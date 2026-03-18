@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.1.0
+
+### Clipboard
+
+- **Cross-window copy/paste** -- Ctrl+C/X/V now uses a global clipboard shared across all Wayfinder windows. Copy in one window, paste in another.
+- **Window-local clipboard** -- Ctrl+Shift+C/X/V for copy/cut/paste scoped to the current window only. Announcements say "(this window)" to distinguish.
+
+### Keyboard shortcuts
+
+- **Backspace** goes to parent directory (same as Alt+Up).
+- **Ctrl+?** (Ctrl+Shift+/) opens a Keyboard Shortcuts window listing every shortcut organised by category: Navigation, File Operations, View, and General. Each entry is read by Orca as "Description: Key".
+- **Ctrl+Shift+R** now opens File System (previously Ctrl+Shift+C, which is now window-local copy).
+
+### Sidebar
+
+- **Bookmark reordering** -- Ctrl+Up/Down reorders bookmarks directly in the sidebar. Announces "Moved above/below {name}" and "Already at top/bottom" at boundaries. Changes persist to the bookmarks file.
+
+### Fixed
+
+- Backspace shortcut was listed in documentation but never registered.
+
+---
+
 ## 2.0.0
 
 A major feature release focused on extensibility, integration, and accessibility.

@@ -142,33 +142,136 @@ impl WayfinderSidebar {
         });
     }
 
-    /// Delete key removes the focused bookmark from the sidebar.
+    /// Delete key removes the focused bookmark. Ctrl+Up/Down reorders bookmarks.
     fn connect_bookmark_delete_key(&self) {
         let controller = gtk::EventControllerKey::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         let list = self.imp().places_list.clone();
-        controller.connect_key_pressed(move |_, key, _, _| {
-            if key != gtk::gdk::Key::Delete {
-                return glib::Propagation::Proceed;
-            }
-            // Get the focused/selected row
+        let sidebar = self.clone();
+        controller.connect_key_pressed(move |_, key, _, mods| {
+            use gtk::gdk;
+
             let Some(row) = list.selected_row() else {
                 return glib::Propagation::Proceed;
             };
             let name = row.widget_name().to_string();
-            let Some(path) = name.strip_prefix("bookmark:") else {
+
+            // Delete key: remove bookmark
+            if key == gdk::Key::Delete {
+                let Some(path) = name.strip_prefix("bookmark:") else {
+                    return glib::Propagation::Proceed;
+                };
+                let uri = format!("file://{}", path);
+                remove_bookmark(&uri);
+                let idx = row.index();
+                list.remove(&row);
+                if idx > 0 {
+                    if let Some(prev) = list.row_at_index(idx - 1) {
+                        list.select_row(Some(&prev));
+                        prev.grab_focus();
+                    }
+                }
+                return glib::Propagation::Stop;
+            }
+
+            // Ctrl+Up/Down: reorder bookmarks
+            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+            if !ctrl || !name.starts_with("bookmark:") {
                 return glib::Propagation::Proceed;
+            }
+            if key != gdk::Key::Up && key != gdk::Key::Down {
+                return glib::Propagation::Proceed;
+            }
+
+            // Find the neighbour bookmark in the requested direction
+            let target_widget = if key == gdk::Key::Up {
+                // Walk backwards to find previous bookmark row
+                let mut prev = row.prev_sibling();
+                loop {
+                    match prev {
+                        Some(ref w) if w.widget_name().starts_with("bookmark:") => break,
+                        Some(ref w) => prev = w.prev_sibling(),
+                        None => break,
+                    }
+                }
+                prev
+            } else {
+                // Walk forward to find next bookmark row
+                let mut next = row.next_sibling();
+                loop {
+                    match next {
+                        Some(ref w) if w.widget_name().starts_with("bookmark:") => break,
+                        Some(ref w) if w.widget_name() == "bookmark-separator" => {
+                            next = w.next_sibling();
+                        }
+                        _ => break,
+                    }
+                }
+                // Only proceed if we found another bookmark
+                next.filter(|w| w.widget_name().starts_with("bookmark:"))
             };
-            let uri = format!("file://{}", path);
-            remove_bookmark(&uri);
-            // Focus the row above before removing
-            let idx = row.index();
-            list.remove(&row);
-            if idx > 0 {
-                if let Some(prev) = list.row_at_index(idx - 1) {
-                    list.select_row(Some(&prev));
-                    prev.grab_focus();
+
+            if target_widget.is_none() {
+                // Announce boundary
+                let msg = if key == gdk::Key::Up { "Already at top" } else { "Already at bottom" };
+                list.announce(msg, gtk::AccessibleAnnouncementPriority::Medium);
+                return glib::Propagation::Stop;
+            }
+
+            // Swap in the bookmarks file
+            let mut bookmarks = load_bookmarks();
+            let current_uri = format!("file://{}", name.strip_prefix("bookmark:").unwrap_or(""));
+            let target_name = target_widget.as_ref().unwrap().widget_name().to_string();
+            let target_uri = format!("file://{}", target_name.strip_prefix("bookmark:").unwrap_or(""));
+
+            let cur_idx = bookmarks.iter().position(|(u, _)| *u == current_uri);
+            let tgt_idx = bookmarks.iter().position(|(u, _)| *u == target_uri);
+
+            if let (Some(ci), Some(ti)) = (cur_idx, tgt_idx) {
+                // Get the neighbour's display name for announcement
+                let neighbour_display = bookmarks[ti].1.clone();
+                let announcement = if key == gdk::Key::Up {
+                    format!("Moved above {}", neighbour_display)
+                } else {
+                    format!("Moved below {}", neighbour_display)
+                };
+
+                bookmarks.swap(ci, ti);
+                save_bookmarks(&bookmarks);
+
+                // Refresh and re-focus
+                sidebar.refresh_bookmarks();
+
+                // Find and focus the moved bookmark row, with announcement as label
+                let mut child = list.first_child();
+                while let Some(widget) = child {
+                    if widget.widget_name() == name {
+                        if let Some(r) = widget.downcast_ref::<gtk::ListBoxRow>() {
+                            r.update_property(&[
+                                gtk::accessible::Property::Label(&announcement),
+                            ]);
+                            list.select_row(Some(r));
+                            r.grab_focus();
+                            // Restore real label after Orca reads the announcement
+                            let row_ref = r.clone();
+                            let current_display = bookmarks[ci].1.clone();
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(500),
+                                move || {
+                                    row_ref.update_property(&[
+                                        gtk::accessible::Property::Label(
+                                            &format!("Bookmark: {}", current_display),
+                                        ),
+                                    ]);
+                                },
+                            );
+                        }
+                        break;
+                    }
+                    child = widget.next_sibling();
                 }
             }
+
             glib::Propagation::Stop
         });
         self.imp().places_list.add_controller(controller);

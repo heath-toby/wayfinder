@@ -62,28 +62,37 @@ wayfinder /path/to/folder    # Opens a specific directory
 | Key | Action |
 |-----|--------|
 | Enter | Open file or folder |
-| Backspace / Alt+Left | Go back |
+| Backspace | Go to parent directory |
+| Alt+Left | Go back |
 | Alt+Right | Go forward |
 | Alt+Up | Go to parent directory |
 | Ctrl+L | Focus location bar |
 | Tab (in location bar) | Path completion |
 | Ctrl+D | Bookmark current folder |
 | Delete (on bookmark) | Remove bookmark |
+| Ctrl+Up/Down (on bookmark) | Reorder bookmark |
 | Ctrl+H | Toggle hidden files |
 | Ctrl+1 / Ctrl+2 | Switch to list / grid view |
+| Ctrl+Shift+S | Toggle sidebar |
 | Ctrl+F | Search files |
 | Ctrl+A | Select all |
 | Space | Toggle selection on focused file |
 | Shift+Space | Range selection |
 | Escape | Clear selection |
-| Ctrl+C | Copy |
-| Ctrl+X | Cut |
-| Ctrl+V | Paste |
+| Ctrl+C | Copy (all windows) |
+| Ctrl+X | Cut (all windows) |
+| Ctrl+V | Paste (all windows) |
+| Ctrl+Shift+C | Copy (this window only) |
+| Ctrl+Shift+X | Cut (this window only) |
+| Ctrl+Shift+V | Paste (this window only) |
 | F2 | Rename |
+| Ctrl+Shift+N | New folder |
 | Delete | Move to Bin |
 | Shift+Delete | Delete permanently |
+| Ctrl+N | New window |
 | Ctrl+I | Properties |
 | Shift+F10 / Menu | Context menu |
+| Ctrl+? | Keyboard shortcuts window |
 | Type any letters | Jump to matching file |
 
 ### Custom actions

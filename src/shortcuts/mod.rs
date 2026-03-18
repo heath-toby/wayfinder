@@ -9,9 +9,10 @@ pub fn register_shortcuts(window: &super::window::WayfinderWindow) {
     add_shortcut(&controller, "<Ctrl><Shift>o", "win.documents");
     add_shortcut(&controller, "<Ctrl><Shift>k", "win.desktop");
     add_shortcut(&controller, "<Ctrl><Shift>l", "win.downloads");
-    add_shortcut(&controller, "<Ctrl><Shift>c", "win.root");
+    add_shortcut(&controller, "<Ctrl><Shift>r", "win.root");
     add_shortcut(&controller, "<Alt>Up", "win.up");
     add_shortcut(&controller, "<Alt>Left", "win.back");
+    add_shortcut(&controller, "BackSpace", "win.up");
     add_shortcut(&controller, "<Alt>Right", "win.forward");
     add_shortcut(&controller, "<Ctrl>l", "win.location-bar");
 
@@ -24,10 +25,14 @@ pub fn register_shortcuts(window: &super::window::WayfinderWindow) {
     // Search
     add_shortcut(&controller, "<Ctrl>f", "win.search");
 
-    // File operations
+    // File operations (global clipboard — works across windows)
     add_shortcut(&controller, "<Ctrl>c", "win.copy");
     add_shortcut(&controller, "<Ctrl>x", "win.cut");
     add_shortcut(&controller, "<Ctrl>v", "win.paste");
+    // Window-local clipboard
+    add_shortcut(&controller, "<Ctrl><Shift>c", "win.copy-local");
+    add_shortcut(&controller, "<Ctrl><Shift>x", "win.cut-local");
+    add_shortcut(&controller, "<Ctrl><Shift>v", "win.paste-local");
     add_shortcut(&controller, "Delete", "win.trash");
     add_shortcut(&controller, "<Shift>Delete", "win.delete");
     add_shortcut(&controller, "F2", "win.rename");
@@ -47,6 +52,9 @@ pub fn register_shortcuts(window: &super::window::WayfinderWindow) {
 
     // Go to folder (same dialog as Ctrl+L)
     add_shortcut(&controller, "<Ctrl><Shift>g", "win.location-bar");
+
+    // Shortcuts help
+    add_shortcut(&controller, "<Ctrl>question", "win.show-shortcuts");
 
     window.add_controller(controller);
 }

@@ -370,6 +370,7 @@ impl WayfinderWindow {
         }
     }
 
+    /// Copy selected files to the global (cross-window) clipboard.
     pub fn copy_selected(&self) {
         let files = self.get_selected_files();
         if files.is_empty() {
@@ -377,8 +378,7 @@ impl WayfinderWindow {
         }
         let gio_files: Vec<_> = files.iter().map(|f| gio::File::for_path(f.path())).collect();
         let count = gio_files.len();
-        *self.imp().clipboard.borrow_mut() =
-            Some(ClipboardState::new(ClipboardOperation::Copy, gio_files));
+        wayfinder::clipboard::global_set(ClipboardState::new(ClipboardOperation::Copy, gio_files));
         if count == 1 {
             self.announce(
                 &format!("Copied {}", files[0].name()),
@@ -392,6 +392,7 @@ impl WayfinderWindow {
         }
     }
 
+    /// Cut selected files to the global (cross-window) clipboard.
     pub fn cut_selected(&self) {
         let files = self.get_selected_files();
         if files.is_empty() {
@@ -399,8 +400,7 @@ impl WayfinderWindow {
         }
         let gio_files: Vec<_> = files.iter().map(|f| gio::File::for_path(f.path())).collect();
         let count = gio_files.len();
-        *self.imp().clipboard.borrow_mut() =
-            Some(ClipboardState::new(ClipboardOperation::Cut, gio_files));
+        wayfinder::clipboard::global_set(ClipboardState::new(ClipboardOperation::Cut, gio_files));
         if count == 1 {
             self.announce(
                 &format!("Cut {}", files[0].name()),
@@ -414,9 +414,64 @@ impl WayfinderWindow {
         }
     }
 
+    /// Paste from the global (cross-window) clipboard.
     pub fn paste(&self) {
+        self.paste_from(wayfinder::clipboard::global_get(), true);
+    }
+
+    /// Copy selected files to the window-local clipboard.
+    pub fn copy_selected_local(&self) {
+        let files = self.get_selected_files();
+        if files.is_empty() {
+            return;
+        }
+        let gio_files: Vec<_> = files.iter().map(|f| gio::File::for_path(f.path())).collect();
+        let count = gio_files.len();
+        *self.imp().clipboard.borrow_mut() =
+            Some(ClipboardState::new(ClipboardOperation::Copy, gio_files));
+        if count == 1 {
+            self.announce(
+                &format!("Copied {} (this window)", files[0].name()),
+                AccessibleAnnouncementPriority::Medium,
+            );
+        } else {
+            self.announce(
+                &format!("Copied {} files (this window)", count),
+                AccessibleAnnouncementPriority::Medium,
+            );
+        }
+    }
+
+    /// Cut selected files to the window-local clipboard.
+    pub fn cut_selected_local(&self) {
+        let files = self.get_selected_files();
+        if files.is_empty() {
+            return;
+        }
+        let gio_files: Vec<_> = files.iter().map(|f| gio::File::for_path(f.path())).collect();
+        let count = gio_files.len();
+        *self.imp().clipboard.borrow_mut() =
+            Some(ClipboardState::new(ClipboardOperation::Cut, gio_files));
+        if count == 1 {
+            self.announce(
+                &format!("Cut {} (this window)", files[0].name()),
+                AccessibleAnnouncementPriority::Medium,
+            );
+        } else {
+            self.announce(
+                &format!("Cut {} files (this window)", count),
+                AccessibleAnnouncementPriority::Medium,
+            );
+        }
+    }
+
+    /// Paste from the window-local clipboard.
+    pub fn paste_local(&self) {
+        self.paste_from(self.imp().clipboard.borrow().clone(), false);
+    }
+
+    fn paste_from(&self, clipboard: Option<ClipboardState>, is_global: bool) {
         let imp = self.imp();
-        let clipboard = imp.clipboard.borrow().clone();
         if let Some(state) = clipboard {
             let dest_dir = gio::File::for_path(imp.model.current_path());
             let parent_window: gtk::Window = self.clone().upcast();
@@ -440,7 +495,11 @@ impl WayfinderWindow {
 
             // Clear clipboard after cut
             if state.operation == ClipboardOperation::Cut {
-                *imp.clipboard.borrow_mut() = None;
+                if is_global {
+                    wayfinder::clipboard::global_clear();
+                } else {
+                    *imp.clipboard.borrow_mut() = None;
+                }
             }
         } else {
             self.announce("Nothing to paste", AccessibleAnnouncementPriority::Medium);
@@ -746,5 +805,144 @@ impl WayfinderWindow {
 
         dlg.present();
         entry.grab_focus();
+    }
+
+    pub fn show_shortcuts(&self) {
+        let dlg = gtk::Window::builder()
+            .title("Keyboard Shortcuts")
+            .modal(true)
+            .transient_for(self)
+            .default_width(500)
+            .default_height(600)
+            .build();
+        dlg.update_property(&[gtk::accessible::Property::Label("Keyboard shortcuts")]);
+
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        vbox.set_margin_top(12);
+        vbox.set_margin_bottom(12);
+        vbox.set_margin_start(12);
+        vbox.set_margin_end(12);
+
+        let scrolled = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vexpand(true)
+            .build();
+
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.add_css_class("rich-list");
+        list.update_property(&[gtk::accessible::Property::Label("Shortcuts list")]);
+
+        let sections: &[(&str, &[(&str, &str)])] = &[
+            ("Navigation", &[
+                ("Alt+Left", "Go back"),
+                ("Alt+Right", "Go forward"),
+                ("Alt+Up", "Go to parent folder"),
+                ("Ctrl+L", "Go to location"),
+                ("Ctrl+Shift+H", "Home"),
+                ("Ctrl+Shift+O", "Documents"),
+                ("Ctrl+Shift+K", "Desktop"),
+                ("Ctrl+Shift+L", "Downloads"),
+                ("Ctrl+Shift+R", "File System"),
+                ("Enter", "Open file or folder"),
+                ("Backspace", "Go back"),
+            ]),
+            ("File Operations", &[
+                ("Ctrl+C", "Copy"),
+                ("Ctrl+X", "Cut"),
+                ("Ctrl+V", "Paste"),
+                ("Ctrl+Shift+C", "Copy (this window only)"),
+                ("Ctrl+Shift+X", "Cut (this window only)"),
+                ("Ctrl+Shift+V", "Paste (this window only)"),
+                ("Ctrl+A", "Select all"),
+                ("Space", "Toggle selection"),
+                ("Shift+Space", "Range selection"),
+                ("Escape", "Clear selection"),
+                ("F2", "Rename"),
+                ("Delete", "Move to Bin"),
+                ("Shift+Delete", "Delete permanently"),
+                ("Ctrl+Shift+N", "New folder"),
+                ("Ctrl+D", "Bookmark current folder"),
+            ]),
+            ("View", &[
+                ("Ctrl+1", "Grid view"),
+                ("Ctrl+2", "List view"),
+                ("Ctrl+H", "Toggle hidden files"),
+                ("Ctrl+Shift+S", "Toggle sidebar"),
+                ("Ctrl+F", "Search files"),
+                ("Ctrl+I", "Properties"),
+            ]),
+            ("General", &[
+                ("Ctrl+N", "New window"),
+                ("Menu or Shift+F10", "Context menu"),
+                ("Tab", "Path completion (in location bar)"),
+                ("Type letters", "Jump to matching file"),
+                ("Ctrl+?", "This shortcuts window"),
+            ]),
+        ];
+
+        for (section_name, shortcuts) in sections {
+            // Section header
+            let header = gtk::Label::builder()
+                .label(*section_name)
+                .xalign(0.0)
+                .css_classes(["heading"])
+                .margin_top(12)
+                .margin_bottom(4)
+                .margin_start(8)
+                .build();
+            let header_row = gtk::ListBoxRow::new();
+            header_row.set_child(Some(&header));
+            header_row.set_selectable(false);
+            header_row.set_activatable(false);
+            list.append(&header_row);
+
+            for (key, description) in *shortcuts {
+                let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                hbox.set_margin_top(4);
+                hbox.set_margin_bottom(4);
+                hbox.set_margin_start(16);
+                hbox.set_margin_end(8);
+
+                let desc_label = gtk::Label::builder()
+                    .label(*description)
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .build();
+
+                let key_label = gtk::Label::builder()
+                    .label(*key)
+                    .xalign(1.0)
+                    .css_classes(["dim-label"])
+                    .build();
+
+                hbox.append(&desc_label);
+                hbox.append(&key_label);
+
+                let row = gtk::ListBoxRow::new();
+                row.set_child(Some(&hbox));
+                row.set_selectable(false);
+                row.set_activatable(false);
+                row.update_property(&[gtk::accessible::Property::Label(
+                    &format!("{}: {}", description, key),
+                )]);
+
+                list.append(&row);
+            }
+        }
+
+        scrolled.set_child(Some(&list));
+        vbox.append(&scrolled);
+
+        let close_btn = gtk::Button::with_label("Close");
+        close_btn.set_halign(gtk::Align::End);
+        close_btn.set_margin_top(12);
+        let d = dlg.clone();
+        close_btn.connect_clicked(move |_| d.close());
+        vbox.append(&close_btn);
+
+        dlg.set_child(Some(&vbox));
+        dlg.present();
     }
 }

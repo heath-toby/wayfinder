@@ -521,6 +521,28 @@ impl WayfinderWindowInner {
         });
         window.add_action(&action);
 
+        // Window-local clipboard operations (Ctrl+Shift+C/X/V)
+        let w = window.clone();
+        let action = gio::SimpleAction::new("copy-local", None);
+        action.connect_activate(move |_, _| {
+            w.copy_selected_local();
+        });
+        window.add_action(&action);
+
+        let w = window.clone();
+        let action = gio::SimpleAction::new("cut-local", None);
+        action.connect_activate(move |_, _| {
+            w.cut_selected_local();
+        });
+        window.add_action(&action);
+
+        let w = window.clone();
+        let action = gio::SimpleAction::new("paste-local", None);
+        action.connect_activate(move |_, _| {
+            w.paste_local();
+        });
+        window.add_action(&action);
+
         let w = window.clone();
         let action = gio::SimpleAction::new("trash", None);
         action.connect_activate(move |_, _| {
@@ -580,6 +602,14 @@ impl WayfinderWindowInner {
                 let new_win = super::WayfinderWindow::new(&app);
                 new_win.present();
             }
+        });
+        window.add_action(&action);
+
+        // Shortcuts dialog
+        let w = window.clone();
+        let action = gio::SimpleAction::new("show-shortcuts", None);
+        action.connect_activate(move |_, _| {
+            w.show_shortcuts();
         });
         window.add_action(&action);
 
