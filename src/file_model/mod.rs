@@ -332,9 +332,7 @@ fn walk_dir_size_impl(dir: &std::path::Path, depth: u32) -> u64 {
         let Ok(meta) = entry.path().symlink_metadata() else {
             continue;
         };
-        if meta.file_type().is_symlink() {
-            total += meta.len();
-        } else if meta.is_file() {
+        if meta.file_type().is_symlink() || meta.is_file() {
             total += meta.len();
         } else if meta.is_dir() {
             total += walk_dir_size_impl(&entry.path(), depth + 1);

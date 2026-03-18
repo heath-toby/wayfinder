@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::AccessibleAnnouncementPriority;
@@ -74,7 +73,7 @@ fn load_desktop_actions(dir: &Path) -> Vec<CustomAction> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "desktop") {
+        if path.extension().is_none_or(|ext| ext != "desktop") {
             continue;
         }
         if let Some(action) = parse_desktop_action(&path) {

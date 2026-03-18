@@ -23,7 +23,7 @@ impl ClipboardState {
 // Global (app-wide) clipboard shared across all windows.
 // Safe because GTK is single-threaded.
 thread_local! {
-    static GLOBAL_CLIPBOARD: RefCell<Option<ClipboardState>> = RefCell::new(None);
+    static GLOBAL_CLIPBOARD: RefCell<Option<ClipboardState>> = const { RefCell::new(None) };
 }
 
 pub fn global_set(state: ClipboardState) {

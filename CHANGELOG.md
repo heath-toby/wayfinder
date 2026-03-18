@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.2.1
+
+### Fixed
+
+- Restoring a file from the Bin now refreshes the trash listing immediately, with focus moving to the nearest remaining item.
+- Trash failures (e.g. permission denied) are now announced via screen reader before any focus changes, so the error is heard first.
+
+### Code quality
+
+- Resolved all clippy warnings (unused imports, boolean simplification, const thread_local, identical branches).
+- Updated dependencies to latest compatible patch versions.
+
+---
+
 ## 2.2.0
 
 ### Context menu
