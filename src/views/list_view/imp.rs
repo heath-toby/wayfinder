@@ -204,6 +204,7 @@ impl Default for ListViewInner {
                     crate::state::save_sort_state(idx.get() as u32, asc.get());
 
                     // Update all button labels
+                    let mut sorted_name = String::new();
                     for (j, (name, button)) in btns.iter().enumerate() {
                         if j == idx.get() {
                             let dir = if asc.get() { "ascending" } else { "descending" };
@@ -211,6 +212,7 @@ impl Default for ListViewInner {
                             button.update_property(&[gtk::accessible::Property::Label(
                                 &format!("{}, sorted {}", name, dir),
                             )]);
+                            sorted_name = name.clone();
                         } else {
                             button.set_label(name);
                             button.update_property(&[gtk::accessible::Property::Label(
@@ -218,6 +220,13 @@ impl Default for ListViewInner {
                             )]);
                         }
                     }
+
+                    // Announce sort change for screen readers
+                    let direction = if asc.get() { "ascending" } else { "descending" };
+                    cv.announce(
+                        &format!("Sorted by {}, {}", sorted_name, direction),
+                        gtk::AccessibleAnnouncementPriority::Medium,
+                    );
                 });
 
                 child = widget.next_sibling();

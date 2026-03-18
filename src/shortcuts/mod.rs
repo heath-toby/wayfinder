@@ -53,6 +53,12 @@ pub fn register_shortcuts(window: &super::window::WayfinderWindow) {
     // Go to folder (same dialog as Ctrl+L)
     add_shortcut(&controller, "<Ctrl><Shift>g", "win.location-bar");
 
+    // Undo (restore last trashed)
+    add_shortcut(&controller, "<Ctrl>z", "win.undo");
+
+    // Open terminal here
+    add_shortcut(&controller, "<Ctrl>grave", "win.terminal-here");
+
     // Shortcuts help
     add_shortcut(&controller, "<Ctrl>question", "win.show-shortcuts");
 

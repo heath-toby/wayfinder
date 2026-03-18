@@ -194,6 +194,34 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
             let w = window.clone();
             move || w.copy_selected()
         });
+        add_menu_item(&main_box, "Copy Path", &popover, {
+            let w = window.clone();
+            let f = file.clone();
+            move || {
+                let path = f.path();
+                let display = WidgetExt::display(&w);
+                let clipboard = display.clipboard();
+                clipboard.set_text(&path);
+                w.announce(
+                    &format!("Copied path: {}", path),
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+            }
+        });
+        add_menu_item(&main_box, "Copy Name", &popover, {
+            let w = window.clone();
+            let f = file.clone();
+            move || {
+                let name = f.name();
+                let display = WidgetExt::display(&w);
+                let clipboard = display.clipboard();
+                clipboard.set_text(&name);
+                w.announce(
+                    &format!("Copied name: {}", name),
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+            }
+        });
         add_menu_item(&main_box, "Paste", &popover, {
             let w = window.clone();
             move || w.paste()

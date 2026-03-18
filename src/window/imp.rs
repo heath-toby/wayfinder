@@ -75,6 +75,7 @@ pub struct WayfinderWindowInner {
     pub file_selection: RefCell<SelectionState>,
     pub type_ahead_buffer: Rc<RefCell<String>>,
     pub type_ahead_generation: Rc<Cell<u32>>,
+    pub last_trashed: RefCell<Vec<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -199,6 +200,7 @@ impl Default for WayfinderWindowInner {
             file_selection: RefCell::new(SelectionState::new()),
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),
             type_ahead_generation: Rc::new(Cell::new(0)),
+            last_trashed: RefCell::new(Vec::new()),
         }
     }
 }
@@ -630,6 +632,22 @@ impl WayfinderWindowInner {
                     AccessibleAnnouncementPriority::Medium,
                 );
             }
+        });
+        window.add_action(&action);
+
+        // Undo (restore last trashed files)
+        let w = window.clone();
+        let action = gio::SimpleAction::new("undo", None);
+        action.connect_activate(move |_, _| {
+            w.undo_trash();
+        });
+        window.add_action(&action);
+
+        // Open terminal here
+        let w = window.clone();
+        let action = gio::SimpleAction::new("terminal-here", None);
+        action.connect_activate(move |_, _| {
+            w.open_terminal_here();
         });
         window.add_action(&action);
 

@@ -515,6 +515,9 @@ impl WayfinderWindow {
         let imp = self.imp();
         let old_pos = imp.selection.selected();
 
+        // Save paths for undo
+        let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
+
         let mut success = 0;
         for file in &files {
             let gio_file = gio::File::for_path(file.path());
@@ -522,6 +525,12 @@ impl WayfinderWindow {
                 success += 1;
             }
         }
+
+        // Store trashed paths for undo (only if at least one succeeded)
+        if success > 0 {
+            *imp.last_trashed.borrow_mut() = paths;
+        }
+
         imp.file_selection.borrow_mut().clear();
         self.update_status();
 
@@ -807,6 +816,113 @@ impl WayfinderWindow {
         entry.grab_focus();
     }
 
+    pub fn undo_trash(&self) {
+        let paths = self.imp().last_trashed.borrow().clone();
+        if paths.is_empty() {
+            self.announce("Nothing to undo", AccessibleAnnouncementPriority::Medium);
+            return;
+        }
+
+        let trash = gio::File::for_uri("trash:///");
+        let mut restored = 0;
+        for path in &paths {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // Find the item in trash by original path
+            if let Ok(enumerator) = trash.enumerate_children(
+                "standard::name,trash::orig-path",
+                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                gio::Cancellable::NONE,
+            ) {
+                while let Ok(Some(info)) = enumerator.next_file(gio::Cancellable::NONE) {
+                    let orig = info
+                        .attribute_byte_string("trash::orig-path")
+                        .map(|p| p.to_string())
+                        .unwrap_or_default();
+                    if orig == *path {
+                        let trash_file = trash.child(info.name());
+                        match wayfinder::file_ops::restore_from_trash(&trash_file) {
+                            Ok(_) => restored += 1,
+                            Err(e) => {
+                                log::error!("Failed to restore {}: {}", name, e);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.imp().last_trashed.borrow_mut().clear();
+
+        if restored > 0 {
+            // Reload directory to show restored files
+            let current = self.imp().model.current_path();
+            let _ = self.imp().model.load_directory(&current);
+            self.update_status();
+
+            if restored == 1 {
+                self.announce(
+                    &format!(
+                        "Restored {}",
+                        std::path::Path::new(&paths[0])
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                    ),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+            } else {
+                self.announce(
+                    &format!("Restored {} files", restored),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+            }
+        } else {
+            self.announce(
+                "Could not restore files",
+                AccessibleAnnouncementPriority::High,
+            );
+        }
+    }
+
+    pub fn open_terminal_here(&self) {
+        let path = self.imp().model.current_path();
+        // Try common terminals in order
+        let terminals: &[(&str, &[&str])] = &[
+            ("foot", &["--working-directory"]),
+            ("alacritty", &["--working-directory"]),
+            ("gnome-terminal", &["--working-directory"]),
+            ("konsole", &["--workdir"]),
+        ];
+
+        for (cmd, args) in terminals {
+            if std::process::Command::new("which")
+                .arg(cmd)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                let mut full_args: Vec<&str> = args.to_vec();
+                full_args.push(&path);
+                let _ = std::process::Command::new(cmd).args(&full_args).spawn();
+                self.announce(
+                    &format!("Opened terminal in {}", path),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+                return;
+            }
+        }
+        self.announce(
+            "No terminal emulator found",
+            AccessibleAnnouncementPriority::High,
+        );
+    }
+
     pub fn show_shortcuts(&self) {
         let dlg = gtk::Window::builder()
             .title("Keyboard Shortcuts")
@@ -864,6 +980,7 @@ impl WayfinderWindow {
                 ("Shift+Delete", "Delete permanently"),
                 ("Ctrl+Shift+N", "New folder"),
                 ("Ctrl+D", "Bookmark current folder"),
+                ("Ctrl+Z", "Undo trash"),
             ]),
             ("View", &[
                 ("Ctrl+1", "Grid view"),
@@ -875,6 +992,7 @@ impl WayfinderWindow {
             ]),
             ("General", &[
                 ("Ctrl+N", "New window"),
+                ("Ctrl+`", "Open terminal here"),
                 ("Menu or Shift+F10", "Context menu"),
                 ("Tab", "Path completion (in location bar)"),
                 ("Type letters", "Jump to matching file"),

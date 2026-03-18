@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.2.0
+
+### Context menu
+
+- **Copy Path** -- copies the full file path to the system clipboard for pasting into terminals, text editors, etc. Announces "Copied path: /full/path".
+- **Copy Name** -- copies just the filename to the system clipboard. Announces "Copied name: filename".
+
+### Undo
+
+- **Undo Trash (Ctrl+Z)** -- restores the most recently trashed file(s). Searches the Bin by original path, restores to the original location, and reloads the directory. Announces what was restored.
+
+### Terminal
+
+- **Open Terminal Here (Ctrl+`)** -- opens a terminal emulator in the current directory. Auto-detects foot, alacritty, gnome-terminal, or konsole.
+
+### Accessibility
+
+- **Sort order announcements** -- clicking a column header now announces "Sorted by Name, ascending" (or descending) via the screen reader.
+
+---
+
 ## 2.1.0
 
 ### Clipboard

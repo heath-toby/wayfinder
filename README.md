@@ -89,7 +89,9 @@ wayfinder /path/to/folder    # Opens a specific directory
 | Ctrl+Shift+N | New folder |
 | Delete | Move to Bin |
 | Shift+Delete | Delete permanently |
+| Ctrl+Z | Undo trash (restore last trashed) |
 | Ctrl+N | New window |
+| Ctrl+` | Open terminal in current directory |
 | Ctrl+I | Properties |
 | Shift+F10 / Menu | Context menu |
 | Ctrl+? | Keyboard shortcuts window |
