@@ -537,16 +537,40 @@ impl WayfinderWindow {
         let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
 
         let mut success = 0;
+        let mut failed = 0;
+        let mut last_error = String::new();
         for file in &files {
             let gio_file = gio::File::for_path(file.path());
-            if wayfinder::file_ops::trash_file(&gio_file).is_ok() {
-                success += 1;
+            match wayfinder::file_ops::trash_file(&gio_file) {
+                Ok(()) => success += 1,
+                Err(e) => {
+                    failed += 1;
+                    last_error = format!("{}: {}", file.name(), e);
+                }
             }
         }
 
-        // Store trashed paths for undo (only if at least one succeeded)
+        // Store trashed paths for undo (only successfully trashed ones)
         if success > 0 {
             *imp.last_trashed.borrow_mut() = paths;
+        }
+
+        // Announce failures FIRST (before focus changes trigger Orca)
+        if failed > 0 {
+            if failed == 1 {
+                self.announce(
+                    &format!("Could not move to Bin: {}", last_error),
+                    AccessibleAnnouncementPriority::High,
+                );
+            } else {
+                self.announce(
+                    &format!("{} files could not be moved to Bin", failed),
+                    AccessibleAnnouncementPriority::High,
+                );
+            }
+            if success == 0 {
+                return;
+            }
         }
 
         imp.file_selection.borrow_mut().clear();
@@ -566,16 +590,18 @@ impl WayfinderWindow {
             self.restore_focus_to_selected();
         }
 
-        if success == 1 {
-            self.announce(
-                &format!("Moved {} to Bin", files[0].name()),
-                AccessibleAnnouncementPriority::Medium,
-            );
-        } else {
-            self.announce(
-                &format!("Moved {} files to Bin", success),
-                AccessibleAnnouncementPriority::Medium,
-            );
+        if failed == 0 {
+            if success == 1 {
+                self.announce(
+                    &format!("Moved {} to Bin", files[0].name()),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+            } else {
+                self.announce(
+                    &format!("Moved {} files to Bin", success),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+            }
         }
     }
 
