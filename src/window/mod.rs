@@ -8,8 +8,8 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{AccessibleAnnouncementPriority, Application};
 
-use crate::clipboard::{ClipboardOperation, ClipboardState};
-use crate::file_object::FileObject;
+use wayfinder::clipboard::{ClipboardOperation, ClipboardState};
+use wayfinder::file_object::FileObject;
 
 pub use imp::ViewMode;
 
@@ -69,7 +69,7 @@ impl WayfinderWindow {
                 let at_root = path == "/";
                 imp.up_button.set_sensitive(!at_root);
 
-                crate::state::save_last_directory(path);
+                wayfinder::state::save_last_directory(path);
 
                 self.update_status();
 
@@ -82,8 +82,9 @@ impl WayfinderWindow {
                 let announcement = format!("Opened {}, {} items", dir_name, count);
                 self.announce(&announcement, AccessibleAnnouncementPriority::Medium);
 
-                // Reset column to Name and select the first item
+                // Reset column, selection state, and focus the first item
                 imp.current_column.set(0);
+                imp.file_selection.borrow_mut().clear();
                 imp.selection.set_selected(0);
 
                 self.focus_current_view();
@@ -139,7 +140,11 @@ impl WayfinderWindow {
     pub fn update_status(&self) {
         let imp = self.imp();
         let count = imp.model.item_count();
+        let sel_count = imp.file_selection.borrow().count();
         let mut parts = vec![format!("{} items", count)];
+        if sel_count > 0 {
+            parts.push(format!("{} selected", sel_count));
+        }
         if imp.model.showing_hidden() {
             parts.push("showing hidden".to_string());
         }
@@ -148,6 +153,31 @@ impl WayfinderWindow {
         }
         let status = parts.join(", ");
         imp.status_label.set_text(&status);
+    }
+
+    /// Get selected files — if multi-selection has files, use those; otherwise use the focused file
+    pub fn get_selected_files(&self) -> Vec<FileObject> {
+        let imp = self.imp();
+        let sel = imp.file_selection.borrow();
+        if sel.count() > 0 {
+            // Return all files matching the selected paths
+            let mut files = Vec::new();
+            let model = &imp.model.filter_model;
+            for i in 0..model.n_items() {
+                if let Some(item) = model.item(i) {
+                    if let Some(file) = item.downcast_ref::<FileObject>() {
+                        if sel.is_selected(&file.path()) {
+                            files.push(file.clone());
+                        }
+                    }
+                }
+            }
+            files
+        } else if let Some(file) = self.get_selected_file() {
+            vec![file]
+        } else {
+            vec![]
+        }
     }
 
     pub fn switch_view(&self, mode: ViewMode) {
@@ -161,7 +191,7 @@ impl WayfinderWindow {
                 imp.list_view.column_view().set_model(gtk::SelectionModel::NONE);
                 imp.grid_view.set_model(&imp.selection);
                 imp.view_stack.set_visible_child_name("grid");
-                crate::state::save_view_mode("grid");
+                wayfinder::state::save_view_mode("grid");
                 self.announce(
                     "Switched to grid view",
                     AccessibleAnnouncementPriority::Medium,
@@ -171,7 +201,7 @@ impl WayfinderWindow {
                 imp.grid_view.grid_view().set_model(gtk::SelectionModel::NONE);
                 imp.list_view.set_model(&imp.selection);
                 imp.view_stack.set_visible_child_name("list");
-                crate::state::save_view_mode("list");
+                wayfinder::state::save_view_mode("list");
                 self.announce(
                     "Switched to list view",
                     AccessibleAnnouncementPriority::Medium,
@@ -226,7 +256,7 @@ impl WayfinderWindow {
         let path = file.path();
 
         // Check for per-file app association
-        if let Some(desktop_id) = crate::state::load_file_app(&path) {
+        if let Some(desktop_id) = wayfinder::state::load_file_app(&path) {
             let all_apps = gio::AppInfo::all();
             if let Some(app) = all_apps.iter().find(|a| {
                 a.id().map(|id| id.to_string()) == Some(desktop_id.clone())
@@ -274,7 +304,7 @@ impl WayfinderWindow {
             return;
         };
         let gio_file = gio::File::for_uri(&format!("trash:///{}", file.name()));
-        match crate::file_ops::restore_from_trash(&gio_file) {
+        match wayfinder::file_ops::restore_from_trash(&gio_file) {
             Ok(dest) => {
                 self.announce(
                     &format!("Restored {} to {}", file.name(), dest),
@@ -306,7 +336,7 @@ impl WayfinderWindow {
             move |result| {
                 if let Ok(choice) = result {
                     if choice == 1 {
-                        match crate::file_ops::empty_trash() {
+                        match wayfinder::file_ops::empty_trash() {
                             Ok(count) => {
                                 window.announce(
                                     &format!("Bin emptied, {} items deleted", count),
@@ -330,73 +360,6 @@ impl WayfinderWindow {
         );
     }
 
-    pub fn show_go_to_folder(&self) {
-        let window = self.clone();
-        let entry = gtk::Entry::builder()
-            .hexpand(true)
-            .placeholder_text("/path/to/folder")
-            .build();
-        entry.update_property(&[gtk::accessible::Property::Label("Go to folder path")]);
-        entry.set_text(&self.imp().model.current_path());
-        entry.select_region(0, -1);
-
-        let dlg = gtk::Window::builder()
-            .title("Go to Folder")
-            .modal(true)
-            .transient_for(&window)
-            .default_width(500)
-            .build();
-
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        vbox.set_margin_top(12);
-        vbox.set_margin_bottom(12);
-        vbox.set_margin_start(12);
-        vbox.set_margin_end(12);
-
-        let label = gtk::Label::new(Some("Enter a folder path:"));
-        vbox.append(&label);
-        vbox.append(&entry);
-
-        let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        button_box.set_halign(gtk::Align::End);
-        let cancel_btn = gtk::Button::with_label("Cancel");
-        let go_btn = gtk::Button::with_label("Go");
-        go_btn.add_css_class("suggested-action");
-        button_box.append(&cancel_btn);
-        button_box.append(&go_btn);
-        vbox.append(&button_box);
-
-        dlg.set_child(Some(&vbox));
-
-        let d = dlg.clone();
-        cancel_btn.connect_clicked(move |_| d.close());
-
-        let d = dlg.clone();
-        let entry_clone = entry.clone();
-        let w = window.clone();
-        let do_go = move || {
-            let text = entry_clone.text().to_string();
-            let path = if text.starts_with('~') {
-                if let Some(home) = dirs::home_dir() {
-                    text.replacen('~', &home.to_string_lossy(), 1)
-                } else {
-                    text
-                }
-            } else {
-                text
-            };
-            w.navigate_to_path(&path);
-            d.close();
-        };
-
-        let do_go_clone = do_go.clone();
-        go_btn.connect_clicked(move |_| do_go_clone());
-        entry.connect_activate(move |_| do_go());
-
-        dlg.present();
-        entry.grab_focus();
-    }
-
     pub fn show_properties(&self) {
         if let Some(file) = self.get_selected_file() {
             let parent: gtk::Window = self.clone().upcast();
@@ -405,24 +368,44 @@ impl WayfinderWindow {
     }
 
     pub fn copy_selected(&self) {
-        if let Some(file) = self.get_selected_file() {
-            let gio_file = gio::File::for_path(file.path());
-            *self.imp().clipboard.borrow_mut() =
-                Some(ClipboardState::new(ClipboardOperation::Copy, vec![gio_file]));
+        let files = self.get_selected_files();
+        if files.is_empty() {
+            return;
+        }
+        let gio_files: Vec<_> = files.iter().map(|f| gio::File::for_path(f.path())).collect();
+        let count = gio_files.len();
+        *self.imp().clipboard.borrow_mut() =
+            Some(ClipboardState::new(ClipboardOperation::Copy, gio_files));
+        if count == 1 {
             self.announce(
-                &format!("Copied {}", file.name()),
+                &format!("Copied {}", files[0].name()),
+                AccessibleAnnouncementPriority::Medium,
+            );
+        } else {
+            self.announce(
+                &format!("Copied {} files", count),
                 AccessibleAnnouncementPriority::Medium,
             );
         }
     }
 
     pub fn cut_selected(&self) {
-        if let Some(file) = self.get_selected_file() {
-            let gio_file = gio::File::for_path(file.path());
-            *self.imp().clipboard.borrow_mut() =
-                Some(ClipboardState::new(ClipboardOperation::Cut, vec![gio_file]));
+        let files = self.get_selected_files();
+        if files.is_empty() {
+            return;
+        }
+        let gio_files: Vec<_> = files.iter().map(|f| gio::File::for_path(f.path())).collect();
+        let count = gio_files.len();
+        *self.imp().clipboard.borrow_mut() =
+            Some(ClipboardState::new(ClipboardOperation::Cut, gio_files));
+        if count == 1 {
             self.announce(
-                &format!("Cut {}", file.name()),
+                &format!("Cut {}", files[0].name()),
+                AccessibleAnnouncementPriority::Medium,
+            );
+        } else {
+            self.announce(
+                &format!("Cut {} files", count),
                 AccessibleAnnouncementPriority::Medium,
             );
         }
@@ -438,10 +421,10 @@ impl WayfinderWindow {
             for source in &state.files {
                 match state.operation {
                     ClipboardOperation::Copy => {
-                        crate::file_ops::copy_with_progress(source, &dest_dir, &parent_window);
+                        wayfinder::file_ops::copy_with_progress(source, &dest_dir, &parent_window);
                     }
                     ClipboardOperation::Cut => {
-                        crate::file_ops::move_with_progress(source, &dest_dir, &parent_window);
+                        wayfinder::file_ops::move_with_progress(source, &dest_dir, &parent_window);
                     }
                 }
             }
@@ -456,22 +439,29 @@ impl WayfinderWindow {
     }
 
     pub fn trash_selected(&self) {
-        if let Some(file) = self.get_selected_file() {
+        let files = self.get_selected_files();
+        if files.is_empty() {
+            return;
+        }
+        let mut success = 0;
+        for file in &files {
             let gio_file = gio::File::for_path(file.path());
-            match crate::file_ops::trash_file(&gio_file) {
-                Ok(()) => {
-                    self.announce(
-                        &format!("Moved {} to Bin", file.name()),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                }
-                Err(e) => {
-                    self.announce(
-                        &format!("Failed to move {} to Bin: {}", file.name(), e),
-                        AccessibleAnnouncementPriority::High,
-                    );
-                }
+            if wayfinder::file_ops::trash_file(&gio_file).is_ok() {
+                success += 1;
             }
+        }
+        self.imp().file_selection.borrow_mut().clear();
+        self.update_status();
+        if success == 1 {
+            self.announce(
+                &format!("Moved {} to Bin", files[0].name()),
+                AccessibleAnnouncementPriority::Medium,
+            );
+        } else {
+            self.announce(
+                &format!("Moved {} files to Bin", success),
+                AccessibleAnnouncementPriority::Medium,
+            );
         }
     }
 
@@ -496,7 +486,7 @@ impl WayfinderWindow {
                 if let Ok(choice) = result {
                     if choice == 1 {
                         let gio_file = gio::File::for_path(file.path());
-                        match crate::file_ops::delete_file_recursive(&gio_file) {
+                        match wayfinder::file_ops::delete_file_recursive(&gio_file) {
                             Ok(()) => {
                                 window.announce(
                                     &format!("Deleted {}", file.name()),
@@ -583,7 +573,7 @@ impl WayfinderWindow {
                 return;
             }
             let gio_file = gio::File::for_path(&file_path);
-            match crate::file_ops::rename_file(&gio_file, &new_name) {
+            match wayfinder::file_ops::rename_file(&gio_file, &new_name) {
                 Ok(_) => {
                     w.announce(
                         &format!("Renamed to {}", new_name),
@@ -667,7 +657,7 @@ impl WayfinderWindow {
                 return;
             }
             let parent = gio::File::for_path(w.imp().model.current_path());
-            match crate::file_ops::create_folder(&parent, &name) {
+            match wayfinder::file_ops::create_folder(&parent, &name) {
                 Ok(_) => {
                     w.announce(
                         &format!("Created folder {}", name),

@@ -3,7 +3,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::AccessibleAnnouncementPriority;
 
-use crate::file_object::FileObject;
+use wayfinder::file_object::FileObject;
 use crate::window::WayfinderWindow;
 
 pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
@@ -136,11 +136,14 @@ pub fn register_open_with_actions(window: &WayfinderWindow) {
         window.add_action(&action);
     }
 
-    // Properties
+    // Properties — defer so the popover closes first
     let w = window.clone();
     let action = gio::SimpleAction::new("properties", None);
     action.connect_activate(move |_, _| {
-        w.show_properties();
+        let win = w.clone();
+        glib::idle_add_local_once(move || {
+            win.show_properties();
+        });
     });
     window.add_action(&action);
 

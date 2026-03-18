@@ -6,14 +6,51 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::AccessibleAnnouncementPriority;
 
-use crate::clipboard::ClipboardState;
-use crate::file_model::DirectoryModel;
-use crate::file_object::FileObject;
-use crate::navigation::NavigationState;
-use crate::sidebar::WayfinderSidebar;
-use crate::views::{WayfinderGridView, WayfinderListView};
+use wayfinder::clipboard::ClipboardState;
+use wayfinder::file_model::DirectoryModel;
+use wayfinder::file_object::FileObject;
+use wayfinder::navigation::NavigationState;
+use wayfinder::sidebar::WayfinderSidebar;
+use wayfinder::views::{WayfinderGridView, WayfinderListView};
 
 const COLUMN_NAMES: &[&str] = &["Name", "Size", "Date Modified", "Kind"];
+
+pub struct SelectionState {
+    pub selected: std::collections::HashSet<String>, // paths of selected files
+    pub range_anchor: Option<u32>,                   // position where Shift+Space started
+}
+
+impl SelectionState {
+    pub fn new() -> Self {
+        Self {
+            selected: std::collections::HashSet::new(),
+            range_anchor: None,
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.selected.len()
+    }
+
+    pub fn is_selected(&self, path: &str) -> bool {
+        self.selected.contains(path)
+    }
+
+    pub fn toggle(&mut self, path: &str) -> bool {
+        if self.selected.contains(path) {
+            self.selected.remove(path);
+            false
+        } else {
+            self.selected.insert(path.to_string());
+            true
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.selected.clear();
+        self.range_anchor = None;
+    }
+}
 
 pub struct WayfinderWindowInner {
     pub model: DirectoryModel,
@@ -34,6 +71,7 @@ pub struct WayfinderWindowInner {
     pub search_entry: gtk::SearchEntry,
     pub clipboard: RefCell<Option<ClipboardState>>,
     pub current_view: Cell<ViewMode>,
+    pub file_selection: RefCell<SelectionState>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,19 +92,21 @@ impl Default for WayfinderWindowInner {
         // Grid view starts without a model — only the active view gets one
         let grid_view = WayfinderGridView::new();
 
-        let initial_dir = crate::state::load_last_directory()
+        let initial_dir = wayfinder::state::load_last_directory()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| "/".into());
         let nav = RefCell::new(NavigationState::new(initial_dir));
 
         let location_entry = gtk::Entry::builder()
             .hexpand(true)
+            .editable(false)
+            .can_focus(true)
             .placeholder_text("Path")
             .build();
         location_entry.update_property(&[
             gtk::accessible::Property::Label("Location"),
             gtk::accessible::Property::Description(
-                "Current directory path. Press Enter to navigate.",
+                "Current directory path. Press Ctrl+L to navigate.",
             ),
         ]);
 
@@ -153,6 +193,7 @@ impl Default for WayfinderWindowInner {
             search_entry,
             clipboard: RefCell::new(None),
             current_view: Cell::new(ViewMode::List),
+            file_selection: RefCell::new(SelectionState::new()),
         }
     }
 }
@@ -170,7 +211,7 @@ impl ObjectImpl for WayfinderWindowInner {
         let window = self.obj();
 
         window.set_title(Some("Wayfinder"));
-        let (w, h) = crate::state::load_window_size();
+        let (w, h) = wayfinder::state::load_window_size();
         window.set_default_size(w, h);
 
         // Header bar
@@ -184,7 +225,7 @@ impl ObjectImpl for WayfinderWindowInner {
         header.set_title_widget(Some(&self.location_entry));
 
         // Sidebar toggle button — restore saved state
-        let sidebar_visible = crate::state::load_sidebar_visible();
+        let sidebar_visible = wayfinder::state::load_sidebar_visible();
         self.sidebar_revealer.set_reveal_child(sidebar_visible);
         let sidebar_toggle = gtk::ToggleButton::builder()
             .icon_name("sidebar-show-symbolic")
@@ -197,7 +238,7 @@ impl ObjectImpl for WayfinderWindowInner {
         sidebar_toggle.connect_toggled(move |btn| {
             let visible = btn.is_active();
             revealer.set_reveal_child(visible);
-            crate::state::save_sidebar_visible(visible);
+            wayfinder::state::save_sidebar_visible(visible);
         });
         header.pack_end(&sidebar_toggle);
 
@@ -221,7 +262,7 @@ impl ObjectImpl for WayfinderWindowInner {
         window.set_child(Some(&paned));
 
         // Restore saved view mode
-        let saved_view = crate::state::load_view_mode();
+        let saved_view = wayfinder::state::load_view_mode();
         let initial_mode = match saved_view.as_deref() {
             Some("grid") => {
                 // Detach list, attach grid
@@ -238,7 +279,7 @@ impl ObjectImpl for WayfinderWindowInner {
         self.current_view.set(initial_mode);
 
         // Restore hidden files setting
-        if crate::state::load_show_hidden() {
+        if wayfinder::state::load_show_hidden() {
             self.model.toggle_hidden();
         }
 
@@ -254,11 +295,8 @@ impl ObjectImpl for WayfinderWindowInner {
         // Connect grid view activation
         self.connect_grid_activation();
 
-        // Connect location entry
-        self.connect_location_entry();
-
-        // Connect location entry tab override
-        self.connect_location_tab();
+        // Ctrl+L action opens location dialog
+        self.setup_location_dialog();
 
         // Connect nav buttons
         self.connect_nav_buttons();
@@ -294,7 +332,7 @@ impl ObjectImpl for WayfinderWindowInner {
         });
 
         // Restore saved sort state and wire ColumnView's sorter to the model
-        let (sort_col_idx, sort_asc) = crate::state::load_sort_state();
+        let (sort_col_idx, sort_asc) = wayfinder::state::load_sort_state();
         let columns = self.list_view.column_view().columns();
         let sort_order = if sort_asc { gtk::SortType::Ascending } else { gtk::SortType::Descending };
         if let Some(col) = columns.item(sort_col_idx).and_downcast::<gtk::ColumnViewColumn>() {
@@ -317,7 +355,7 @@ impl WindowImpl for WayfinderWindowInner {
     fn close_request(&self) -> glib::Propagation {
         let window = self.obj();
         let (w, h) = window.default_size();
-        crate::state::save_window_size(w, h);
+        wayfinder::state::save_window_size(w, h);
         self.parent_close_request()
     }
 }
@@ -401,19 +439,13 @@ impl WayfinderWindowInner {
         });
         window.add_action(&action);
 
-        let location_entry = self.location_entry.clone();
-        let action = gio::SimpleAction::new("location-bar", None);
-        action.connect_activate(move |_, _| {
-            location_entry.grab_focus();
-            location_entry.select_region(0, -1);
-        });
-        window.add_action(&action);
+        // location-bar action is set up in setup_location_dialog()
 
         let w = window.clone();
         let action = gio::SimpleAction::new("toggle-hidden", None);
         action.connect_activate(move |_, _| {
             let showing = w.imp().model.toggle_hidden();
-            crate::state::save_show_hidden(showing);
+            wayfinder::state::save_show_hidden(showing);
             let msg = if showing {
                 "Showing hidden files"
             } else {
@@ -445,7 +477,7 @@ impl WayfinderWindowInner {
         action.connect_activate(move |_, _| {
             let visible = !revealer.reveals_child();
             revealer.set_reveal_child(visible);
-            crate::state::save_sidebar_visible(visible);
+            wayfinder::state::save_sidebar_visible(visible);
         });
         window.add_action(&action);
 
@@ -512,11 +544,23 @@ impl WayfinderWindowInner {
         let w = window.clone();
         let action = gio::SimpleAction::new("select-all", None);
         action.connect_activate(move |_, _| {
-            // Select all not available with SingleSelection — will be added with MultiSelection
+            let imp = w.imp();
+            let mut sel = imp.file_selection.borrow_mut();
+            let model = &imp.model.filter_model;
+            for i in 0..model.n_items() {
+                if let Some(item) = model.item(i) {
+                    if let Some(file) = item.downcast_ref::<FileObject>() {
+                        sel.selected.insert(file.path());
+                    }
+                }
+            }
+            let count = sel.count();
+            drop(sel);
             w.announce(
-                "Select all not yet available",
+                &format!("{} files selected", count),
                 AccessibleAnnouncementPriority::Medium,
             );
+            w.update_status();
         });
         window.add_action(&action);
 
@@ -531,13 +575,8 @@ impl WayfinderWindowInner {
         });
         window.add_action(&action);
 
-        // Go to folder dialog
-        let w = window.clone();
-        let action = gio::SimpleAction::new("go-to-folder", None);
-        action.connect_activate(move |_, _| {
-            w.show_go_to_folder();
-        });
-        window.add_action(&action);
+        // Go to folder — same as Ctrl+L location dialog
+        // (the "location-bar" action is registered in setup_location_dialog)
     }
 
     fn connect_activation(&self) {
@@ -574,52 +613,125 @@ impl WayfinderWindowInner {
             });
     }
 
-    fn connect_location_entry(&self) {
-        let window = self.obj().clone();
-        self.location_entry.connect_activate(move |entry| {
-            let text = entry.text().to_string();
-            let path = if text.starts_with('~') {
-                if let Some(home) = dirs::home_dir() {
-                    text.replacen('~', &home.to_string_lossy(), 1)
-                } else {
-                    text
+    fn setup_location_dialog(&self) {
+        // Ctrl+L action: open a "Go to location" dialog with Tab autocomplete
+        let w = self.obj().clone();
+        let location_entry = self.location_entry.clone();
+        let action = gio::SimpleAction::new("location-bar", None);
+        action.connect_activate(move |_, _| {
+            let window = w.clone();
+            let le = location_entry.clone();
+
+            let dlg = gtk::Window::builder()
+                .title("Go to Location")
+                .modal(true)
+                .transient_for(&window)
+                .default_width(500)
+                .build();
+
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            vbox.set_margin_top(12);
+            vbox.set_margin_bottom(12);
+            vbox.set_margin_start(12);
+            vbox.set_margin_end(12);
+
+            let label = gtk::Label::new(Some("Enter a path (Tab to autocomplete):"));
+            vbox.append(&label);
+
+            let entry = gtk::Entry::builder()
+                .hexpand(true)
+                .text(window.imp().model.current_path())
+                .build();
+            entry.update_property(&[gtk::accessible::Property::Label("Location path")]);
+            entry.select_region(0, -1);
+            vbox.append(&entry);
+
+            let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            button_box.set_halign(gtk::Align::End);
+            let cancel_btn = gtk::Button::with_label("Cancel");
+            let go_btn = gtk::Button::with_label("Go");
+            go_btn.add_css_class("suggested-action");
+            button_box.append(&cancel_btn);
+            button_box.append(&go_btn);
+            vbox.append(&button_box);
+
+            dlg.set_child(Some(&vbox));
+
+            // Tab autocomplete + Escape to cancel
+            let tab_ctrl = gtk::EventControllerKey::new();
+            tab_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let entry_for_tab = entry.clone();
+            let dlg_for_tab = dlg.clone();
+            let dlg_for_esc = dlg.clone();
+            tab_ctrl.connect_key_pressed(move |_ctrl, key, _code, mods| {
+                use gtk::gdk;
+                if key == gdk::Key::Escape {
+                    dlg_for_esc.close();
+                    return glib::Propagation::Stop;
                 }
-            } else {
-                text
-            };
-            window.navigate_to_path(&path);
-            window.focus_current_view();
-        });
-    }
+                if key == gdk::Key::Tab && !mods.contains(gdk::ModifierType::SHIFT_MASK) {
+                    let text = entry_for_tab.text().to_string();
+                    if text.is_empty() {
+                        return glib::Propagation::Proceed;
+                    }
 
-    fn connect_location_tab(&self) {
-        let controller = gtk::EventControllerKey::new();
-        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let sidebar = self.sidebar.clone();
-        let sidebar_revealer = self.sidebar_revealer.clone();
+                    let expanded = if text.starts_with('~') {
+                        dirs::home_dir()
+                            .map(|h| text.replacen('~', &h.to_string_lossy(), 1))
+                            .unwrap_or(text)
+                    } else {
+                        text
+                    };
 
-        controller.connect_key_pressed(move |_controller, key, _code, mods| {
-            use gtk::gdk;
-
-            let is_tab = key == gdk::Key::Tab && !mods.contains(gdk::ModifierType::SHIFT_MASK);
-            let is_shift_tab = key == gdk::Key::ISO_Left_Tab
-                || (key == gdk::Key::Tab && mods.contains(gdk::ModifierType::SHIFT_MASK));
-
-            if is_tab || is_shift_tab {
-                if sidebar_revealer.reveals_child() {
-                    // Sidebar visible — go there
-                    sidebar.widget().child_focus(gtk::DirectionType::TabForward);
+                    if let Some(completed) = complete_path(&expanded) {
+                        entry_for_tab.set_text(&completed);
+                        entry_for_tab.set_position(-1);
+                        let name = std::path::Path::new(&completed)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or(completed);
+                        dlg_for_tab.announce(
+                            &name,
+                            AccessibleAnnouncementPriority::Medium,
+                        );
+                    }
                     glib::Propagation::Stop
                 } else {
-                    // Sidebar hidden — let Tab propagate naturally through the widget tree
                     glib::Propagation::Proceed
                 }
-            } else {
-                glib::Propagation::Proceed
-            }
-        });
+            });
+            entry.add_controller(tab_ctrl);
 
-        self.location_entry.add_controller(controller);
+            // Cancel
+            let d = dlg.clone();
+            cancel_btn.connect_clicked(move |_| d.close());
+
+            // Go — navigate and close
+            let d = dlg.clone();
+            let entry_clone = entry.clone();
+            let w = window.clone();
+            let _le2 = le.clone();
+            let do_go = move || {
+                let text = entry_clone.text().to_string();
+                let path = if text.starts_with('~') {
+                    dirs::home_dir()
+                        .map(|h| text.replacen('~', &h.to_string_lossy(), 1))
+                        .unwrap_or(text)
+                } else {
+                    text
+                };
+                w.navigate_to_path(&path);
+                d.close();
+            };
+
+            let do_go_clone = do_go.clone();
+            go_btn.connect_clicked(move |_| do_go_clone());
+            entry.connect_activate(move |_| do_go());
+
+            dlg.present();
+            entry.grab_focus();
+        });
+        self.obj().add_action(&action);
     }
 
     fn connect_list_key_navigation(&self) {
@@ -663,6 +775,90 @@ impl WayfinderWindowInner {
                 if col + 1 < COLUMN_NAMES.len() {
                     imp.current_column.set(col + 1);
                     imp.announce_current_cell(&window);
+                }
+                glib::Propagation::Stop
+            } else if key == gdk::Key::space
+                && !mods.contains(gdk::ModifierType::SHIFT_MASK)
+            {
+                // Space: toggle selection of current item
+                if let Some(item) = imp.selection.selected_item() {
+                    if let Some(file) = item.downcast_ref::<FileObject>() {
+                        let mut sel = imp.file_selection.borrow_mut();
+                        let selected = sel.toggle(&file.path());
+                        let count = sel.count();
+                        drop(sel);
+                        if selected {
+                            window.announce(
+                                &format!("{} selected, {} total", file.name(), count),
+                                AccessibleAnnouncementPriority::Medium,
+                            );
+                        } else {
+                            window.announce(
+                                &format!("{} deselected, {} total", file.name(), count),
+                                AccessibleAnnouncementPriority::Medium,
+                            );
+                        }
+                        window.update_status();
+                    }
+                }
+                glib::Propagation::Stop
+            } else if key == gdk::Key::space
+                && mods.contains(gdk::ModifierType::SHIFT_MASK)
+            {
+                // Shift+Space: start or finish range selection
+                let mut sel = imp.file_selection.borrow_mut();
+                let pos = imp.selection.selected();
+                if sel.range_anchor.is_none() {
+                    // Start range
+                    sel.range_anchor = Some(pos);
+                    drop(sel);
+                    window.announce(
+                        "Selection started",
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                } else {
+                    // Finish range — select all items between anchor and current
+                    let anchor = sel.range_anchor.unwrap();
+                    let start = anchor.min(pos);
+                    let end = anchor.max(pos);
+                    for i in start..=end {
+                        if let Some(item) = imp.selection.model().and_then(|m| m.item(i)) {
+                            if let Some(file) = item.downcast_ref::<FileObject>() {
+                                sel.selected.insert(file.path());
+                            }
+                        }
+                    }
+                    let count = sel.count();
+                    sel.range_anchor = None;
+                    drop(sel);
+                    window.announce(
+                        &format!("Selection finished: {} files selected", count),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    window.update_status();
+                }
+                glib::Propagation::Stop
+            } else if key == gdk::Key::Escape {
+                // Escape: cancel range selection or clear selection
+                let mut sel = imp.file_selection.borrow_mut();
+                if sel.range_anchor.is_some() {
+                    sel.range_anchor = None;
+                    drop(sel);
+                    window.announce(
+                        "Selection cancelled",
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                } else if sel.count() > 0 {
+                    sel.clear();
+                    drop(sel);
+                    window.announce(
+                        "Selection cleared",
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    window.update_status();
+                } else {
+                    drop(sel);
+                    return glib::Propagation::Proceed;
                 }
                 glib::Propagation::Stop
             } else {
@@ -718,6 +914,85 @@ impl WayfinderWindowInner {
                 || (key == gdk::Key::Tab && mods.contains(gdk::ModifierType::SHIFT_MASK))
             {
                 imp.location_entry.grab_focus();
+                glib::Propagation::Stop
+            } else if key == gdk::Key::space
+                && !mods.contains(gdk::ModifierType::SHIFT_MASK)
+            {
+                if let Some(item) = imp.selection.selected_item() {
+                    if let Some(file) = item.downcast_ref::<FileObject>() {
+                        let mut sel = imp.file_selection.borrow_mut();
+                        let selected = sel.toggle(&file.path());
+                        let count = sel.count();
+                        drop(sel);
+                        if selected {
+                            window.announce(
+                                &format!("{} selected, {} total", file.name(), count),
+                                AccessibleAnnouncementPriority::Medium,
+                            );
+                        } else {
+                            window.announce(
+                                &format!("{} deselected, {} total", file.name(), count),
+                                AccessibleAnnouncementPriority::Medium,
+                            );
+                        }
+                        window.update_status();
+                    }
+                }
+                glib::Propagation::Stop
+            } else if key == gdk::Key::space
+                && mods.contains(gdk::ModifierType::SHIFT_MASK)
+            {
+                let mut sel = imp.file_selection.borrow_mut();
+                let pos = imp.selection.selected();
+                if sel.range_anchor.is_none() {
+                    sel.range_anchor = Some(pos);
+                    drop(sel);
+                    window.announce(
+                        "Selection started",
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                } else {
+                    let anchor = sel.range_anchor.unwrap();
+                    let start = anchor.min(pos);
+                    let end = anchor.max(pos);
+                    for i in start..=end {
+                        if let Some(item) = imp.selection.model().and_then(|m| m.item(i)) {
+                            if let Some(file) = item.downcast_ref::<FileObject>() {
+                                sel.selected.insert(file.path());
+                            }
+                        }
+                    }
+                    let count = sel.count();
+                    sel.range_anchor = None;
+                    drop(sel);
+                    window.announce(
+                        &format!("Selection finished: {} files selected", count),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    window.update_status();
+                }
+                glib::Propagation::Stop
+            } else if key == gdk::Key::Escape {
+                let mut sel = imp.file_selection.borrow_mut();
+                if sel.range_anchor.is_some() {
+                    sel.range_anchor = None;
+                    drop(sel);
+                    window.announce(
+                        "Selection cancelled",
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                } else if sel.count() > 0 {
+                    sel.clear();
+                    drop(sel);
+                    window.announce(
+                        "Selection cleared",
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    window.update_status();
+                } else {
+                    drop(sel);
+                    return glib::Propagation::Proceed;
+                }
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -915,4 +1190,87 @@ impl WayfinderWindowInner {
             }
         });
     }
+}
+
+/// Complete a partial path to the first matching entry.
+/// If the path ends with a partial name, find the first match in the parent directory.
+/// If the path is a complete directory, append a / to signal entering it.
+fn complete_path(partial: &str) -> Option<String> {
+    let path = std::path::Path::new(partial);
+
+    // If it's an existing directory without trailing /, add the /
+    if path.is_dir() && !partial.ends_with('/') {
+        return Some(format!("{}/", partial));
+    }
+
+    // If it ends with /, list the first child
+    if partial.ends_with('/') && path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            if let Some(first) = names.first() {
+                return Some(format!("{}{}", partial, first));
+            }
+        }
+        return None;
+    }
+
+    // Split into parent directory and partial filename
+    let parent = path.parent()?;
+    let prefix = path.file_name()?.to_string_lossy().to_lowercase();
+
+    if !parent.is_dir() {
+        return None;
+    }
+
+    let mut matches: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.to_lowercase().starts_with(&prefix) {
+                matches.push(name);
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+
+    if matches.len() == 1 {
+        // Single match — complete it fully
+        let completed = parent.join(&matches[0]);
+        let result = completed.to_string_lossy().to_string();
+        if completed.is_dir() {
+            Some(format!("{}/", result))
+        } else {
+            Some(result)
+        }
+    } else if matches.len() > 1 {
+        // Multiple matches — complete to the longest common prefix
+        let common = longest_common_prefix(&matches);
+        let completed = parent.join(&common);
+        Some(completed.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn longest_common_prefix(strings: &[String]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+    let first = &strings[0];
+    let mut len = first.len();
+    for s in &strings[1..] {
+        len = len.min(s.len());
+        for (i, (a, b)) in first.chars().zip(s.chars()).enumerate() {
+            if a.to_lowercase().ne(b.to_lowercase()) {
+                len = len.min(i);
+                break;
+            }
+        }
+    }
+    first[..len].to_string()
 }

@@ -1,9 +1,17 @@
 [package]
 name = "wayfinder"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Accessible GTK4 file manager"
 license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "wayfinder"
+path = "src/main.rs"
+
+[[bin]]
+name = "wayfinder-portal"
+path = "src/portal/main.rs"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
@@ -13,3 +21,5 @@ log = "0.4"
 env_logger = "0.11"
 chrono = "0.4"
 open = "5"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "macros"] }

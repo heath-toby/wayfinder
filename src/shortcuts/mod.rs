@@ -42,8 +42,8 @@ pub fn register_shortcuts(window: &super::window::WayfinderWindow) {
     // New window
     add_shortcut(&controller, "<Ctrl>n", "win.new-window");
 
-    // Go to folder
-    add_shortcut(&controller, "<Ctrl><Shift>g", "win.go-to-folder");
+    // Go to folder (same dialog as Ctrl+L)
+    add_shortcut(&controller, "<Ctrl><Shift>g", "win.location-bar");
 
     window.add_controller(controller);
 }

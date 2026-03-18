@@ -5,7 +5,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::AccessibleAnnouncementPriority;
 
-use crate::file_object::FileObject;
+use wayfinder::file_object::FileObject;
 
 pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
     let gio_file = gio::File::for_path(file.path());
@@ -148,7 +148,7 @@ pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
 
             // Check for a per-file association first, then fall back to MIME default
             let file_path = file.path();
-            let per_file_app = crate::state::load_file_app(&file_path);
+            let per_file_app = wayfinder::state::load_file_app(&file_path);
             let mut selected_idx = 0u32;
 
             if let Some(ref per_file_id) = per_file_app {
@@ -177,7 +177,7 @@ pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
                 let idx = dd.selected() as usize;
                 if let Some(app) = apps_for_change.get(idx) {
                     if let Some(id) = app.id() {
-                        crate::state::save_file_app(&fp, id.as_ref());
+                        wayfinder::state::save_file_app(&fp, id.as_ref());
                         parent_for_change.announce(
                             &format!("{} will be used to open this file", app.name()),
                             AccessibleAnnouncementPriority::Medium,

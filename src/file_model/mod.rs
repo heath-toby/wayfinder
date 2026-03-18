@@ -22,6 +22,12 @@ pub struct DirectoryModel {
     monitor: RefCell<Option<gio::FileMonitor>>,
 }
 
+impl Default for DirectoryModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirectoryModel {
     pub fn new() -> Self {
         let store = gio::ListStore::new::<FileObject>();
