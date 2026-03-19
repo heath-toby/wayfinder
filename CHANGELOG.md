@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.2.3
+
+### Accessibility
+
+- **Empty folder announcements** — opening an empty folder announces "Opened X, folder is empty". Opening an empty Bin announces "Opened Bin, Bin is empty". Trashing or deleting the last file announces "folder is now empty" in the message.
+
+---
+
 ## 2.2.2
 
 ### Fixed

@@ -79,8 +79,6 @@ impl WayfinderWindow {
                     .unwrap_or_else(|| path.to_string());
 
                 let count = imp.model.item_count();
-                let announcement = format!("Opened {}, {} items", dir_name, count);
-                self.announce(&announcement, AccessibleAnnouncementPriority::Medium);
 
                 // Reset column, selection state, type-ahead, and focus the first item
                 imp.current_column.set(0);
@@ -88,7 +86,23 @@ impl WayfinderWindow {
                 imp.type_ahead_buffer.borrow_mut().clear();
                 imp.selection.set_selected(0);
 
+                // Announce before focus for empty folders (focus change
+                // would otherwise override the announcement)
+                if count == 0 {
+                    self.announce(
+                        &format!("Opened {}, folder is empty", dir_name),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                }
+
                 self.focus_current_view();
+
+                if count > 0 {
+                    self.announce(
+                        &format!("Opened {}, {} items", dir_name, count),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                }
             }
             Err(e) => {
                 log::error!("Failed to load directory {}: {}", path, e);
@@ -121,12 +135,19 @@ impl WayfinderWindow {
                 self.update_status();
 
                 let count = imp.model.item_count();
-                let announcement = format!("Opened Bin, {} items", count);
-                self.announce(&announcement, AccessibleAnnouncementPriority::Medium);
 
                 imp.current_column.set(0);
                 imp.selection.set_selected(0);
+
+                if count == 0 {
+                    self.announce("Opened Bin, Bin is empty", AccessibleAnnouncementPriority::Medium);
+                }
+
                 self.focus_current_view();
+
+                if count > 0 {
+                    self.announce(&format!("Opened Bin, {} items", count), AccessibleAnnouncementPriority::Medium);
+                }
             }
             Err(e) => {
                 log::error!("Failed to load {}: {}", uri, e);
@@ -591,17 +612,20 @@ impl WayfinderWindow {
         }
 
         if failed == 0 {
-            if success == 1 {
-                self.announce(
-                    &format!("Moved {} to Bin", files[0].name()),
-                    AccessibleAnnouncementPriority::Medium,
-                );
+            let now_empty = imp.selection.n_items() == 0;
+            let msg = if success == 1 {
+                if now_empty {
+                    format!("Moved {} to Bin, folder is now empty", files[0].name())
+                } else {
+                    format!("Moved {} to Bin", files[0].name())
+                }
+            } else if now_empty {
+                format!("Moved {} files to Bin, folder is now empty", success)
             } else {
-                self.announce(
-                    &format!("Moved {} files to Bin", success),
-                    AccessibleAnnouncementPriority::Medium,
-                );
-            }
+                format!("Moved {} files to Bin", success)
+            };
+
+            self.announce(&msg, AccessibleAnnouncementPriority::Medium);
         }
     }
 
@@ -689,17 +713,20 @@ impl WayfinderWindow {
                             }
 
                             if failed == 0 {
-                                if success == 1 {
-                                    window.announce(
-                                        &format!("Deleted {}", file_paths[0].0),
-                                        AccessibleAnnouncementPriority::Medium,
-                                    );
+                                let now_empty = n_items == 0;
+                                let msg = if success == 1 {
+                                    if now_empty {
+                                        format!("Deleted {}, folder is now empty", file_paths[0].0)
+                                    } else {
+                                        format!("Deleted {}", file_paths[0].0)
+                                    }
+                                } else if now_empty {
+                                    format!("Deleted {} files, folder is now empty", success)
                                 } else {
-                                    window.announce(
-                                        &format!("Deleted {} files", success),
-                                        AccessibleAnnouncementPriority::Medium,
-                                    );
-                                }
+                                    format!("Deleted {} files", success)
+                                };
+
+                                window.announce(&msg, AccessibleAnnouncementPriority::Medium);
                             }
                         }
                     }
