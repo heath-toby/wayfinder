@@ -606,19 +606,34 @@ impl WayfinderWindow {
     }
 
     pub fn delete_selected(&self) {
-        let Some(file) = self.get_selected_file() else {
+        let files = self.get_selected_files();
+        if files.is_empty() {
             return;
-        };
+        }
 
         let window = self.clone();
         let old_pos = self.imp().selection.selected();
+        let count = files.len();
+
+        let message = if count == 1 {
+            format!("Permanently delete {}?", files[0].name())
+        } else {
+            format!("Permanently delete {} items?", count)
+        };
+
         let dialog = gtk::AlertDialog::builder()
-            .message(format!("Permanently delete {}?", file.name()))
+            .message(message)
             .detail("This cannot be undone.")
             .buttons(["Cancel", "Delete permanently"])
             .cancel_button(0)
             .default_button(0)
             .build();
+
+        // Capture paths as strings before the async callback
+        let file_paths: Vec<(String, String)> = files
+            .iter()
+            .map(|f| (f.name(), f.path()))
+            .collect();
 
         dialog.choose(
             Some(&window.clone()),
@@ -626,32 +641,65 @@ impl WayfinderWindow {
             move |result| {
                 if let Ok(choice) = result {
                     if choice == 1 {
-                        let gio_file = gio::File::for_path(file.path());
-                        match wayfinder::file_ops::delete_file_recursive(&gio_file) {
-                            Ok(()) => {
-                                window.announce(
-                                    &format!("Deleted {}", file.name()),
-                                    AccessibleAnnouncementPriority::Medium,
-                                );
-                                // Focus the item above the deleted one
-                                let n_items = window.imp().selection.n_items();
-                                if n_items > 0 {
-                                    let new_pos = if old_pos > 0 && old_pos >= n_items {
-                                        n_items - 1
-                                    } else if old_pos > 0 {
-                                        old_pos - 1
-                                    } else {
-                                        0
-                                    };
-                                    window.imp().selection.set_selected(new_pos);
-                                    window.restore_focus_to_selected();
+                        let mut success = 0;
+                        let mut failed = 0;
+                        let mut last_error = String::new();
+
+                        for (name, path) in &file_paths {
+                            let gio_file = gio::File::for_path(path);
+                            match wayfinder::file_ops::delete_file_recursive(&gio_file) {
+                                Ok(()) => success += 1,
+                                Err(e) => {
+                                    failed += 1;
+                                    last_error = format!("{}: {}", name, e);
                                 }
                             }
-                            Err(e) => {
+                        }
+
+                        // Announce failures first
+                        if failed > 0 {
+                            if failed == 1 {
                                 window.announce(
-                                    &format!("Failed to delete {}: {}", file.name(), e),
+                                    &format!("Could not delete: {}", last_error),
                                     AccessibleAnnouncementPriority::High,
                                 );
+                            } else {
+                                window.announce(
+                                    &format!("{} files could not be deleted", failed),
+                                    AccessibleAnnouncementPriority::High,
+                                );
+                            }
+                        }
+
+                        if success > 0 {
+                            window.imp().file_selection.borrow_mut().clear();
+                            window.update_status();
+
+                            let n_items = window.imp().selection.n_items();
+                            if n_items > 0 {
+                                let new_pos = if old_pos > 0 && old_pos >= n_items {
+                                    n_items - 1
+                                } else if old_pos > 0 {
+                                    old_pos - 1
+                                } else {
+                                    0
+                                };
+                                window.imp().selection.set_selected(new_pos);
+                                window.restore_focus_to_selected();
+                            }
+
+                            if failed == 0 {
+                                if success == 1 {
+                                    window.announce(
+                                        &format!("Deleted {}", file_paths[0].0),
+                                        AccessibleAnnouncementPriority::Medium,
+                                    );
+                                } else {
+                                    window.announce(
+                                        &format!("Deleted {} files", success),
+                                        AccessibleAnnouncementPriority::Medium,
+                                    );
+                                }
                             }
                         }
                     }

@@ -1,5 +1,5 @@
 [Desktop Entry]
 Name=Extract Here
 TryExec=bsdtar
-Exec=sh -c 'cd "$(dirname "$1")" && bsdtar xf "$1"' _ %f
+Exec=sh -c 'archive="$1"; dir="$(dirname "$archive")"; stem="$(basename "$archive")"; stem="${stem%%.*}"; entries=$(bsdtar tf "$archive" 2>/dev/null | head -2); first=$(echo "$entries" | head -1 | cut -d/ -f1); count=$(echo "$entries" | cut -d/ -f1 | sort -u | wc -l); if [ "$count" -eq 1 ] && [ -n "$first" ]; then cd "$dir" && bsdtar xf "$archive"; else mkdir -p "$dir/$stem" && cd "$dir/$stem" && bsdtar xf "$archive"; fi' _ %f
 MimeType=application/zip;application/gzip;application/x-tar;application/x-compressed-tar;application/x-bzip-compressed-tar;application/x-xz-compressed-tar;application/x-zstd-compressed-tar;application/x-7z-compressed;
