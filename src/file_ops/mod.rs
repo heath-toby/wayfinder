@@ -124,6 +124,214 @@ pub fn rename_file(file: &gio::File, new_name: &str) -> Result<gio::File, glib::
     Ok(new_file)
 }
 
+/// Callback fired when `delete_with_progress` finishes: receives
+/// `(success_count, failed_count)`.
+pub type DeleteCompleteCallback = Box<dyn FnOnce(usize, usize) + 'static>;
+
+/// Permanently delete a list of paths in a background thread, with a
+/// non-modal progress dialog and Cancel button. Best used for slow
+/// filesystems (FUSE, network mounts) where each delete may take seconds.
+///
+/// `on_complete` runs on the main thread when all deletions finish or the
+/// user cancels.
+pub fn delete_with_progress(
+    paths: Vec<String>,
+    parent_window: &gtk::Window,
+    on_complete: Option<DeleteCompleteCallback>,
+) {
+    let total = paths.len();
+    if total == 0 {
+        if let Some(cb) = on_complete {
+            cb(0, 0);
+        }
+        return;
+    }
+
+    // Build the dialog
+    let dlg = gtk::Window::builder()
+        .title(if total == 1 {
+            "Deleting".to_string()
+        } else {
+            format!("Deleting {total} items")
+        })
+        .modal(false)
+        .transient_for(parent_window)
+        .default_width(450)
+        .resizable(false)
+        .build();
+    dlg.update_property(&[gtk::accessible::Property::Label("Delete progress")]);
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    let title_label = gtk::Label::builder()
+        .label(if total == 1 {
+            format!("Deleting {}", &paths[0])
+        } else {
+            format!("Deleting {total} items")
+        })
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    title_label.update_property(&[gtk::accessible::Property::Label(
+        "Delete operation in progress",
+    )]);
+
+    let progress_bar = gtk::ProgressBar::new();
+    progress_bar.set_show_text(true);
+    progress_bar.update_property(&[gtk::accessible::Property::Label("Progress")]);
+
+    let status_entry = gtk::Entry::builder()
+        .editable(false)
+        .can_focus(true)
+        .text("Preparing...")
+        .build();
+    status_entry.update_property(&[
+        gtk::accessible::Property::Label("Delete status"),
+        gtk::accessible::Property::Description("Current file being deleted"),
+    ]);
+
+    let cancel_button = gtk::Button::with_label("Cancel");
+    cancel_button.update_property(&[gtk::accessible::Property::Label("Cancel deletion")]);
+
+    let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    button_box.set_halign(gtk::Align::End);
+    button_box.append(&cancel_button);
+
+    vbox.append(&title_label);
+    vbox.append(&progress_bar);
+    vbox.append(&status_entry);
+    vbox.append(&button_box);
+    dlg.set_child(Some(&vbox));
+
+    // Cancellation flag — checked between each file delete in the worker thread
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_btn = cancelled.clone();
+    let dlg_for_cancel = dlg.clone();
+    cancel_button.connect_clicked(move |_| {
+        cancelled_for_btn.store(true, Ordering::Relaxed);
+        // Don't close yet — let the worker thread send Done so the dialog
+        // closes with consistent state.
+        dlg_for_cancel.set_title(Some("Cancelling..."));
+    });
+
+    dlg.present();
+    status_entry.grab_focus();
+
+    // Channel for streaming progress events
+    enum DeleteEvent {
+        Progress {
+            done: usize,
+            total: usize,
+            current_path: String,
+            ok: bool,
+            error: Option<String>,
+        },
+        Done {
+            success: usize,
+            failed: usize,
+        },
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<DeleteEvent>();
+    let cancelled_for_thread = cancelled.clone();
+
+    // Worker thread: deletes files using std::fs (no GIO needed; works
+    // through any FUSE mount that exposes a normal POSIX interface).
+    std::thread::spawn(move || {
+        let mut success = 0;
+        let mut failed = 0;
+        for (i, path) in paths.iter().enumerate() {
+            if cancelled_for_thread.load(Ordering::Relaxed) {
+                break;
+            }
+            let result = delete_path_recursive_std(std::path::Path::new(path));
+            let ok = result.is_ok();
+            if ok {
+                success += 1;
+            } else {
+                failed += 1;
+            }
+            let _ = tx.send(DeleteEvent::Progress {
+                done: i + 1,
+                total,
+                current_path: path.clone(),
+                ok,
+                error: result.err(),
+            });
+        }
+        let _ = tx.send(DeleteEvent::Done { success, failed });
+    });
+
+    // Main thread polls the channel and updates the UI
+    let on_complete_cell: std::rc::Rc<std::cell::RefCell<Option<DeleteCompleteCallback>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(on_complete));
+    let progress_clone = progress_bar.clone();
+    let status_clone = status_entry.clone();
+    let dlg_clone = dlg.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+        loop {
+            match rx.try_recv() {
+                Ok(DeleteEvent::Progress {
+                    done,
+                    total,
+                    current_path,
+                    ok,
+                    error,
+                }) => {
+                    let fraction = done as f64 / total as f64;
+                    progress_clone.set_fraction(fraction);
+                    progress_clone.set_text(Some(&format!(
+                        "{done} of {total}, {:.0}%",
+                        fraction * 100.0
+                    )));
+                    let basename = std::path::Path::new(&current_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or(current_path);
+                    let msg = if ok {
+                        format!("Deleted {basename}")
+                    } else {
+                        format!(
+                            "Failed: {basename}: {}",
+                            error.unwrap_or_default()
+                        )
+                    };
+                    status_clone.set_text(&msg);
+                }
+                Ok(DeleteEvent::Done { success, failed }) => {
+                    dlg_clone.close();
+                    if let Some(cb) = on_complete_cell.borrow_mut().take() {
+                        cb(success, failed);
+                    }
+                    return glib::ControlFlow::Break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(_) => {
+                    dlg_clone.close();
+                    return glib::ControlFlow::Break;
+                }
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Recursive delete using std::fs. Works through any FUSE mount that
+/// exposes POSIX semantics. Faster startup than GIO for our use case
+/// because we skip the full file-info enumeration on each child.
+fn delete_path_recursive_std(path: &std::path::Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if meta.file_type().is_dir() {
+        std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+    } else {
+        std::fs::remove_file(path).map_err(|e| e.to_string())
+    }
+}
+
 pub fn create_folder(parent: &gio::File, name: &str) -> Result<gio::File, glib::Error> {
     let folder = parent.child(name);
     folder.make_directory(gio::Cancellable::NONE)?;

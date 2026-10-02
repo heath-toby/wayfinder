@@ -184,15 +184,15 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
 
         add_separator(&main_box);
 
-        add_menu_item(&main_box, "Cut", &popover, {
+        add_clipboard_item(&main_box, "Cut", &popover, {
             let w = window.clone();
             move || w.cut_selected()
         });
-        add_menu_item(&main_box, "Copy", &popover, {
+        add_clipboard_item(&main_box, "Copy", &popover, {
             let w = window.clone();
             move || w.copy_selected()
         });
-        add_menu_item(&main_box, "Copy Path", &popover, {
+        add_clipboard_item(&main_box, "Copy Path", &popover, {
             let w = window.clone();
             let f = file.clone();
             move || {
@@ -206,7 +206,7 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                 );
             }
         });
-        add_menu_item(&main_box, "Copy Name", &popover, {
+        add_clipboard_item(&main_box, "Copy Name", &popover, {
             let w = window.clone();
             let f = file.clone();
             move || {
@@ -251,6 +251,147 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                 });
             }
         });
+
+        // Offline pin toggle — only show on FUSE-mounted paths
+        let pin_path = file.path();
+        if is_fuse_mounted_path(&pin_path) || wayfinder::offline::is_pinned(&pin_path) {
+            let pinned = wayfinder::offline::is_pinned(&pin_path);
+            let label = if pinned {
+                "Remove Offline Copy"
+            } else {
+                "Keep Available Offline"
+            };
+            add_menu_item(&main_box, label, &popover, {
+                let w = window.clone();
+                let p = pin_path.clone();
+                let was_pinned = pinned;
+                move || {
+                    if was_pinned {
+                        match wayfinder::offline::unpin_path(&p) {
+                            Ok(()) => w.announce(
+                                "Offline copy removed",
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            ),
+                            Err(e) => w.announce(
+                                &format!("Failed to remove offline copy: {e}"),
+                                gtk::AccessibleAnnouncementPriority::High,
+                            ),
+                        }
+                    } else {
+                        let parent_window: gtk::Window = w.clone().upcast();
+                        let pin_path_str = p.clone();
+                        let w_done = w.clone();
+                        let on_complete: Option<Box<dyn FnOnce() + 'static>> =
+                            Some(Box::new(move || {
+                                match wayfinder::offline::record_pin(&pin_path_str) {
+                                    Ok(()) => w_done.announce(
+                                        "Available offline",
+                                        gtk::AccessibleAnnouncementPriority::Medium,
+                                    ),
+                                    Err(e) => w_done.announce(
+                                        &format!("Pin recorded with warning: {e}"),
+                                        gtk::AccessibleAnnouncementPriority::High,
+                                    ),
+                                }
+                            }));
+
+                        // Prefer rclone-direct copy when the source lives on
+                        // an rclone FUSE mount — much faster than reading
+                        // through the FUSE layer, and it shows real progress.
+                        if wayfinder::rclone_ops::rclone_for_path(&p).is_some()
+                            && wayfinder::rclone_ops::rclone_available()
+                        {
+                            wayfinder::rclone_ops::pin_with_progress(
+                                &p,
+                                &parent_window,
+                                on_complete,
+                            );
+                        } else {
+                            // Fallback: GIO copy through the filesystem.
+                            let cache_path = wayfinder::offline::cache_path_for(&p);
+                            let Some(cache_parent) =
+                                cache_path.parent().map(|p| p.to_path_buf())
+                            else {
+                                w.announce(
+                                    "Pin failed: cannot determine cache location",
+                                    gtk::AccessibleAnnouncementPriority::High,
+                                );
+                                return;
+                            };
+                            if let Err(e) = std::fs::create_dir_all(&cache_parent) {
+                                w.announce(
+                                    &format!("Pin failed: {e}"),
+                                    gtk::AccessibleAnnouncementPriority::High,
+                                );
+                                return;
+                            }
+                            let source = gio::File::for_path(&p);
+                            let dest_dir = gio::File::for_path(&cache_parent);
+                            wayfinder::file_ops::copy_with_progress(
+                                &source,
+                                &dest_dir,
+                                &parent_window,
+                                on_complete,
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        // Two-way sync via rclone — only show on directories
+        if file.is_directory() {
+            let sync_path = file.path();
+            let pair = wayfinder::rclone_sync::pair_for(&sync_path);
+            if pair.is_some() {
+                // Already paired — offer Sync now and Edit/Remove
+                add_menu_item(&main_box, "Sync now", &popover, {
+                    let w = window.clone();
+                    let p = sync_path.clone();
+                    move || {
+                        let parent: gtk::Window = w.clone().upcast();
+                        wayfinder::rclone_sync::dialog::trigger_sync(&parent, &p);
+                    }
+                });
+                add_menu_item(&main_box, "Edit sync pairing...", &popover, {
+                    let w = window.clone();
+                    let p = sync_path.clone();
+                    move || {
+                        let win = w.clone();
+                        let p_clone = p.clone();
+                        glib::idle_add_local_once(move || {
+                            wayfinder::rclone_sync::dialog::show_dialog(
+                                &win,
+                                &p_clone,
+                                {
+                                    let w = win.clone();
+                                    move || w.restore_focus_to_selected()
+                                },
+                            );
+                        });
+                    }
+                });
+            } else if wayfinder::rclone_ops::rclone_available() {
+                add_menu_item(&main_box, "Set up two-way sync...", &popover, {
+                    let w = window.clone();
+                    let p = sync_path.clone();
+                    move || {
+                        let win = w.clone();
+                        let p_clone = p.clone();
+                        glib::idle_add_local_once(move || {
+                            wayfinder::rclone_sync::dialog::show_dialog(
+                                &win,
+                                &p_clone,
+                                {
+                                    let w = win.clone();
+                                    move || w.restore_focus_to_selected()
+                                },
+                            );
+                        });
+                    }
+                });
+            }
+        }
 
         // Custom actions from .desktop files and Nautilus scripts
         let custom_actions = wayfinder::actions::load_actions();
@@ -400,6 +541,32 @@ fn add_menu_item(
     container.append(&button);
 }
 
+/// Like `add_menu_item`, but runs the callback *before* closing the popover.
+/// Use it for every item that writes to the clipboard.
+/// On Wayland the compositor only accepts a clipboard selection from the
+/// client that holds keyboard focus. Popping down destroys the popup surface
+/// first, leaving a gap where nothing of ours is focused, so a clipboard set
+/// after `popdown()` gets silently dropped (Niri/Smithay does this).
+fn add_clipboard_item(
+    container: &gtk::Box,
+    label: &str,
+    popover: &gtk::Popover,
+    callback: impl Fn() + 'static,
+) {
+    let button = gtk::Button::builder()
+        .label(label)
+        .accessible_role(AccessibleRole::MenuItem)
+        .css_classes(["flat"])
+        .halign(gtk::Align::Fill)
+        .build();
+    let pop = popover.clone();
+    button.connect_clicked(move |_| {
+        callback();
+        pop.popdown();
+    });
+    container.append(&button);
+}
+
 fn add_separator(container: &gtk::Box) {
     let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
     container.append(&sep);
@@ -492,4 +659,9 @@ pub fn register_open_with_actions(window: &WayfinderWindow) {
         w.empty_trash();
     });
     window.add_action(&action);
+}
+
+/// Check whether a path is on a FUSE filesystem (rclone, sshfs, etc.).
+fn is_fuse_mounted_path(path: &str) -> bool {
+    wayfinder::rclone_ops::is_fuse_path(path)
 }

@@ -13,6 +13,36 @@ use wayfinder::file_object::FileObject;
 
 pub use imp::ViewMode;
 
+/// Where the files being pasted came from, which decides what a cut clears.
+#[derive(Clone, Copy)]
+enum PasteSource {
+    /// Wayfinder's app-wide clipboard (Ctrl+C / Ctrl+X).
+    Global,
+    /// The window-local clipboard (Ctrl+Shift+C / Ctrl+Shift+X).
+    Local,
+    /// Another application, e.g. files copied in Nautilus.
+    System,
+}
+
+/// RAII guard that clears `pasting` on drop. Captures any panic in the
+/// progress callback or worker so the flag can never be stranded.
+struct PastingGuard {
+    win: WayfinderWindow,
+}
+
+impl PastingGuard {
+    fn new(win: WayfinderWindow) -> Self {
+        win.imp().pasting.set(true);
+        Self { win }
+    }
+}
+
+impl Drop for PastingGuard {
+    fn drop(&mut self) {
+        self.win.imp().pasting.set(false);
+    }
+}
+
 glib::wrapper! {
     pub struct WayfinderWindow(ObjectSubclass<imp::WayfinderWindowInner>)
         @extends gtk::ApplicationWindow, gtk::Window, gtk::Widget,
@@ -22,7 +52,14 @@ glib::wrapper! {
 
 impl WayfinderWindow {
     pub fn new(app: &Application) -> Self {
-        glib::Object::builder().property("application", app).build()
+        // Explicitly set accessible-role to ApplicationWindow so Orca and
+        // other AT-SPI2 clients recognize this as a proper application window.
+        // Without this, the window may default to FILLER role which breaks
+        // focus tracking and causes spurious window-activation events.
+        glib::Object::builder()
+            .property("application", app)
+            .property("accessible-role", gtk::AccessibleRole::Window)
+            .build()
     }
 
     /// Navigate to a path, updating history. If the path doesn't exist,
@@ -48,6 +85,19 @@ impl WayfinderWindow {
     pub fn load_directory(&self, path: &str) {
         let imp = self.imp();
 
+        // Save the currently selected filename for the OLD directory so we can
+        // restore it if the user navigates back later in this session.
+        let old_path = imp.model.current_path();
+        if !old_path.is_empty() && old_path != path {
+            if let Some(item) = imp.selection.selected_item() {
+                if let Some(file) = item.downcast_ref::<FileObject>() {
+                    imp.last_position
+                        .borrow_mut()
+                        .insert(old_path, file.name());
+                }
+            }
+        }
+
         // Clear search when navigating
         if imp.model.search.is_active() {
             imp.model.search.clear();
@@ -55,7 +105,71 @@ impl WayfinderWindow {
             imp.search_bar.set_search_mode(false);
         }
 
-        match imp.model.load_directory(path) {
+        let live_result = imp.model.load_directory(path);
+        // Use the count returned directly by load_directory, NOT the
+        // filtered model — the filter chain can momentarily report 0 even
+        // when the underlying store is populated, which would falsely
+        // trigger cache fallback for ordinary directories.
+        let live_count = live_result.as_ref().copied().unwrap_or(0);
+
+        // Decide whether to substitute the offline cache. We want the cache
+        // to kick in ONLY for paths that are at-or-inside a known rclone
+        // FUSE mountpoint (the user has seen mounted at some point).
+        // Otherwise an ordinary parent directory like `/home/<user>` could
+        // get hijacked by the cache layout, since the cache mirrors the
+        // full path structure.
+        let path_is_fuse = is_fuse_mount(path);
+        let in_known_mount = wayfinder::offline::path_is_in_known_mountpoint(path);
+        let cache = wayfinder::offline::cache_path_for(path);
+        let cache_has_items = cache.is_dir()
+            && std::fs::read_dir(&cache)
+                .map(|d| d.count() > 0)
+                .unwrap_or(false);
+
+        // Two triggers, both gated on `in_known_mount`:
+        // 1. Live load errored (stale mount, read_dir failed).
+        // 2. Live load succeeded with 0 items, path isn't currently FUSE
+        //    (i.e. cleanly unmounted), and the cache has content.
+        let use_cache = in_known_mount
+            && cache_has_items
+            && (live_result.is_err() || (live_count == 0 && !path_is_fuse));
+
+        if use_cache {
+            let cache_str = cache.to_string_lossy().to_string();
+            if let Ok(_count) = imp.model.load_directory(&cache_str) {
+                imp.location_entry.set_text(path);
+                self.update_breadcrumb(path);
+                imp.back_button
+                    .set_sensitive(imp.nav.borrow().can_go_back());
+                imp.forward_button
+                    .set_sensitive(imp.nav.borrow().can_go_forward());
+                let at_root = path == "/";
+                imp.up_button.set_sensitive(!at_root);
+                wayfinder::state::save_last_directory(path);
+                self.update_status();
+
+                let dir_name = PathBuf::from(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string());
+                let count = imp.model.item_count();
+                imp.current_column.set(0);
+                imp.file_selection.borrow_mut().clear();
+                imp.type_ahead_buffer.borrow_mut().clear();
+                imp.selection.set_selected(0);
+                self.focus_current_view();
+
+                self.announce(
+                    &format!(
+                        "Opened {dir_name} from offline cache, {count} items. Mount is currently unreachable."
+                    ),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+                return;
+            }
+        }
+
+        match live_result {
             Ok(_count) => {
                 imp.location_entry.set_text(path);
                 self.update_breadcrumb(path);
@@ -79,11 +193,33 @@ impl WayfinderWindow {
 
                 let count = imp.model.item_count();
 
-                // Reset column, selection state, type-ahead, and focus the first item
+                // Reset column, selection state, type-ahead
                 imp.current_column.set(0);
                 imp.file_selection.borrow_mut().clear();
                 imp.type_ahead_buffer.borrow_mut().clear();
-                imp.selection.set_selected(0);
+
+                // Restore previous selection for this directory if we've
+                // visited it before this session, otherwise start at 0.
+                let remembered = imp
+                    .last_position
+                    .borrow()
+                    .get(path)
+                    .cloned();
+                let mut selected_pos: u32 = 0;
+                if let Some(name) = remembered {
+                    let model = &imp.model.filter_model;
+                    for i in 0..model.n_items() {
+                        if let Some(item) = model.item(i) {
+                            if let Some(file) = item.downcast_ref::<FileObject>() {
+                                if file.name() == name {
+                                    selected_pos = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                imp.selection.set_selected(selected_pos);
 
                 // Announce before focus for empty folders (focus change
                 // would otherwise override the announcement)
@@ -115,6 +251,18 @@ impl WayfinderWindow {
 
     pub fn load_special_uri(&self, uri: &str) {
         let imp = self.imp();
+
+        // Save the currently selected filename for the OLD location
+        let old_path = imp.model.current_path();
+        if !old_path.is_empty() && old_path != uri {
+            if let Some(item) = imp.selection.selected_item() {
+                if let Some(file) = item.downcast_ref::<FileObject>() {
+                    imp.last_position
+                        .borrow_mut()
+                        .insert(old_path, file.name());
+                }
+            }
+        }
 
         if imp.model.search.is_active() {
             imp.model.search.clear();
@@ -148,7 +296,24 @@ impl WayfinderWindow {
                 imp.current_column.set(0);
                 imp.file_selection.borrow_mut().clear();
                 imp.type_ahead_buffer.borrow_mut().clear();
-                imp.selection.set_selected(0);
+
+                // Restore previous selection for this URI if known
+                let remembered = imp.last_position.borrow().get(uri).cloned();
+                let mut selected_pos: u32 = 0;
+                if let Some(name) = remembered {
+                    let model = &imp.model.filter_model;
+                    for i in 0..model.n_items() {
+                        if let Some(item) = model.item(i) {
+                            if let Some(file) = item.downcast_ref::<FileObject>() {
+                                if file.name() == name {
+                                    selected_pos = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                imp.selection.set_selected(selected_pos);
 
                 if count == 0 {
                     self.announce(
@@ -298,7 +463,7 @@ impl WayfinderWindow {
     pub fn open_file(&self, file: &FileObject) {
         let path = file.path();
 
-        // Check for per-file app association
+        // Check for per-file app association (always takes priority)
         if let Some(desktop_id) = wayfinder::state::load_file_app(&path) {
             let all_apps = gio::AppInfo::all();
             if let Some(app) = all_apps
@@ -316,6 +481,17 @@ impl WayfinderWindow {
             }
         }
 
+        // If the file is executable, run it directly instead of opening
+        // it with a text editor (which is GIO's default for scripts).
+        if is_executable_file(&path) {
+            match self.execute_file(&path, &file.name()) {
+                Ok(()) => return,
+                Err(e) => {
+                    log::warn!("Failed to execute {path}: {e}. Falling back to open.");
+                }
+            }
+        }
+
         // Fall back to MIME type default
         let gio_file = gio::File::for_path(&path);
         let uri = gio_file.uri();
@@ -326,6 +502,70 @@ impl WayfinderWindow {
                 &format!("Failed to open {}", file.name()),
                 AccessibleAnnouncementPriority::High,
             );
+        }
+    }
+
+    /// Execute a file. Shell scripts and text-based executables are run in
+    /// a terminal so the user can see output. Binary executables are spawned
+    /// directly.
+    fn execute_file(&self, path: &str, name: &str) -> Result<(), String> {
+        let is_text = is_text_executable(path);
+
+        if is_text {
+            // Text script — run in a terminal so output is visible
+            let terminals: &[(&str, &[&str])] = &[
+                ("foot", &["-e"]),
+                ("alacritty", &["-e"]),
+                ("gnome-terminal", &["--"]),
+                ("konsole", &["-e"]),
+                ("xterm", &["-e"]),
+            ];
+            for (cmd, args) in terminals {
+                if std::process::Command::new("which")
+                    .arg(cmd)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    // Wrap the script in a shell that keeps the terminal
+                    // open after the script exits so output stays visible.
+                    let wrapped = format!(
+                        "{} ; echo ; echo \"[Press Enter to close]\" ; read",
+                        shell_quote(path)
+                    );
+                    let mut cmd_args: Vec<&str> = args.to_vec();
+                    cmd_args.push("sh");
+                    cmd_args.push("-c");
+                    cmd_args.push(&wrapped);
+                    match std::process::Command::new(cmd).args(&cmd_args).spawn() {
+                        Ok(_) => {
+                            self.announce(
+                                &format!("Running {name} in terminal"),
+                                AccessibleAnnouncementPriority::Medium,
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            return Err(format!("failed to spawn {cmd}: {e}"));
+                        }
+                    }
+                }
+            }
+            Err("no terminal emulator found".to_string())
+        } else {
+            // Binary executable — spawn directly
+            match std::process::Command::new(path).spawn() {
+                Ok(_) => {
+                    self.announce(
+                        &format!("Running {name}"),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(format!("spawn failed: {e}")),
+            }
         }
     }
 
@@ -442,7 +682,9 @@ impl WayfinderWindow {
             .map(|f| gio::File::for_path(f.path()))
             .collect();
         let count = gio_files.len();
-        wayfinder::clipboard::global_set(ClipboardState::new(ClipboardOperation::Copy, gio_files));
+        let state = ClipboardState::new(ClipboardOperation::Copy, gio_files);
+        wayfinder::clipboard::publish(&WidgetExt::display(self), &state);
+        wayfinder::clipboard::global_set(state);
         if count == 1 {
             self.announce(
                 &format!("Copied {}", files[0].name()),
@@ -467,7 +709,9 @@ impl WayfinderWindow {
             .map(|f| gio::File::for_path(f.path()))
             .collect();
         let count = gio_files.len();
-        wayfinder::clipboard::global_set(ClipboardState::new(ClipboardOperation::Cut, gio_files));
+        let state = ClipboardState::new(ClipboardOperation::Cut, gio_files);
+        wayfinder::clipboard::publish(&WidgetExt::display(self), &state);
+        wayfinder::clipboard::global_set(state);
         if count == 1 {
             self.announce(
                 &format!("Cut {}", files[0].name()),
@@ -482,8 +726,18 @@ impl WayfinderWindow {
     }
 
     /// Paste from the global (cross-window) clipboard.
+    /// Files another app put on the system clipboard (e.g. copied in Nautilus)
+    /// take priority. If Wayfinder owns the clipboard, or it holds no files,
+    /// use the internal one.
     pub fn paste(&self) {
-        self.paste_from(wayfinder::clipboard::global_get(), true);
+        let w = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let display = WidgetExt::display(&w);
+            match wayfinder::clipboard::read_system(&display).await {
+                Some(state) => w.paste_from(Some(state), PasteSource::System),
+                None => w.paste_from(wayfinder::clipboard::global_get(), PasteSource::Global),
+            }
+        });
     }
 
     /// Copy selected files to the window-local clipboard.
@@ -540,29 +794,102 @@ impl WayfinderWindow {
 
     /// Paste from the window-local clipboard.
     pub fn paste_local(&self) {
-        self.paste_from(self.imp().clipboard.borrow().clone(), false);
+        self.paste_from(self.imp().clipboard.borrow().clone(), PasteSource::Local);
     }
 
-    fn paste_from(&self, clipboard: Option<ClipboardState>, is_global: bool) {
+    fn paste_from(&self, clipboard: Option<ClipboardState>, source: PasteSource) {
         let imp = self.imp();
 
-        if let Some(state) = clipboard {
-            let dest_dir = gio::File::for_path(imp.model.current_path());
-            let parent_window: gtk::Window = self.clone().upcast();
+        if imp.pasting.get() {
+            self.announce(
+                "A paste is already in progress",
+                AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
 
+        let Some(state) = clipboard else {
+            self.announce("Nothing to paste", AccessibleAnnouncementPriority::Medium);
+            return;
+        };
+        if state.files.is_empty() {
+            self.announce("Nothing to paste", AccessibleAnnouncementPriority::Medium);
+            return;
+        }
+
+        let dest_dir_str = imp.model.current_path();
+        let dest_dir_gio = gio::File::for_path(&dest_dir_str);
+        let parent_window: gtk::Window = self.clone().upcast();
+
+        // If any source or the destination is on a recognised rclone mount,
+        // batch the whole paste through rclone-direct so we get server-side
+        // moves where possible and a single progress dialog instead of one
+        // per file.
+        let source_paths: Vec<String> = state
+            .files
+            .iter()
+            .filter_map(|f| f.path().map(|p| p.to_string_lossy().to_string()))
+            .collect();
+        let any_src_rclone = source_paths
+            .iter()
+            .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some());
+        let dest_rclone =
+            wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
+        let use_rclone = (any_src_rclone || dest_rclone)
+            && wayfinder::rclone_ops::rclone_available()
+            && !source_paths.is_empty();
+
+        // Guard is set immediately and cleared via Drop, so it survives
+        // panics in the progress callback or worker.
+        let guard = PastingGuard::new(self.clone());
+
+        if use_rclone {
+            let w = self.clone();
+            let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                // Move guard into the closure so it drops here on success.
+                let _g = guard;
+                let path = w.imp().model.current_path();
+                let _ = w.imp().model.load_directory(&path);
+                w.update_status();
+            }));
+            match state.operation {
+                ClipboardOperation::Copy => {
+                    wayfinder::rclone_ops::copy_paths_with_progress(
+                        source_paths,
+                        dest_dir_str,
+                        &parent_window,
+                        reload,
+                    );
+                }
+                ClipboardOperation::Cut => {
+                    wayfinder::rclone_ops::move_paths_with_progress(
+                        source_paths,
+                        dest_dir_str,
+                        &parent_window,
+                        reload,
+                    );
+                }
+            }
+        } else {
+            // Per-file GIO path: each reload callback holds a clone of the
+            // shared guard, which drops when the last one finishes (or all
+            // are dropped without running, e.g. due to panic).
+            let shared_guard = std::rc::Rc::new(guard);
             for source in &state.files {
                 let w = self.clone();
-                let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                    // Reload directory to reflect changes
-                    let path = w.imp().model.current_path();
-                    let _ = w.imp().model.load_directory(&path);
-                    w.update_status();
-                }));
+                let guard_held = shared_guard.clone();
+                let reload: Option<Box<dyn FnOnce() + 'static>> =
+                    Some(Box::new(move || {
+                        let _g = guard_held;
+                        let path = w.imp().model.current_path();
+                        let _ = w.imp().model.load_directory(&path);
+                        w.update_status();
+                    }));
                 match state.operation {
                     ClipboardOperation::Copy => {
                         wayfinder::file_ops::copy_with_progress(
                             source,
-                            &dest_dir,
+                            &dest_dir_gio,
                             &parent_window,
                             reload,
                         );
@@ -570,24 +897,36 @@ impl WayfinderWindow {
                     ClipboardOperation::Cut => {
                         wayfinder::file_ops::move_with_progress(
                             source,
-                            &dest_dir,
+                            &dest_dir_gio,
                             &parent_window,
                             reload,
                         );
                     }
                 }
             }
+        }
 
-            // Clear clipboard after cut
-            if state.operation == ClipboardOperation::Cut {
-                if is_global {
+        // Clear clipboard after cut
+        if state.operation == ClipboardOperation::Cut {
+            match source {
+                PasteSource::Global => {
                     wayfinder::clipboard::global_clear();
-                } else {
-                    *imp.clipboard.borrow_mut() = None;
+                    // Withdraw the cut list we published, unless another
+                    // app has taken over the clipboard since.
+                    let clipboard = WidgetExt::display(self).clipboard();
+                    if clipboard.is_local() {
+                        let _ = clipboard.set_content(None::<&gtk::gdk::ContentProvider>);
+                    }
+                }
+                PasteSource::Local => *imp.clipboard.borrow_mut() = None,
+                // The files have moved, so the other app's list is stale.
+                // Clear it as Nautilus does, so a second paste can't fail.
+                PasteSource::System => {
+                    let _ = WidgetExt::display(self)
+                        .clipboard()
+                        .set_content(None::<&gtk::gdk::ContentProvider>);
                 }
             }
-        } else {
-            self.announce("Nothing to paste", AccessibleAnnouncementPriority::Medium);
         }
     }
 
@@ -650,6 +989,8 @@ impl WayfinderWindow {
                 .iter()
                 .map(|f| (f.name(), f.path()))
                 .collect();
+            let file_path_dirs: Vec<bool> =
+                needs_perm_delete.iter().map(|f| f.is_directory()).collect();
 
             dialog.choose(
                 Some(&window.clone()),
@@ -657,26 +998,27 @@ impl WayfinderWindow {
                 move |result| {
                     if let Ok(choice) = result {
                         if choice == 1 {
-                            let mut del_success = 0;
-                            for (_name, path) in &file_paths {
-                                let gio_file = gio::File::for_path(path);
-                                if wayfinder::file_ops::delete_file_recursive(&gio_file).is_ok() {
-                                    del_success += 1;
-                                }
-                            }
-                            if del_success > 0 {
-                                let msg = if del_success == 1 {
-                                    format!("Deleted {}", file_paths[0].0)
-                                } else {
-                                    format!("Deleted {del_success} files")
-                                };
-                                // Reload directory to reflect deletions
-                                let current = window.imp().model.current_path();
-                                let _ = window.imp().model.load_directory(&current);
-                                window.announce(&msg, AccessibleAnnouncementPriority::Medium);
-                                window.imp().file_selection.borrow_mut().clear();
-                                window.update_status();
-                                window.restore_focus_to_selected();
+                            // Prefer rclone-direct delete when every path is on
+                            // a recognised rclone mount.
+                            let all_rclone = !file_paths.is_empty()
+                                && file_paths.iter().all(|(_, p)| {
+                                    wayfinder::rclone_ops::rclone_for_path(p).is_some()
+                                })
+                                && wayfinder::rclone_ops::rclone_available();
+                            if all_rclone {
+                                let rclone_items: Vec<(String, bool)> = file_paths
+                                    .iter()
+                                    .zip(file_path_dirs.iter())
+                                    .map(|((_, p), d)| (p.clone(), *d))
+                                    .collect();
+                                run_rclone_direct_delete(
+                                    &window,
+                                    rclone_items,
+                                    0,
+                                );
+                            } else {
+                                // Other FUSE mounts: threaded std::fs delete.
+                                run_threaded_delete(&window, file_paths, 0);
                             }
                         }
                     }
@@ -769,6 +1111,7 @@ impl WayfinderWindow {
         // Capture paths as strings before the async callback
         let file_paths: Vec<(String, String)> =
             files.iter().map(|f| (f.name(), f.path())).collect();
+        let file_path_dirs: Vec<bool> = files.iter().map(|f| f.is_directory()).collect();
 
         dialog.choose(
             Some(&window.clone()),
@@ -776,6 +1119,38 @@ impl WayfinderWindow {
             move |result| {
                 if let Ok(choice) = result {
                     if choice == 1 {
+                        // If every path lives on an rclone FUSE mount, dispatch
+                        // direct to rclone — much faster, real progress, proper
+                        // rate-limit handling.
+                        let all_rclone = !file_paths.is_empty()
+                            && file_paths
+                                .iter()
+                                .all(|(_, p)| wayfinder::rclone_ops::rclone_for_path(p).is_some())
+                            && wayfinder::rclone_ops::rclone_available();
+                        if all_rclone {
+                            let rclone_items: Vec<(String, bool)> = file_paths
+                                .iter()
+                                .zip(file_path_dirs.iter())
+                                .map(|((_, p), d)| (p.clone(), *d))
+                                .collect();
+                            run_rclone_direct_delete(
+                                &window,
+                                rclone_items,
+                                old_pos,
+                            );
+                            return;
+                        }
+
+                        // Otherwise: if any path is a FUSE mount (sshfs, gvfs,
+                        // unrecognised rclone mount, etc.), run the delete in
+                        // a background thread with a progress dialog so the
+                        // UI stays responsive.
+                        let any_slow = file_paths.iter().any(|(_, p)| is_fuse_mount(p));
+                        if any_slow {
+                            run_threaded_delete(&window, file_paths, old_pos);
+                            return;
+                        }
+
                         let mut success = 0;
                         let mut failed = 0;
                         let mut last_error = String::new();
@@ -824,19 +1199,11 @@ impl WayfinderWindow {
                             }
 
                             if failed == 0 {
-                                let now_empty = n_items == 0;
                                 let msg = if success == 1 {
-                                    if now_empty {
-                                        format!("Deleted {}, folder is now empty", file_paths[0].0)
-                                    } else {
-                                        format!("Deleted {}", file_paths[0].0)
-                                    }
-                                } else if now_empty {
-                                    format!("Deleted {success} files, folder is now empty")
+                                    format!("Deleted {}", file_paths[0].0)
                                 } else {
                                     format!("Deleted {success} files")
                                 };
-
                                 window.announce(&msg, AccessibleAnnouncementPriority::Medium);
                             }
                         }
@@ -912,6 +1279,33 @@ impl WayfinderWindow {
                 d.close();
                 return;
             }
+
+            // rclone-direct rename: server-side moveto, no FUSE round-trip.
+            if wayfinder::rclone_ops::rclone_for_path(&file_path).is_some()
+                && wayfinder::rclone_ops::rclone_available()
+            {
+                let parent: gtk::Window = w.clone().upcast();
+                let new_path = std::path::Path::new(&file_path)
+                    .parent()
+                    .map(|p| p.join(&new_name).to_string_lossy().to_string())
+                    .unwrap_or_else(|| new_name.clone());
+                let w_done = w.clone();
+                let on_complete: Option<Box<dyn FnOnce() + 'static>> =
+                    Some(Box::new(move || {
+                        let path = w_done.imp().model.current_path();
+                        let _ = w_done.imp().model.load_directory(&path);
+                        w_done.update_status();
+                    }));
+                wayfinder::rclone_ops::rename_with_progress(
+                    file_path.clone(),
+                    new_path,
+                    &parent,
+                    on_complete,
+                );
+                d.close();
+                return;
+            }
+
             let gio_file = gio::File::for_path(&file_path);
             match wayfinder::file_ops::rename_file(&gio_file, &new_name) {
                 Ok(_) => {
@@ -1124,14 +1518,71 @@ impl WayfinderWindow {
                 return;
             }
             let replace_text = replace_e.text().to_string();
-            let mut renamed = 0u32;
-            let mut errors = 0u32;
+
+            // Compute (old_path, new_path) pairs for entries that actually
+            // change name. Skip identity renames.
+            let mut pairs: Vec<(String, String)> = Vec::new();
             for (i, name) in names_rc.iter().enumerate() {
                 let new_name = name.replace(&find_text, &replace_text);
                 if new_name == *name {
                     continue;
                 }
-                let gio_file = gio::File::for_path(&file_paths[i]);
+                let old_path = &file_paths[i];
+                let new_path = std::path::Path::new(old_path)
+                    .parent()
+                    .map(|p| p.join(&new_name).to_string_lossy().to_string())
+                    .unwrap_or_else(|| new_name.clone());
+                pairs.push((old_path.clone(), new_path));
+            }
+
+            if pairs.is_empty() {
+                w.announce(
+                    "No matches to rename",
+                    AccessibleAnnouncementPriority::Medium,
+                );
+                d.close();
+                return;
+            }
+
+            // If every old path lives on a recognised rclone mount, batch
+            // through rclone-direct. Mixed-batch falls back to per-file GIO
+            // (existing behaviour).
+            let all_rclone = pairs
+                .iter()
+                .all(|(old, _)| wayfinder::rclone_ops::rclone_for_path(old).is_some())
+                && wayfinder::rclone_ops::rclone_available();
+
+            if all_rclone {
+                let parent: gtk::Window = w.clone().upcast();
+                let w_done = w.clone();
+                let pair_count = pairs.len();
+                let on_complete: Option<Box<dyn FnOnce() + 'static>> =
+                    Some(Box::new(move || {
+                        let path = w_done.imp().model.current_path();
+                        let _ = w_done.imp().model.load_directory(&path);
+                        w_done.update_status();
+                        w_done.announce(
+                            &format!("Renamed {pair_count} files"),
+                            AccessibleAnnouncementPriority::Medium,
+                        );
+                    }));
+                wayfinder::rclone_ops::batch_rename_with_progress(
+                    pairs,
+                    &parent,
+                    on_complete,
+                );
+                d.close();
+                return;
+            }
+
+            let mut renamed = 0u32;
+            let mut errors = 0u32;
+            for (old_path, new_path) in &pairs {
+                let new_name = std::path::Path::new(new_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| new_path.clone());
+                let gio_file = gio::File::for_path(old_path);
                 match wayfinder::file_ops::rename_file(&gio_file, &new_name) {
                     Ok(_) => renamed += 1,
                     Err(e) => {
@@ -1178,22 +1629,49 @@ impl WayfinderWindow {
     }
 
     pub fn handle_drop(&self, uri_str: &str) {
+        let imp = self.imp();
+        if imp.pasting.get() {
+            self.announce(
+                "A copy or paste is already in progress",
+                AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
+
+        // Set the guard before any per-path resolution work so two rapid
+        // drops can't both pass the check.
+        let guard = PastingGuard::new(self.clone());
+
         let path = if let Some(p) = uri_str.strip_prefix("file://") {
             p.to_string()
         } else {
             uri_str.to_string()
         };
 
-        let source = gio::File::for_path(&path);
-        let dest_dir = gio::File::for_path(self.imp().model.current_path());
+        let dest_dir_str = imp.model.current_path();
         let parent_window: gtk::Window = self.clone().upcast();
         let w = self.clone();
         let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+            let _g = guard;
             let current = w.imp().model.current_path();
             let _ = w.imp().model.load_directory(&current);
             w.update_status();
         }));
-        wayfinder::file_ops::copy_with_progress(&source, &dest_dir, &parent_window, reload);
+
+        let src_rclone = wayfinder::rclone_ops::rclone_for_path(&path).is_some();
+        let dst_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
+        if (src_rclone || dst_rclone) && wayfinder::rclone_ops::rclone_available() {
+            wayfinder::rclone_ops::copy_paths_with_progress(
+                vec![path],
+                dest_dir_str,
+                &parent_window,
+                reload,
+            );
+        } else {
+            let source = gio::File::for_path(&path);
+            let dest_dir = gio::File::for_path(&dest_dir_str);
+            wayfinder::file_ops::copy_with_progress(&source, &dest_dir, &parent_window, reload);
+        }
     }
 
     pub fn create_new_folder(&self) {
@@ -1689,4 +2167,159 @@ impl WayfinderWindow {
             AccessibleAnnouncementPriority::Medium,
         );
     }
+}
+
+/// Check if a file has the execute bit set and is a regular file.
+fn is_executable_file(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    meta.permissions().mode() & 0o111 != 0
+}
+
+/// Check if an executable is a text-based script (has a shebang or is
+/// recognised text content) vs a compiled binary.
+fn is_text_executable(path: &str) -> bool {
+    // Read first 4 bytes to detect ELF magic (binary) vs shebang (#!)
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    let Ok(n) = file.read(&mut buf) else {
+        return false;
+    };
+    if n < 2 {
+        return false;
+    }
+    // ELF magic bytes: 0x7F 'E' 'L' 'F' → binary
+    if n >= 4 && &buf[..4] == b"\x7fELF" {
+        return false;
+    }
+    // Shebang: starts with #!
+    if &buf[..2] == b"#!" {
+        return true;
+    }
+    // Otherwise assume binary (could be a script without shebang, but rare)
+    false
+}
+
+/// Shell-quote a path for safe inclusion in a sh -c command.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Check whether `path` resides on a FUSE filesystem according to /proc/mounts.
+fn is_fuse_mount(path: &str) -> bool {
+    wayfinder::rclone_ops::is_fuse_path(path)
+}
+
+/// Spawn a threaded delete with a non-modal progress dialog. Used for
+/// FUSE mounts where each per-file delete may take seconds.
+fn run_threaded_delete(
+    window: &WayfinderWindow,
+    file_paths: Vec<(String, String)>,
+    old_pos: u32,
+) {
+    let parent: gtk::Window = window.clone().upcast();
+    let paths: Vec<String> = file_paths.iter().map(|(_, p)| p.clone()).collect();
+    let names: Vec<String> = file_paths.iter().map(|(n, _)| n.clone()).collect();
+    let total = paths.len();
+    let win = window.clone();
+    let on_complete: Option<Box<dyn FnOnce(usize, usize) + 'static>> =
+        Some(Box::new(move |success, failed| {
+            // Reload the current directory so the UI reflects the deletions.
+            let current = win.imp().model.current_path();
+            let _ = win.imp().model.load_directory(&current);
+            win.imp().file_selection.borrow_mut().clear();
+            win.update_status();
+
+            // Restore focus near the previous position
+            let n_items = win.imp().selection.n_items();
+            if n_items > 0 {
+                let new_pos = if old_pos > 0 && old_pos >= n_items {
+                    n_items - 1
+                } else if old_pos > 0 {
+                    old_pos - 1
+                } else {
+                    0
+                };
+                win.imp().selection.set_selected(new_pos);
+                win.restore_focus_to_selected();
+            }
+
+            // Announce outcome
+            if failed == 0 && success > 0 {
+                let msg = if success == 1 {
+                    format!("Deleted {}", names[0])
+                } else {
+                    format!("Deleted {success} of {total} items")
+                };
+                win.announce(&msg, AccessibleAnnouncementPriority::Medium);
+            } else if failed > 0 && success == 0 {
+                win.announce(
+                    &format!("Failed to delete {failed} item(s)"),
+                    AccessibleAnnouncementPriority::High,
+                );
+            } else if failed > 0 {
+                win.announce(
+                    &format!("Deleted {success}, failed to delete {failed}"),
+                    AccessibleAnnouncementPriority::High,
+                );
+            } else {
+                win.announce(
+                    "Deletion cancelled",
+                    AccessibleAnnouncementPriority::Medium,
+                );
+            }
+        }));
+    wayfinder::file_ops::delete_with_progress(paths, &parent, on_complete);
+}
+
+/// Run a permanent delete via direct `rclone deletefile`/`purge` calls,
+/// bypassing the FUSE layer. The rclone progress dialog handles its own
+/// success/failure announcements.
+fn run_rclone_direct_delete(
+    window: &WayfinderWindow,
+    rclone_items: Vec<(String, bool)>,
+    old_pos: u32,
+) {
+    let parent: gtk::Window = window.clone().upcast();
+    let win = window.clone();
+    let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+        let current = win.imp().model.current_path();
+        let _ = win.imp().model.load_directory(&current);
+        win.imp().file_selection.borrow_mut().clear();
+        win.update_status();
+
+        let n_items = win.imp().selection.n_items();
+        if n_items > 0 {
+            let new_pos = if old_pos > 0 && old_pos >= n_items {
+                n_items - 1
+            } else if old_pos > 0 {
+                old_pos - 1
+            } else {
+                0
+            };
+            win.imp().selection.set_selected(new_pos);
+            win.restore_focus_to_selected();
+        }
+        // The progress dialog already announced success/failure — don't
+        // override it with a misleading "Deleted N" if rclone errored or
+        // the user cancelled.
+    }));
+    wayfinder::rclone_ops::delete_with_progress(rclone_items, &parent, on_complete);
 }

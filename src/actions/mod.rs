@@ -55,8 +55,13 @@ pub fn load_actions() -> Vec<CustomAction> {
     actions
 }
 
-/// Check if a command exists on PATH.
+/// Check if a command exists on PATH, or if an absolute/relative path
+/// points at an existing file.
 fn has_command(cmd: &str) -> bool {
+    // Absolute or explicitly relative paths: check existence directly.
+    if cmd.starts_with('/') || cmd.starts_with("./") || cmd.starts_with("../") {
+        return Path::new(cmd).is_file();
+    }
     std::process::Command::new("which")
         .arg(cmd)
         .stdout(std::process::Stdio::null())
@@ -66,7 +71,9 @@ fn has_command(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Parse .desktop-like action files from a directory.
+/// Parse .desktop-like action files from a directory. Also scans immediate
+/// subdirectories one level deep, allowing folder-based actions where the
+/// script lives alongside its `.desktop` file.
 fn load_desktop_actions(dir: &Path) -> Vec<CustomAction> {
     let mut actions = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -75,10 +82,26 @@ fn load_desktop_actions(dir: &Path) -> Vec<CustomAction> {
 
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.is_dir() {
+            // One level of recursion: scan files inside this subdirectory.
+            let Ok(sub_entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for sub_entry in sub_entries.flatten() {
+                let sub_path = sub_entry.path();
+                if sub_path.extension().is_none_or(|ext| ext != "desktop") {
+                    continue;
+                }
+                if let Some(action) = parse_desktop_action(&sub_path, &path) {
+                    actions.push(action);
+                }
+            }
+            continue;
+        }
         if path.extension().is_none_or(|ext| ext != "desktop") {
             continue;
         }
-        if let Some(action) = parse_desktop_action(&path) {
+        if let Some(action) = parse_desktop_action(&path, dir) {
             actions.push(action);
         }
     }
@@ -86,8 +109,20 @@ fn load_desktop_actions(dir: &Path) -> Vec<CustomAction> {
     actions
 }
 
-/// Parse a single .desktop action file.
-fn parse_desktop_action(path: &Path) -> Option<CustomAction> {
+/// Resolve a command-or-path token relative to `base_dir` if it starts with
+/// `./`. Returns the resolved absolute string, or the original unchanged.
+fn resolve_relative(token: &str, base_dir: &Path) -> String {
+    if let Some(rest) = token.strip_prefix("./") {
+        base_dir.join(rest).to_string_lossy().to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+/// Parse a single .desktop action file. `base_dir` is the directory
+/// containing the `.desktop` file; it is used to resolve `./`-relative
+/// paths in `Exec=` and `TryExec=`.
+fn parse_desktop_action(path: &Path, base_dir: &Path) -> Option<CustomAction> {
     let contents = std::fs::read_to_string(path).ok()?;
 
     let mut name = None;
@@ -113,9 +148,23 @@ fn parse_desktop_action(path: &Path) -> Option<CustomAction> {
         if let Some(val) = line.strip_prefix("Name=") {
             name = Some(val.to_string());
         } else if let Some(val) = line.strip_prefix("Exec=") {
-            exec = Some(val.to_string());
+            // Resolve a leading ./ in the first token against the
+            // action's own directory so folder-based actions can ship
+            // their script alongside the .desktop file.
+            let resolved = if let Some(rest) = val.strip_prefix("./") {
+                // Split off the first whitespace-separated token and resolve it.
+                let (first, tail) = match rest.find(char::is_whitespace) {
+                    Some(idx) => (&rest[..idx], &rest[idx..]),
+                    None => (rest, ""),
+                };
+                let abs = base_dir.join(first);
+                format!("{}{}", abs.to_string_lossy(), tail)
+            } else {
+                val.to_string()
+            };
+            exec = Some(resolved);
         } else if let Some(val) = line.strip_prefix("TryExec=") {
-            try_exec = Some(val.to_string());
+            try_exec = Some(resolve_relative(val.trim(), base_dir));
         } else if let Some(val) = line
             .strip_prefix("MimeTypes=")
             .or_else(|| line.strip_prefix("MimeType="))

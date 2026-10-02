@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.4.0
+
+### New features
+
+- **Copy and paste files with other apps** — Ctrl+C, Ctrl+X and the Cut and Copy menu items now put files on the system clipboard in the same formats Nautilus and Dolphin use. Pasting into Signal or WhatsApp attaches the files, and other file managers can paste them, including cut-to-move.
+- **Paste files copied in other apps** — Ctrl+V pastes files copied or cut in Nautilus, Dolphin or another copy of Wayfinder. When the system clipboard holds no files, Wayfinder's own clipboard is used as before. The window-local clipboard (Ctrl+Shift+C/X/V) stays private.
+- **rclone integration** — "Keep Available Offline" pinning for files on rclone mounts, two-way sync setup with `rclone bisync`, and direct `rclone` copy, move and delete with a streaming progress dialog instead of going through the FUSE mount.
+- **Run executables on open** — opening an executable file runs it instead of opening it in a text editor. Scripts run in a terminal so their output is visible.
+- **Folder-based custom actions** — custom actions can live in their own subfolder, with `./`-relative `Exec=` and `TryExec=` paths resolved against that folder.
+
+### FUSE / rclone mount support
+
+- **Background deletes on FUSE mounts** — deleting on sshfs and other FUSE mounts runs in a background thread with a progress dialog instead of freezing the window.
+
+### Fixed
+
+- **Copy Path and Copy Name** — now actually reach the clipboard. On Wayland, setting the clipboard after the context menu closed was silently ignored by the compositor.
+- **Stale paste** — after another app takes over the clipboard, Ctrl+V no longer brings back files copied earlier in Wayfinder.
+- **Cut cleanup** — after pasting a cut, the system clipboard is cleared, so neither Wayfinder nor another file manager tries to move the same files twice.
+
+### Removed
+
+- Unused `clap` and `open` dependencies.
+
 ## 2.3.0
 
 ### New features

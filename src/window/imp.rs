@@ -72,11 +72,17 @@ pub struct WayfinderWindowInner {
     pub search_bar: gtk::SearchBar,
     pub search_entry: gtk::SearchEntry,
     pub clipboard: RefCell<Option<ClipboardState>>,
+    /// Guard so a second Ctrl+V (or drag-drop) can't fire while a paste is
+    /// already running. Cleared by `paste_from`'s reload callback.
+    pub pasting: Cell<bool>,
     pub current_view: Cell<ViewMode>,
     pub file_selection: RefCell<SelectionState>,
     pub type_ahead_buffer: Rc<RefCell<String>>,
     pub type_ahead_generation: Rc<Cell<u32>>,
     pub last_trashed: RefCell<Vec<String>>,
+    /// Remembers the last-selected filename per directory so that
+    /// navigating back into a folder restores the previous selection.
+    pub last_position: RefCell<std::collections::HashMap<String, String>>,
     pub zoom_level: Cell<i32>,
     pub zoom_css: gtk::CssProvider,
     pub breadcrumb_box: gtk::Box,
@@ -199,11 +205,13 @@ impl Default for WayfinderWindowInner {
             search_bar,
             search_entry,
             clipboard: RefCell::new(None),
+            pasting: Cell::new(false),
             current_view: Cell::new(ViewMode::List),
             file_selection: RefCell::new(SelectionState::new()),
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),
             type_ahead_generation: Rc::new(Cell::new(0)),
             last_trashed: RefCell::new(Vec::new()),
+            last_position: RefCell::new(std::collections::HashMap::new()),
             zoom_level: Cell::new(100),
             zoom_css: gtk::CssProvider::new(),
             breadcrumb_box: gtk::Box::new(gtk::Orientation::Horizontal, 0),
@@ -1095,18 +1103,6 @@ impl WayfinderWindowInner {
         });
 
         self.list_view.column_view().add_controller(controller);
-
-        // Restore focus to selected row when list regains focus
-        let focus_controller = gtk::EventControllerFocus::new();
-        let selection = self.selection.clone();
-        let list_view = self.list_view.clone();
-        focus_controller.connect_enter(move |_| {
-            let pos = selection.selected();
-            if pos != gtk::INVALID_LIST_POSITION {
-                list_view.grab_focus_at_selected(pos);
-            }
-        });
-        self.list_view.widget().add_controller(focus_controller);
 
         // Announce column data on selection change in list view only.
         // Icon view is a native GtkListView — Orca reads it directly.

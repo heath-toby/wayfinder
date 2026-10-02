@@ -23,6 +23,19 @@ impl ApplicationImpl for WayfinderApplicationInner {
         let app = self.obj().clone();
         let rx = crate::dbus::start_service();
         crate::dbus::connect_to_app(app.upcast_ref(), rx);
+
+        // Record any rclone FUSE mountpoints we can see right now. The list
+        // persists across sessions so cache fallback still works after the
+        // mount is unmounted.
+        for mp in wayfinder::rclone_ops::current_rclone_fuse_mountpoints() {
+            wayfinder::offline::record_mountpoint(&mp);
+        }
+
+        // Refresh offline pins in the background. Reachable pins get their
+        // cache copies updated; unreachable ones are skipped.
+        std::thread::spawn(|| {
+            let _ = wayfinder::offline::sync_all();
+        });
     }
 
     fn activate(&self) {

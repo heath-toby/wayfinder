@@ -13,24 +13,7 @@ use crate::search::SearchState;
 /// Reads `/proc/mounts` and picks the longest matching mountpoint whose
 /// filesystem type contains "fuse".
 fn is_fuse_mount(path: &str) -> bool {
-    let Ok(contents) = std::fs::read_to_string("/proc/mounts") else {
-        return false;
-    };
-    let mut best_len = 0;
-    let mut best_is_fuse = false;
-    for line in contents.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let mountpoint = parts[1].replace("\\040", " ");
-        let fstype = parts[2];
-        if path.starts_with(&mountpoint) && mountpoint.len() > best_len {
-            best_len = mountpoint.len();
-            best_is_fuse = fstype.contains("fuse");
-        }
-    }
-    best_is_fuse
+    crate::rclone_ops::is_fuse_path(path)
 }
 
 pub struct DirectoryModel {
@@ -381,31 +364,30 @@ impl DirectoryModel {
                     };
 
                     match event {
-                        gio::FileMonitorEvent::Created => {
-                            // Only add if not already in the store
-                            if find_index(&store, &changed_name).is_none() {
-                                if on_fuse {
-                                    let file_path_str = file
-                                        .path()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    let path = path.clone();
-                                    let store = store.clone();
-                                    let sorter = sorter.clone();
-                                    Self::query_info_async(file_path_str, move |data| {
-                                        let file_obj = FileObject::from_data(&path, &data);
-                                        store.append(&file_obj);
-                                        sorter.changed(gtk::SorterChange::Different);
-                                    });
-                                } else if let Ok(info) = file.query_info(
-                                    "standard::*,time::modified",
-                                    gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                                    gio::Cancellable::NONE,
-                                ) {
-                                    let file_obj = FileObject::from_file_info(&path, &info);
+                        gio::FileMonitorEvent::Created
+                            if find_index(&store, &changed_name).is_none() =>
+                        {
+                            if on_fuse {
+                                let file_path_str = file
+                                    .path()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let path = path.clone();
+                                let store = store.clone();
+                                let sorter = sorter.clone();
+                                Self::query_info_async(file_path_str, move |data| {
+                                    let file_obj = FileObject::from_data(&path, &data);
                                     store.append(&file_obj);
                                     sorter.changed(gtk::SorterChange::Different);
-                                }
+                                });
+                            } else if let Ok(info) = file.query_info(
+                                "standard::*,time::modified",
+                                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                                gio::Cancellable::NONE,
+                            ) {
+                                let file_obj = FileObject::from_file_info(&path, &info);
+                                store.append(&file_obj);
+                                sorter.changed(gtk::SorterChange::Different);
                             }
                         }
                         gio::FileMonitorEvent::Deleted => {
