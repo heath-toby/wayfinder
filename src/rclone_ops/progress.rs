@@ -200,6 +200,13 @@ pub fn show<W>(
             if let Some(pid) = pid_holder.get() {
                 kill(pid);
             }
+            // Focus would be lost with the button going insensitive; Close
+            // stays off until rclone has stopped.
+            if btn.has_focus() {
+                if let Some(next) = btn.next_sibling() {
+                    next.grab_focus();
+                }
+            }
             btn.set_sensitive(false);
             parent.announce(cancel_announce, AccessibleAnnouncementPriority::Medium);
         });
@@ -289,6 +296,7 @@ pub fn show<W>(
                     pulsing_done.set(false);
                     cancel_clone.set_sensitive(false);
                     close_clone.set_sensitive(true);
+                    close_clone.grab_focus();
                     let msg = "rclone disconnected unexpectedly. Operation may be incomplete.";
                     status_clone.set_text(msg);
                     parent_clone.announce(msg, AccessibleAnnouncementPriority::High);

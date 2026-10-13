@@ -105,6 +105,9 @@
 - **Open With per file** — the app chosen for a file whose path contains `=` is remembered.
 - **Open With** — pressing Enter on "Open With" moves focus into the submenu.
 - **Right-click** — right-clicking a file opens the menu for that file; it used to act on whichever file was selected before.
+- **After renaming** — the renamed file stays selected, so a key pressed next acts on it and not on its neighbour.
+- **Marked files hidden by a search** — actions use the focused file when none of the marked files are in view, instead of doing nothing.
+- **Undo trash and cancelled deletes** — undo says the name a restored file actually went back under; a cancelled delete says how far it got. In rclone progress windows, focus moves to a working button when Cancel is pressed or rclone stops unexpectedly.
 
 ### Development
 

@@ -440,6 +440,38 @@ impl WayfinderWindow {
         }
     }
 
+    /// Like `reload_after_change`, then select `name` (a renamed file) once
+    /// listed: otherwise its old row goes and the selection jumps to a
+    /// neighbour, which a Delete pressed next would act on.
+    pub fn reload_and_select(&self, folders: &[String], name: Option<String>) {
+        let model = &self.imp().model;
+        for folder in folders {
+            model.forget_cached(folder);
+        }
+        let generation = model.generation();
+        let w = self.clone();
+        model.refresh(move |listed| {
+            w.update_status();
+            let Some(name) = name else {
+                return;
+            };
+            if !listed || w.imp().model.generation() != generation {
+                return;
+            }
+            let selection = &w.imp().selection;
+            let found = (0..selection.n_items()).find(|&i| {
+                selection
+                    .item(i)
+                    .and_downcast::<FileObject>()
+                    .is_some_and(|f| f.name() == name)
+            });
+            if let Some(pos) = found {
+                selection.set_selected(pos);
+                w.restore_focus_to_selected();
+            }
+        });
+    }
+
     /// After files changed in `folders` (pasted into, moved out of, renamed
     /// in): drop their cached listings, so none is shown out of date — if
     /// the user went elsewhere while a slow mount answered, or the reload
@@ -517,6 +549,13 @@ impl WayfinderWindow {
                             files.push(file.clone());
                         }
                     }
+                }
+            }
+            // The marked files all filtered out of view: act on the one
+            // that has focus, not on nothing.
+            if files.is_empty() {
+                if let Some(file) = self.get_selected_file() {
+                    files.push(file);
                 }
             }
             files
@@ -2112,7 +2151,13 @@ impl WayfinderWindow {
                                     note_renames(&renamed);
                                 }
                                 w_done.forget_moved(&moved);
-                                w_done.reload_after_change(&changed);
+                                let select = succeeded.then(|| {
+                                    std::path::Path::new(&renamed[0].1)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default()
+                                });
+                                w_done.reload_and_select(&changed, select);
                             }));
                         wayfinder::rclone_ops::rename_with_progress(
                             old_path,
@@ -2150,7 +2195,7 @@ impl WayfinderWindow {
                         );
                         // Reload directory as fallback in case file monitor doesn't catch the rename
                         w.forget_moved(&moved);
-                        w.reload_after_change(&changed);
+                        w.reload_and_select(&changed, Some(new_name));
                     }
                     Err(e) => {
                         w.announce(
@@ -3198,7 +3243,12 @@ fn run_threaded_delete(
             }
 
             // Announce outcome
-            if failed == 0 && success > 0 {
+            if success > 0 && success + failed < total {
+                win.announce(
+                    &format!("Deletion cancelled after {success} of {total} items"),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+            } else if failed == 0 && success > 0 {
                 let msg = if success == 1 {
                     format!("Deleted {}", names[0])
                 } else {
@@ -3283,7 +3333,8 @@ fn apply_zoom_css(level: i32) {
 
 /// Restore, for each of `paths`, the most recently trashed item that came
 /// from it (an older one from the same place may be in the Bin too).
-/// Returns the paths restored. Goes through the Bin once.
+/// Returns where each restored file went back to (its name may have
+/// changed if something new took its place). Goes through the Bin once.
 fn restore_newest(paths: &[String]) -> Vec<String> {
     let trash = gio::File::for_uri("trash:///");
     let Ok(enumerator) = trash.enumerate_children(
@@ -3316,19 +3367,16 @@ fn restore_newest(paths: &[String]) -> Vec<String> {
     }
     paths
         .iter()
-        .filter(|path| {
-            let Some((_, name)) = newest.get(path.as_str()) else {
-                return false;
-            };
+        .filter_map(|path| {
+            let (_, name) = newest.get(path.as_str())?;
             match wayfinder::file_ops::restore_from_trash(&trash.child(name)) {
-                Ok(_) => true,
+                Ok(dest) => Some(dest),
                 Err(e) => {
                     log::error!("Failed to restore {path}: {e}");
-                    false
+                    None
                 }
             }
         })
-        .cloned()
         .collect()
 }
 
