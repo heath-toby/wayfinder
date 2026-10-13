@@ -80,6 +80,10 @@ pub struct PinnedEntry {
     pub last_synced_mtime: i64,
     /// Last-known size in bytes — secondary indicator of changes.
     pub last_synced_size: u64,
+    /// When the offline copy was last brought up to date (seconds since
+    /// epoch; 0 if unknown). Anything in it changed after that was changed
+    /// here — made or edited by the user — and a refresh leaves it be.
+    pub last_refreshed: i64,
 }
 
 /// Path to the persistent manifest file.
@@ -133,6 +137,7 @@ fn parse_manifest(contents: &str) -> HashMap<String, PinnedEntry> {
         let is_directory = parts[1] == "1" || parts[1].eq_ignore_ascii_case("true");
         let last_synced_mtime: i64 = parts[2].parse().unwrap_or(0);
         let last_synced_size: u64 = parts[3].parse().unwrap_or(0);
+        let last_refreshed: i64 = parts.get(4).and_then(|p| p.parse().ok()).unwrap_or(0);
         out.insert(
             original_path.clone(),
             PinnedEntry {
@@ -140,6 +145,7 @@ fn parse_manifest(contents: &str) -> HashMap<String, PinnedEntry> {
                 is_directory,
                 last_synced_mtime,
                 last_synced_size,
+                last_refreshed,
             },
         );
     }
@@ -153,17 +159,18 @@ fn save_manifest(manifest: &HashMap<String, PinnedEntry>) -> Result<(), String> 
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let mut contents = String::from(
-        "# Wayfinder offline pins — tab-separated: path<TAB>is_directory<TAB>mtime<TAB>size\n",
+        "# Wayfinder offline pins — tab-separated: path<TAB>is_directory<TAB>mtime<TAB>size<TAB>refreshed\n",
     );
     let mut entries: Vec<&PinnedEntry> = manifest.values().collect();
     entries.sort_by(|a, b| a.original_path.cmp(&b.original_path));
     for entry in entries {
         contents.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             entry.original_path,
             if entry.is_directory { 1 } else { 0 },
             entry.last_synced_mtime,
             entry.last_synced_size,
+            entry.last_refreshed,
         ));
     }
     // Whole or not at all: a reader mustn't see it half written.
@@ -214,6 +221,7 @@ pub fn record_pin(original_path: &str) -> Result<(), String> {
                 is_directory,
                 last_synced_mtime: mtime,
                 last_synced_size: size,
+                last_refreshed: now_secs(),
             },
         );
     })
@@ -438,9 +446,9 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
         .filter(|_| crate::rclone_ops::rclone_available())
         .map(|t| t.full_remote_spec);
     let changed = if entry.is_directory {
-        sync_dir(src, &dest, remote.as_deref())?
+        sync_dir(src, &dest, remote.as_deref(), entry.last_refreshed)?
     } else {
-        sync_file(src, &meta, &dest, remote.as_deref())?
+        sync_file(src, &meta, &dest, remote.as_deref(), entry.last_refreshed)?
     };
 
     // Update manifest (if it's still pinned: it may have been unpinned
@@ -449,6 +457,7 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
         if let Some(e) = manifest.get_mut(&entry.original_path) {
             e.last_synced_mtime = mtime;
             e.last_synced_size = size;
+            e.last_refreshed = now_secs();
         }
     })?;
     Ok(changed)
@@ -485,14 +494,47 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether `path`, or anything in it, was changed after `since` (a
+/// refresh time; 0 means unknown, and then nothing counts as changed).
+/// Fetched files keep the remote's dates, so only the user's own changes
+/// are newer than the refresh that fetched them.
+fn changed_since(path: &Path, since: i64) -> bool {
+    if since <= 0 {
+        return false;
+    }
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    if mtime_secs(&meta) > since {
+        return true;
+    }
+    meta.is_dir()
+        && std::fs::read_dir(path)
+            .map(|entries| entries.flatten().any(|e| changed_since(&e.path(), since)))
+            .unwrap_or(false)
+}
+
 /// Suffix for a download in progress; renamed into place when complete.
 const PART_SUFFIX: &str = ".wayfinder-part";
 
 /// Bring `dst` in line with the directory `src`. Returns true if anything
 /// was copied or removed.
-fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>) -> Result<bool, String> {
-    // A file here that's a folder on the remote now: make way for it.
+/// `since`: when the copy was last refreshed (see `last_refreshed`).
+fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, since: i64) -> Result<bool, String> {
+    // A file here that's a folder on the remote now: make way for it —
+    // unless it was changed here since the last refresh (the user's).
     if dst.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+        if changed_since(dst, since) {
+            log::warn!("Offline copy {} changed here; kept", dst.display());
+            return Ok(false);
+        }
         std::fs::remove_file(dst).map_err(|e| e.to_string())?;
     }
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
@@ -513,7 +555,7 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>) -> Result<bool, String
         };
         if file_type.is_dir() {
             let child = remote.map(|r| remote_child(r, &entry.file_name().to_string_lossy()));
-            changed |= sync_dir(&from, &to, child.as_deref())?;
+            changed |= sync_dir(&from, &to, child.as_deref(), since)?;
         } else if file_type.is_file() {
             let meta = {
                 let _io = sleep::io_step();
@@ -521,7 +563,7 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>) -> Result<bool, String
             };
             let meta = meta.map_err(|e| e.to_string())?;
             let child = remote.map(|r| remote_child(r, &entry.file_name().to_string_lossy()));
-            changed |= sync_file(&from, &meta, &to, child.as_deref())?;
+            changed |= sync_file(&from, &meta, &to, child.as_deref(), since)?;
         }
         // Skip symlinks — copying through them could pull data we don't want
     }
@@ -533,6 +575,11 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>) -> Result<bool, String
             continue;
         }
         let path = entry.path();
+        // Made or changed here since the last refresh: the user's, kept.
+        if changed_since(&path, since) {
+            log::warn!("Offline copy {} changed here; kept", path.display());
+            continue;
+        }
         let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
             std::fs::remove_dir_all(&path)
         } else {
@@ -550,10 +597,17 @@ fn sync_file(
     src_meta: &std::fs::Metadata,
     dst: &Path,
     remote: Option<&str>,
+    since: i64,
 ) -> Result<bool, String> {
     if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
         if dst_meta.is_dir() {
-            // A folder here that's a file on the remote now: make way.
+            // A folder here that's a file on the remote now: make way —
+            // unless something in it was changed here since the last
+            // refresh.
+            if changed_since(dst, since) {
+                log::warn!("Offline copy {} changed here; kept", dst.display());
+                return Ok(false);
+            }
             std::fs::remove_dir_all(dst).map_err(|e| e.to_string())?;
         } else {
             if dst_meta.len() == src_meta.len() && mtime_secs(&dst_meta) == mtime_secs(src_meta) {
@@ -658,6 +712,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn changes_made_after_a_refresh_are_noticed() {
+        let d = dir("since");
+        std::fs::create_dir_all(d.join("Docs/Sub")).unwrap();
+        std::fs::write(d.join("Docs/Sub/new.txt"), b"mine").unwrap();
+        let now = super::now_secs();
+        // Refreshed an hour ago: the new file is the user's.
+        assert!(super::changed_since(&d.join("Docs"), now - 3600));
+        // Refreshed after it was made: not a change of the user's.
+        assert!(!super::changed_since(&d.join("Docs"), now + 3600));
+        // Unknown refresh time: nothing counts.
+        assert!(!super::changed_since(&d.join("Docs"), 0));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

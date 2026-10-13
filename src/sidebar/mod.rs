@@ -41,7 +41,7 @@ pub fn load_bookmarks() -> Vec<(String, String)> {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                     })
-                    .unwrap_or_else(|| line.to_string());
+                    .unwrap_or_else(|| crate::file_model::display_name(line));
                 (line.to_string(), name)
             };
             Some((uri, display))
@@ -136,6 +136,13 @@ fn remove_bookmark_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
         &format!("Bookmark {display} removed"),
         gtk::AccessibleAnnouncementPriority::Medium,
     );
+}
+
+thread_local! {
+    /// Places activated so far (to tell whether the user has moved on).
+    static ACTIVATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Volumes being mounted (by UUID).
+    static MOUNTING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// `item` and, below it, Wayfinder's settings: the sidebar's menu is
@@ -262,6 +269,7 @@ impl WayfinderSidebar {
         self.imp()
             .places_list
             .connect_row_activated(move |list, row| {
+                ACTIVATIONS.with(|n| n.set(n.get() + 1));
                 let name = row.widget_name();
                 if let Some(path) = name.strip_prefix("place:") {
                     callback(path.to_string());
@@ -276,8 +284,18 @@ impl WayfinderSidebar {
                         for vol in vm.volumes() {
                             let vol_id = vol.uuid().map(|u| u.to_string()).unwrap_or_default();
                             if vol_id == uuid {
-                                let mount_op = gio::MountOperation::new();
                                 let label = vol.name().to_string();
+                                // A second Enter while it's mounting: wait.
+                                if MOUNTING.with(|m| m.borrow().contains(&vol_id)) {
+                                    list.announce(
+                                        &format!("Still mounting {label}"),
+                                        gtk::AccessibleAnnouncementPriority::Medium,
+                                    );
+                                    break;
+                                }
+                                MOUNTING.with(|m| m.borrow_mut().push(vol_id.clone()));
+                                let activation = ACTIVATIONS.with(|n| n.get());
+                                let mount_op = gio::MountOperation::new();
                                 let mounted = vol.clone();
                                 let callback = callback.clone();
                                 let list = list.clone();
@@ -291,21 +309,34 @@ impl WayfinderSidebar {
                                     gio::MountMountFlags::NONE,
                                     Some(&mount_op),
                                     gio::Cancellable::NONE,
-                                    move |result| match result {
-                                        Ok(()) => {
-                                            let path = mounted
-                                                .get_mount()
-                                                .and_then(|m| m.default_location().path());
-                                            if let Some(path) = path {
-                                                callback(path.to_string_lossy().to_string());
+                                    move |result| {
+                                        MOUNTING.with(|m| m.borrow_mut().retain(|v| *v != vol_id));
+                                        match result {
+                                            Ok(()) => {
+                                                // Open it — unless the user has
+                                                // chosen something else meanwhile.
+                                                let moved_on =
+                                                    ACTIVATIONS.with(|n| n.get()) != activation;
+                                                let path = mounted
+                                                    .get_mount()
+                                                    .and_then(|m| m.default_location().path());
+                                                match path {
+                                                    Some(path) if !moved_on => {
+                                                        callback(path.to_string_lossy().to_string())
+                                                    }
+                                                    _ => list.announce(
+                                                        &format!("{label} mounted"),
+                                                        gtk::AccessibleAnnouncementPriority::Medium,
+                                                    ),
+                                                }
                                             }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to mount volume: {e}");
-                                            list.announce(
-                                                &format!("Couldn't mount {label}: {e}"),
-                                                gtk::AccessibleAnnouncementPriority::High,
-                                            );
+                                            Err(e) => {
+                                                log::error!("Failed to mount volume: {e}");
+                                                list.announce(
+                                                    &format!("Couldn't mount {label}: {e}"),
+                                                    gtk::AccessibleAnnouncementPriority::High,
+                                                );
+                                            }
                                         }
                                     },
                                 );

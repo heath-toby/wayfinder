@@ -1289,13 +1289,10 @@ impl WayfinderWindow {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                // By real paths (links resolved, without touching a mount):
-                // the same folder may be reached through a link.
-                let real_src =
-                    wayfinder::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(src));
-                let real_dest = wayfinder::rclone_ops::resolve_links_outside_mounts(
-                    std::path::Path::new(&dest),
-                );
+                // By real paths (links resolved, without touching a mount),
+                // all but the last part: a link is copied as itself.
+                let real_src = real_location_outside_mounts(src);
+                let real_dest = real_location_outside_mounts(&dest);
                 let msg = match placement(&real_src, &real_dest) {
                     Placement::IntoItself => Some(format!(
                         "Cannot {} {name} into itself",
@@ -3483,6 +3480,18 @@ fn duplicate_target(pairs: &[(String, String)]) -> Option<String> {
                 .unwrap_or_default()
         })
     })
+}
+
+/// `path` with its links resolved (without touching a mount) except the
+/// last part.
+fn real_location_outside_mounts(path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => {
+            wayfinder::rclone_ops::resolve_links_outside_mounts(parent).join(name)
+        }
+        _ => p.to_path_buf(),
+    }
 }
 
 /// The folder holding `path`.

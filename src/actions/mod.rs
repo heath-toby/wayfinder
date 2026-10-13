@@ -65,13 +65,31 @@ fn has_command(cmd: &str) -> bool {
     // Looked up in $PATH here, not by running `which`: this runs as the
     // menu opens, on the main thread, where starting a process can wait on
     // a FUSE file this process has open.
+    // Remembered for the run (it's asked each time the menu opens), and
+    // folders on FUSE or network mounts in $PATH are skipped: a slow one
+    // would hold up the menu.
+    static FOUND: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+    if let Some((_, found)) = FOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(c, _)| c == cmd)
+    {
+        return *found;
+    }
     use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|path| {
+    let found = std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
-            std::fs::metadata(dir.join(cmd))
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            !crate::rclone_ops::is_fuse_path(&dir.to_string_lossy())
+                && std::fs::metadata(dir.join(cmd))
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
-    })
+    });
+    FOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((cmd.to_string(), found));
+    found
 }
 
 /// Parse .desktop-like action files from a directory. Also scans immediate
