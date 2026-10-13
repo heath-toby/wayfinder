@@ -71,7 +71,12 @@ impl WayfinderWindow {
 
     /// Load a directory without modifying history (used by back/forward)
     pub fn load_directory(&self, path: &str) {
-        self.open_directory(path, false);
+        if path.contains("://") {
+            // The Bin or Recent Files, in the history.
+            self.open_special_uri(path);
+        } else {
+            self.open_directory(path, false);
+        }
     }
 
     /// Remember the selection in the location being left, and clear search.
@@ -294,7 +299,14 @@ impl WayfinderWindow {
         }
     }
 
+    /// Open the Bin or Recent Files, as a step in the history (so Back
+    /// returns to the folder before it).
     pub fn load_special_uri(&self, uri: &str) {
+        self.imp().nav.borrow_mut().navigate_to(PathBuf::from(uri));
+        self.open_special_uri(uri);
+    }
+
+    fn open_special_uri(&self, uri: &str) {
         self.leave_location(uri);
         self.show_location(uri, false);
 

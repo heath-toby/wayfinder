@@ -711,7 +711,15 @@ impl WayfinderSidebar {
     }
 
     pub fn connect_trash_right_click<F: Fn() + 'static>(&self, callback: F) {
-        let callback = std::rc::Rc::new(callback);
+        *self.imp().trash_menu.borrow_mut() = Some(std::rc::Rc::new(callback));
+        self.wire_trash_right_click();
+    }
+
+    /// Give the Bin row its right-click menu.
+    fn wire_trash_right_click(&self) {
+        let Some(callback) = self.imp().trash_menu.borrow().clone() else {
+            return;
+        };
         // Walk through rows to find the trash row and add a right-click controller
         let mut child = self.imp().places_list.first_child();
         while let Some(widget) = child {
@@ -736,6 +744,8 @@ impl WayfinderSidebar {
             list.remove(&child);
         }
         self.populate_places();
+        // The new Bin row needs its menu again.
+        self.wire_trash_right_click();
     }
 
     pub fn connect_sidebar_edit_menu(&self, parent_window: &gtk::Window) {
@@ -957,20 +967,42 @@ impl WayfinderSidebar {
             let list_row = gtk::ListBoxRow::new();
             list_row.set_child(Some(&hbox));
             list_row.set_widget_name(&row_info.id);
-            list_row.update_property(&[gtk::accessible::Property::Label(&row_info.id)]);
+            // The row is what has focus, so it says whether it's shown.
+            let row_label =
+                |id: &str, shown: bool| format!("{id}, {}", if shown { "shown" } else { "hidden" });
+            list_row.update_property(&[gtk::accessible::Property::Label(&row_label(
+                &row_info.id,
+                row_info.visible,
+            ))]);
 
             // Sync checkbox with data
             let data = row_data.clone();
             let id = row_info.id.clone();
+            let row_for_label = list_row.clone();
+            let dlg_for_toggle = dlg.clone();
             check.connect_toggled(move |cb| {
                 let mut d = data.borrow_mut();
                 if let Some(entry) = d.iter_mut().find(|(name, _)| name == &id) {
                     entry.1 = cb.is_active();
                 }
+                let text = row_label(&id, cb.is_active());
+                row_for_label.update_property(&[gtk::accessible::Property::Label(&text)]);
+                dlg_for_toggle.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
             });
 
             edit_list.append(&list_row);
         }
+
+        // Enter or Space on a row ticks or unticks it.
+        edit_list.connect_row_activated(|_, row| {
+            if let Some(check) = row
+                .child()
+                .and_then(|hbox| hbox.first_child())
+                .and_downcast::<gtk::CheckButton>()
+            {
+                check.set_active(!check.is_active());
+            }
+        });
 
         scrolled.set_child(Some(&edit_list));
         vbox.append(&scrolled);

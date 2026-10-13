@@ -43,6 +43,11 @@
 - **Custom actions** — with several files selected, an action that takes one file (such as Extract Here or Checksum) now runs on each of them, not just the first; actions are only offered when they suit every selected file; file names containing `%c`, `%i` or `%k`, and URIs with spaces or `#`, are passed correctly; the progress window can be put away with "Continue in background" or Escape (it used to stay up, blocking the window, for as long as the program ran — a terminal, say).
 - **Compress** — file names beginning with `-` are no longer mistaken for options, and an existing archive of the same name is reported instead of being added to or replaced.
 - **File chooser (portal)** — Back, Forward and Up no longer crash it. The chosen file is passed to the app correctly when its name has spaces, `#`, `%` or accented letters (it could open the wrong file). Saving over an existing file asks first. A file chosen in one folder is no longer returned after moving to another, the selected file is shown and read out, and when choosing a folder, the folder being shown can be chosen. Enter in the file name field saves; Escape cancels.
+- **Back from the Bin or Recent Files** — goes back to the folder you came from (it skipped it, or went somewhere else); Up does nothing there.
+- **Bin menu after editing the sidebar** — right-clicking the Bin keeps its Open Bin / Empty Bin menu after Edit Sidebar.
+- **Edit Sidebar** — each place says whether it's shown or hidden, and Enter or Space shows or hides it.
+- **Encrypted rclone config** — rclone is never left waiting for a config password, which could freeze the window (opening Set Up Two-Way Sync, for one) or hang an operation.
+- **Saving several files from an app** — the file chooser now lets you pick a folder and saves each file there under its own name (numbered if the name is taken), instead of returning a single file for all of them.
 - **Bookmarks** — folders with spaces or accented letters are bookmarked correctly (they were written so that GTK apps, and Wayfinder, opened the wrong folder), and such bookmarks made by other apps open properly.
 - **"Show in folder"** — from other apps, it now selects the file, and works for files with spaces or accented letters in their path.
 - **Open With per file** — the app chosen for a file whose path contains `=` is remembered.

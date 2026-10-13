@@ -160,7 +160,14 @@ pub fn rclone_available() -> bool {
 
 /// List configured rclone remotes (e.g. ["Proton:", "Drive:"]).
 pub fn list_remotes() -> Vec<String> {
-    let Some(output) = Command::new("rclone").arg("listremotes").output().ok() else {
+    // Never wait for a config password: with an encrypted config, rclone
+    // would sit reading stdin (this runs on the main thread).
+    let Some(output) = Command::new("rclone")
+        .args(["listremotes", "--ask-password=false"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+    else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -204,7 +211,11 @@ pub fn run_streaming(args: &[String], tx: Sender<RcloneEvent>) -> Result<u32, St
     for a in args {
         cmd.arg(a);
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Fail rather than wait for a config password nobody can type.
+    cmd.arg("--ask-password=false");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()

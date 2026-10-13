@@ -123,3 +123,19 @@ pub fn parse_options(
 
     (multiple, directory, current_folder, current_name)
 }
+
+/// The file names a SaveFiles request wants saved (`files`, an array of
+/// byte strings, maybe NUL-terminated).
+pub fn save_files_names(options: &HashMap<String, OwnedValue>) -> Vec<String> {
+    options
+        .get("files")
+        .and_then(|v| <Vec<Vec<u8>>>::try_from(v.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| {
+            let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(&b[..end]).to_string()
+        })
+        .filter(|n| !n.is_empty())
+        .collect()
+}

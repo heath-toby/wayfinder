@@ -442,7 +442,10 @@ fn sync_file(
 fn fetch(src: &Path, dst: &Path, remote: Option<&str>) -> std::io::Result<()> {
     if let Some(remote) = remote {
         let mut cmd = std::process::Command::new("rclone");
-        cmd.arg("copyto").arg(remote).arg(dst);
+        cmd.arg("copyto")
+            .arg("--ask-password=false")
+            .arg(remote)
+            .arg(dst);
         if run_quietly(&mut cmd)?.success() {
             return Ok(());
         }

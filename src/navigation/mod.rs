@@ -52,7 +52,12 @@ impl NavigationState {
         }
     }
 
+    /// The folder above the current one. None at the top, and for the Bin
+    /// and Recent Files (`trash:///`, `recent:///`), which have no parent.
     pub fn go_up(&self) -> Option<PathBuf> {
+        if self.current().to_string_lossy().contains("://") {
+            return None;
+        }
         self.current().parent().map(|p| p.to_path_buf())
     }
 
@@ -62,5 +67,22 @@ impl NavigationState {
 
     pub fn can_go_forward(&self) -> bool {
         self.current_index + 1 < self.history.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NavigationState;
+    use std::path::PathBuf;
+
+    /// Home → Documents → Bin, then Back: Documents.
+    #[test]
+    fn back_from_the_bin_returns_to_the_folder_before_it() {
+        let mut nav = NavigationState::new(PathBuf::from("/home/u"));
+        nav.navigate_to(PathBuf::from("/home/u/Documents"));
+        nav.navigate_to(PathBuf::from("trash:///"));
+        assert_eq!(nav.go_up(), None);
+        assert_eq!(nav.go_back(), Some(&PathBuf::from("/home/u/Documents")));
+        assert_eq!(nav.go_forward(), Some(&PathBuf::from("trash:///")));
     }
 }

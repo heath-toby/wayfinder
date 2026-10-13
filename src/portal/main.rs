@@ -77,12 +77,18 @@ fn main() {
 
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
+            // SaveFiles: the user picks a folder; each requested file is
+            // saved there under its own name.
+            let save_files = request
+                .is_save_files
+                .then(|| dbus::save_files_names(&request.options));
+
             chooser::show_chooser(
                 &request.title,
                 &accept_label,
-                request.is_save,
+                request.is_save && save_files.is_none(),
                 false,
-                directory,
+                directory || save_files.is_some(),
                 current_folder.as_deref(),
                 current_name.as_deref(),
                 vec![],
@@ -91,7 +97,15 @@ fn main() {
 
             let response_tx = request.response_tx;
             glib::spawn_future_local(async move {
-                if let Ok(result) = result_rx.await {
+                if let Ok(mut result) = result_rx.await {
+                    if let (Some(names), false) = (save_files, result.cancelled) {
+                        // Checking for existing files may touch a slow mount.
+                        let folder = result.uris.first().cloned().unwrap_or_default();
+                        result.uris =
+                            gtk::gio::spawn_blocking(move || save_files_uris(&folder, &names))
+                                .await
+                                .unwrap_or_default();
+                    }
                     let response = if result.cancelled { 1u32 } else { 0u32 };
                     let mut results = HashMap::<String, OwnedValue>::new();
                     if !result.cancelled {
@@ -111,4 +125,71 @@ fn main() {
     // Run the GLib main loop
     let main_loop = glib::MainLoop::new(None, false);
     main_loop.run();
+}
+
+/// The URIs to save `names` under in the folder `folder_uri`: a name taken
+/// by an existing file gets a number ("report (2).pdf"), so nothing is
+/// overwritten without being asked.
+fn save_files_uris(folder_uri: &str, names: &[String]) -> Vec<String> {
+    use gtk::gio::prelude::FileExt;
+    let folder = gtk::gio::File::for_uri(folder_uri);
+    let Some(dir) = folder.path() else {
+        return Vec::new();
+    };
+    let mut taken: Vec<std::path::PathBuf> = Vec::new();
+    names
+        .iter()
+        .map(|name| {
+            let path = free_name(&dir, name, |p| {
+                p.exists() || taken.contains(&p.to_path_buf())
+            });
+            taken.push(path.clone());
+            gtk::gio::File::for_path(&path).uri().to_string()
+        })
+        .collect()
+}
+
+/// `dir/name`, or if `taken` says that's in use, `dir/stem (N).ext`.
+fn free_name(
+    dir: &std::path::Path,
+    name: &str,
+    taken: impl Fn(&std::path::Path) -> bool,
+) -> std::path::PathBuf {
+    let first = dir.join(name);
+    if !taken(&first) {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    (2..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !taken(p))
+        .unwrap_or(first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::free_name;
+    use std::path::Path;
+
+    #[test]
+    fn taken_names_get_a_number() {
+        let dir = Path::new("/d");
+        let taken =
+            |p: &Path| p == Path::new("/d/report.pdf") || p == Path::new("/d/report (2).pdf");
+        assert_eq!(
+            free_name(dir, "report.pdf", taken),
+            Path::new("/d/report (3).pdf")
+        );
+        assert_eq!(
+            free_name(dir, "notes", |p: &Path| p == Path::new("/d/notes")),
+            Path::new("/d/notes (2)")
+        );
+        assert_eq!(
+            free_name(dir, "new.txt", |_: &Path| false),
+            Path::new("/d/new.txt")
+        );
+    }
 }
