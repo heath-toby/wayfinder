@@ -32,7 +32,10 @@ fn gather_details(path: &str) -> Result<Details, String> {
     let modified = info
         .modification_date_time()
         .map(|dt: glib::DateTime| {
-            dt.format("%Y-%m-%d %H:%M:%S")
+            // GIO gives UTC; show the time as it is here.
+            dt.to_local()
+                .unwrap_or(dt)
+                .format("%Y-%m-%d %H:%M:%S")
                 .unwrap_or_else(|_| glib::GString::from(""))
                 .to_string()
         })

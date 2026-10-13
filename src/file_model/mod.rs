@@ -598,74 +598,7 @@ impl DirectoryModel {
             return;
         }
 
-        // Channel: thread sends (path, size) pairs, main thread polls and
-        // updates store. No size means a mountpoint that isn't walked.
-        let (tx, rx) = std::sync::mpsc::channel::<(String, Option<u64>)>();
-        let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_flag_thread = done_flag.clone();
-
-        std::thread::spawn(move || {
-            // Resolve symlinks here, off the main thread, so mountpoints
-            // match by path.
-            let base = std::fs::canonicalize(&base).unwrap_or_else(|_| base.into());
-            for (key, name) in &dirs {
-                let real = base.join(name);
-                let size = (!skip.contains(&real)).then(|| walk_dir_size(&real, &skip));
-                let _ = tx.send((key.clone(), size));
-            }
-            done_flag_thread.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-
-        // Poll for results on the main thread
-        let store = self.store.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            // Build index for O(1) lookups
-            let mut path_to_index: std::collections::HashMap<String, u32> =
-                std::collections::HashMap::new();
-            for i in 0..store.n_items() {
-                if let Some(item) = store.item(i) {
-                    let fo = item.downcast_ref::<FileObject>().unwrap();
-                    if fo.is_directory() {
-                        path_to_index.insert(fo.path(), i);
-                    }
-                }
-            }
-
-            // Drain all available results
-            while let Ok((path, size)) = rx.try_recv() {
-                // Try O(1) lookup first
-                let idx = path_to_index.get(&path).copied().or_else(|| {
-                    // Fallback: linear scan if indices shifted
-                    (0..store.n_items()).find(|&i| {
-                        store
-                            .item(i)
-                            .and_then(|item| {
-                                item.downcast_ref::<FileObject>()
-                                    .map(|fo| fo.path() == path)
-                            })
-                            .unwrap_or(false)
-                    })
-                });
-                if let Some(i) = idx {
-                    if let Some(item) = store.item(i) {
-                        let fo = item.downcast_ref::<FileObject>().unwrap();
-                        match size {
-                            Some(size) => {
-                                fo.set_size(size);
-                                fo.set_size_display(crate::file_object::format_size(size));
-                            }
-                            None => fo.set_size_display("\u{2014}".to_string()),
-                        }
-                    }
-                }
-            }
-
-            if done_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
-        });
+        spawn_size_job(&self.store, &self.sort_model, base, dirs, skip);
     }
 
     /// Watch a local directory for changes. (Not used on FUSE mounts.)
@@ -714,6 +647,16 @@ impl DirectoryModel {
                                 let file_obj = FileObject::from_file_info(&path, &info);
                                 store.append(&file_obj);
                                 sorter.changed(gtk::SorterChange::Different);
+                                // It says "Calculating...": do so.
+                                if file_obj.is_directory() {
+                                    spawn_size_job(
+                                        &store,
+                                        &sort_model,
+                                        path.clone(),
+                                        vec![(file_obj.path(), file_obj.name())],
+                                        remote_mountpoints(),
+                                    );
+                                }
                             }
                         }
                         gio::FileMonitorEvent::Deleted => {
@@ -785,6 +728,71 @@ impl DirectoryModel {
 /// order (the sort model places new items, but doesn't notice changes).
 /// Only then: re-sorting replaces every row, which can make Orca lose or
 /// repeat its place.
+/// Work out the sizes of the folders `dirs` ((key in the store, name in
+/// `base`)) on a worker thread, and show each as it comes in.
+fn spawn_size_job(
+    store: &gio::ListStore,
+    sort_model: &SortListModel,
+    base: String,
+    dirs: Vec<(String, String)>,
+    skip: std::collections::HashSet<std::path::PathBuf>,
+) {
+    // Channel: thread sends (path, size) pairs, main thread polls and
+    // updates store. No size means a folder that isn't walked.
+    let (tx, rx) = std::sync::mpsc::channel::<(String, Option<u64>)>();
+    std::thread::spawn(move || {
+        // Resolve symlinks here, off the main thread, so mountpoints
+        // match by path.
+        let base = std::fs::canonicalize(&base).unwrap_or_else(|_| base.into());
+        for (key, name) in &dirs {
+            let real = base.join(name);
+            // A link to a folder isn't walked: it may lead anywhere — onto
+            // a mount, or round in a loop.
+            let is_link = real
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink());
+            let size = (!is_link && !skip.contains(&real)).then(|| walk_dir_size(&real, &skip));
+            let _ = tx.send((key.clone(), size));
+        }
+    });
+
+    // Poll for results on the main thread, until the thread is done and
+    // every result is in (the channel disconnects only after the last).
+    let store = store.clone();
+    let sort_model = sort_model.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        let mut updated = Vec::new();
+        let finished = loop {
+            match rx.try_recv() {
+                Ok((path, size)) => {
+                    let fo = (0..store.n_items())
+                        .filter_map(|i| store.item(i).and_downcast::<FileObject>())
+                        .find(|fo| fo.path() == path);
+                    if let Some(fo) = fo {
+                        match size {
+                            Some(size) => {
+                                fo.set_size(size);
+                                fo.set_size_display(crate::file_object::format_size(size));
+                            }
+                            None => fo.set_size_display("\u{2014}".to_string()),
+                        }
+                        updated.push(fo);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        // Sorted by size, folders move to their places as sizes arrive.
+        resort_if_needed(&sort_model, &updated);
+        if finished {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
 fn resort_if_needed(sort_model: &SortListModel, changed: &[FileObject]) {
     let Some(sorter) = sort_model.sorter() else {
         return;

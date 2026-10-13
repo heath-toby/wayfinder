@@ -11,6 +11,9 @@ glib::wrapper! {
 #[derive(Clone, PartialEq)]
 pub struct FileInfoData {
     pub name: String,
+    /// The name to show. In the Bin, an item trashed from another drive is
+    /// named by its encoded trash path; this is its real name.
+    pub display_name: String,
     pub is_directory: bool,
     pub size: u64,
     pub modified: i64,
@@ -32,7 +35,10 @@ impl FileInfoData {
         let modified_display = info
             .modification_date_time()
             .map(|dt| {
-                dt.format("%Y-%m-%d %H:%M")
+                // GIO gives UTC; show the time as it is here.
+                dt.to_local()
+                    .unwrap_or(dt)
+                    .format("%Y-%m-%d %H:%M")
                     .unwrap_or_else(|_| glib::GString::from(""))
                     .to_string()
             })
@@ -49,8 +55,10 @@ impl FileInfoData {
         .map(|s| s.to_string())
         .unwrap_or_default();
 
+        let display_name = info.display_name().to_string();
         Self {
             name,
+            display_name,
             is_directory,
             size,
             modified,
@@ -64,13 +72,19 @@ impl FileObject {
     /// Build a FileObject from pre-extracted plain data (safe to call on the
     /// main thread after the data was gathered in a background thread).
     pub fn from_data(parent_path: &str, data: &FileInfoData) -> Self {
-        let name = &data.name;
         let path = if parent_path == "/" {
-            format!("/{name}")
+            format!("/{}", data.name)
         } else {
-            format!("{parent_path}/{name}")
+            format!("{parent_path}/{}", data.name)
         };
-        let hidden = name.starts_with('.');
+        let hidden = data.name.starts_with('.');
+        // Shown, sorted, searched and read out: the Bin's real names, not
+        // its encoded ones. (The path keeps the name GIO knows it by.)
+        let name = if parent_path.starts_with("trash:") && !data.display_name.is_empty() {
+            &data.display_name
+        } else {
+            &data.name
+        };
         let size_display = if data.is_directory {
             String::from("\u{2014}")
         } else {
@@ -158,7 +172,10 @@ impl FileObject {
         let modified_display = info
             .modification_date_time()
             .map(|dt| {
-                dt.format("%Y-%m-%d %H:%M")
+                // GIO gives UTC; show the time as it is here.
+                dt.to_local()
+                    .unwrap_or(dt)
+                    .format("%Y-%m-%d %H:%M")
                     .unwrap_or_else(|_| glib::GString::from(""))
                     .to_string()
             })

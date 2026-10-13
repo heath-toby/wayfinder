@@ -742,8 +742,16 @@ impl WayfinderWindow {
         let imp = self.imp();
         let old_pos = imp.selection.selected();
 
-        // child() escapes the name: `#` or `%41` in it must stay part of it.
-        let gio_file = gio::File::for_uri("trash:///").child(file.name());
+        // The Bin's own name for it (the shown name may differ: see
+        // FileInfoData::display_name). child() escapes it: `#` or `%41` in
+        // it must stay part of it.
+        let trash_name = file
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let gio_file = gio::File::for_uri("trash:///").child(trash_name);
         match wayfinder::file_ops::restore_from_trash(&gio_file) {
             Ok(dest) => {
                 // Reload the trash listing so the restored item disappears

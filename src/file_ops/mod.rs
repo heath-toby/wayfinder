@@ -850,7 +850,9 @@ fn run_with_progress(
                     } else {
                         src.copy(
                             &dst,
-                            flags,
+                            // A link is copied as a link (to a folder, it can't
+                            // be copied by following it).
+                            flags | gio::FileCopyFlags::NOFOLLOW_SYMLINKS,
                             Some(&cancellable_clone),
                             Some(&mut |current, total| {
                                 let mut state = ps.lock().unwrap();
@@ -872,7 +874,9 @@ fn run_with_progress(
             } else {
                 src.copy(
                     &dst,
-                    flags,
+                    // A link is copied as a link (to a folder, it can't
+                    // be copied by following it).
+                    flags | gio::FileCopyFlags::NOFOLLOW_SYMLINKS,
                     Some(&cancellable_clone),
                     Some(&mut |current, total| {
                         let mut state = ps.lock().unwrap();

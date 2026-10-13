@@ -74,10 +74,12 @@ pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
     let real_path = real.to_string_lossy().to_string();
     let is_fuse = crate::rclone_ops::is_fuse_path(&real_path);
 
+    // Links are followed (this is a worker thread), so a link to a folder
+    // is listed, sorted and opened as a folder.
     let enumerator = gio::File::for_path(&dir)
         .enumerate_children(
             attrs_for(is_fuse),
-            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::FileQueryInfoFlags::NONE,
             gio::Cancellable::NONE,
         )
         .map_err(|e| e.to_string())?;
@@ -315,6 +317,7 @@ mod tests {
                 path.to_string(),
                 FileInfoData {
                     name: "report.txt".to_string(),
+                    display_name: "report.txt".to_string(),
                     is_directory: false,
                     size: 1,
                     modified: 0,

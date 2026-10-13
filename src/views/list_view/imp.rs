@@ -18,16 +18,19 @@ impl Default for ListViewInner {
             .show_row_separators(true)
             .build();
 
+        // Whether the sort is descending: the folders-first rule reads it
+        // (see folders_first).
+        let descending = std::rc::Rc::new(std::cell::Cell::new(!crate::state::load_sort_state().1));
+
         // Name column with sorter
         let name_factory = SignalListItemFactory::new();
         setup_name_factory(&name_factory);
-        let name_sorter = CustomSorter::new(|a, b| {
+        let desc = descending.clone();
+        let name_sorter = CustomSorter::new(move |a, b| {
             let a = a.downcast_ref::<FileObject>().unwrap();
             let b = b.downcast_ref::<FileObject>().unwrap();
-            match (a.is_directory(), b.is_directory()) {
-                (true, false) => return gtk::Ordering::Smaller,
-                (false, true) => return gtk::Ordering::Larger,
-                _ => {}
+            if let Some(order) = folders_first(a, b, desc.get()) {
+                return order;
             }
             let cmp = a.search_string().cmp(&b.search_string());
             match cmp {
@@ -48,13 +51,12 @@ impl Default for ListViewInner {
         // Size column with sorter
         let size_factory = SignalListItemFactory::new();
         setup_label_factory(&size_factory, "size-display");
-        let size_sorter = CustomSorter::new(|a, b| {
+        let desc = descending.clone();
+        let size_sorter = CustomSorter::new(move |a, b| {
             let a = a.downcast_ref::<FileObject>().unwrap();
             let b = b.downcast_ref::<FileObject>().unwrap();
-            match (a.is_directory(), b.is_directory()) {
-                (true, false) => return gtk::Ordering::Smaller,
-                (false, true) => return gtk::Ordering::Larger,
-                _ => {}
+            if let Some(order) = folders_first(a, b, desc.get()) {
+                return order;
             }
             match a.size().cmp(&b.size()) {
                 std::cmp::Ordering::Less => gtk::Ordering::Smaller,
@@ -74,13 +76,12 @@ impl Default for ListViewInner {
         // Modified column with sorter
         let modified_factory = SignalListItemFactory::new();
         setup_label_factory(&modified_factory, "modified-display");
-        let modified_sorter = CustomSorter::new(|a, b| {
+        let desc = descending.clone();
+        let modified_sorter = CustomSorter::new(move |a, b| {
             let a = a.downcast_ref::<FileObject>().unwrap();
             let b = b.downcast_ref::<FileObject>().unwrap();
-            match (a.is_directory(), b.is_directory()) {
-                (true, false) => return gtk::Ordering::Smaller,
-                (false, true) => return gtk::Ordering::Larger,
-                _ => {}
+            if let Some(order) = folders_first(a, b, desc.get()) {
+                return order;
             }
             match a.modified().cmp(&b.modified()) {
                 std::cmp::Ordering::Less => gtk::Ordering::Smaller,
@@ -100,13 +101,12 @@ impl Default for ListViewInner {
         // Kind column with sorter
         let kind_factory = SignalListItemFactory::new();
         setup_label_factory(&kind_factory, "file-type-name");
-        let kind_sorter = CustomSorter::new(|a, b| {
+        let desc = descending.clone();
+        let kind_sorter = CustomSorter::new(move |a, b| {
             let a = a.downcast_ref::<FileObject>().unwrap();
             let b = b.downcast_ref::<FileObject>().unwrap();
-            match (a.is_directory(), b.is_directory()) {
-                (true, false) => return gtk::Ordering::Smaller,
-                (false, true) => return gtk::Ordering::Larger,
-                _ => {}
+            if let Some(order) = folders_first(a, b, desc.get()) {
+                return order;
             }
             let cmp = a
                 .file_type_name()
@@ -179,6 +179,7 @@ impl Default for ListViewInner {
                 let idx = sort_col_idx.clone();
                 let asc = sort_ascending.clone();
                 let btns = all_buttons.clone();
+                let desc = descending.clone();
 
                 btn.connect_clicked(move |_| {
                     if idx.get() == i {
@@ -194,6 +195,7 @@ impl Default for ListViewInner {
                     } else {
                         gtk::SortType::Descending
                     };
+                    desc.set(!asc.get());
                     cv.sort_by_column(Some(&c), order);
                     crate::state::save_sort_state(idx.get() as u32, asc.get());
 
@@ -241,6 +243,56 @@ impl Default for ListViewInner {
                     "Sort by {name}"
                 ))]);
             }
+        }
+
+        // Sorting by clicking a column's own header: keep the buttons (what
+        // Orca reads), the folders-first rule and the saved state in step.
+        if let Some(view_sorter) = column_view.sorter().and_downcast::<gtk::ColumnViewSorter>() {
+            let cols: Vec<ColumnViewColumn> = columns.iter().map(|(_, c)| c.clone()).collect();
+            let sorters = [
+                name_sorter.clone(),
+                size_sorter.clone(),
+                modified_sorter.clone(),
+                kind_sorter.clone(),
+            ];
+            let idx = sort_col_idx.clone();
+            let asc = sort_ascending.clone();
+            let desc = descending.clone();
+            let btns = all_buttons.clone();
+            view_sorter.connect_changed(move |view_sorter, _| {
+                let Some(col) = view_sorter.primary_sort_column() else {
+                    return;
+                };
+                let Some(i) = cols.iter().position(|c| *c == col) else {
+                    return;
+                };
+                let ascending = view_sorter.primary_sort_order() == gtk::SortType::Ascending;
+                let flipped = desc.get() == ascending;
+                idx.set(i);
+                asc.set(ascending);
+                desc.set(!ascending);
+                crate::state::save_sort_state(i as u32, ascending);
+                for (j, (name, button)) in btns.iter().enumerate() {
+                    if j == i {
+                        let dir = if ascending { "ascending" } else { "descending" };
+                        button.set_label(&format!("{name}, {dir}"));
+                        button.update_property(&[gtk::accessible::Property::Label(&format!(
+                            "{name}, sorted {dir}"
+                        ))]);
+                    } else {
+                        button.set_label(name);
+                        button.update_property(&[gtk::accessible::Property::Label(&format!(
+                            "Sort by {name}"
+                        ))]);
+                    }
+                }
+                if flipped {
+                    // The folders-first rule depends on the direction.
+                    for sorter in &sorters {
+                        sorter.changed(gtk::SorterChange::Different);
+                    }
+                }
+            });
         }
 
         // Down arrow from header buttons focuses the first file in the ColumnView
@@ -329,6 +381,21 @@ fn setup_name_factory(factory: &SignalListItemFactory) {
         );
         a11y_name_expr.bind(item, "accessible-label", Some(item));
 
+        // The row's own label (what Orca reads in context) follows the
+        // file's details as they change — a download growing, say — not
+        // just what they were when the row was bound.
+        let row_weak = row.downgrade();
+        let item_weak = item.downgrade();
+        let label_expr = a11y_name_expr.clone();
+        a11y_name_expr.watch(Some(item), move || {
+            let (Some(row), Some(item)) = (row_weak.upgrade(), item_weak.upgrade()) else {
+                return;
+            };
+            if let Some(text) = label_expr.evaluate_as::<String, _>(Some(&item)) {
+                row.update_property(&[gtk::accessible::Property::Label(&text)]);
+            }
+        });
+
         crate::views::select_on_right_click(&row, item);
         item.set_child(Some(&row));
     });
@@ -338,17 +405,7 @@ fn setup_name_factory(factory: &SignalListItemFactory) {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         if let Some(file) = item.item().and_downcast::<FileObject>() {
             if let Some(child) = item.child() {
-                let label = if file.is_directory() {
-                    format!("{}, Folder", file.name())
-                } else {
-                    format!(
-                        "{}, {}, {}",
-                        file.name(),
-                        file.size_display(),
-                        file.file_type_name()
-                    )
-                };
-                child.update_property(&[gtk::accessible::Property::Label(&label)]);
+                // (Its accessible label follows the file: see the setup.)
 
                 // Add DragSource for drag & drop
                 let drag_source = gtk::DragSource::new();
@@ -401,4 +458,57 @@ fn setup_label_factory(factory: &SignalListItemFactory, property: &'static str) 
         crate::views::select_on_right_click(&label, item);
         item.set_child(Some(&label));
     });
+}
+
+/// Folders before files, whichever way the list is sorted. The view
+/// reverses every comparison for a descending sort, so the rule is
+/// reversed first, to come out the right way round.
+fn folders_first(a: &FileObject, b: &FileObject, descending: bool) -> Option<gtk::Ordering> {
+    let (folder_first, file_first) = if descending {
+        (gtk::Ordering::Larger, gtk::Ordering::Smaller)
+    } else {
+        (gtk::Ordering::Smaller, gtk::Ordering::Larger)
+    };
+    match (a.is_directory(), b.is_directory()) {
+        (true, false) => Some(folder_first),
+        (false, true) => Some(file_first),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::folders_first;
+    use crate::file_object::{FileInfoData, FileObject};
+
+    fn item(name: &str, is_directory: bool) -> FileObject {
+        FileObject::from_data(
+            "/d",
+            &FileInfoData {
+                name: name.to_string(),
+                display_name: name.to_string(),
+                is_directory,
+                size: 0,
+                modified: 0,
+                modified_display: String::new(),
+                content_type: String::new(),
+            },
+        )
+    }
+
+    /// The view reverses a descending comparison; the rule, reversed
+    /// first, still puts folders first.
+    #[test]
+    fn folders_come_first_both_ways() {
+        let (folder, file) = (item("b", true), item("a.txt", false));
+        assert_eq!(
+            folders_first(&folder, &file, false),
+            Some(gtk::Ordering::Smaller)
+        );
+        assert_eq!(
+            folders_first(&folder, &file, true),
+            Some(gtk::Ordering::Larger)
+        );
+        assert_eq!(folders_first(&file, &item("c.txt", false), true), None);
+    }
 }
