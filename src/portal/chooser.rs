@@ -23,11 +23,9 @@ pub fn show_chooser(
     title: &str,
     accept_label: &str,
     is_save: bool,
-    _multiple: bool,
     directory_mode: bool,
     current_folder: Option<&str>,
     current_name: Option<&str>,
-    _filters: Vec<(String, Vec<String>)>,
     result_tx: tokio::sync::oneshot::Sender<ChooserResult>,
 ) {
     let model = Rc::new(DirectoryModel::new());
@@ -46,7 +44,6 @@ pub fn show_chooser(
             .unwrap_or_else(|| "/".into()),
     )));
 
-    let _current_view: Rc<Cell<ViewMode>> = Rc::new(Cell::new(ViewMode::List));
     let result_tx = Rc::new(RefCell::new(Some(result_tx)));
 
     // Build the dialog window
@@ -720,13 +717,6 @@ pub fn show_chooser(
     });
 
     dlg.present();
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum ViewMode {
-    Grid,
-    List,
 }
 
 #[allow(clippy::too_many_arguments)]

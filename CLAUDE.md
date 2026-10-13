@@ -116,4 +116,4 @@ Sidebar and breadcrumb bar have paired toggle buttons + actions. The button stor
 
 - **gtk4 0.10** with `v4_14` feature
 - **zbus 5** (tokio) + **tokio 1** for D-Bus (portal, FileManager1, logind sleep watcher), **futures-util 0.3** for its signal stream
-- **clap 4**, **dirs 6**, **chrono 0.4**, **open 5**, **log 0.4**, **env_logger 0.11**
+- **dirs 6**, **chrono 0.4**, **log 0.4**, **env_logger 0.11**

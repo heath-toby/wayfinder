@@ -12,7 +12,6 @@
 
 pub mod progress;
 
-use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::Sender;
 
@@ -21,12 +20,6 @@ use gtk::prelude::*;
 /// A local path resolved to its rclone-remote equivalent.
 #[derive(Clone, Debug)]
 pub struct RcloneTarget {
-    /// Local mountpoint, e.g. `/home/Toby/protonDrive`.
-    pub mountpoint: String,
-    /// Remote root the mount was created with, e.g. `Proton:` or `Proton:Subdir`.
-    pub remote_root: String,
-    /// Path relative to the mountpoint, e.g. `Documents/German`.
-    pub relative: String,
     /// Full remote spec — what you would pass to `rclone copy`, e.g.
     /// `Proton:Documents/German`.
     pub full_remote_spec: String,
@@ -60,9 +53,6 @@ pub fn rclone_for_path(local_path: &str) -> Option<RcloneTarget> {
     };
 
     Some(RcloneTarget {
-        mountpoint: mountpoint.clone(),
-        remote_root: remote_root.clone(),
-        relative: rel,
         full_remote_spec: full,
     })
 }
@@ -324,28 +314,6 @@ pub fn kill(pid: u32) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-}
-
-/// Build the args for `rclone copy <remote_spec> <local_dest>` with sensible
-/// defaults: parallel transfers, retries, progress stats.
-pub fn copy_args(remote_spec: &str, local_dest: &Path) -> Vec<String> {
-    vec![
-        "copy".to_string(),
-        remote_spec.to_string(),
-        local_dest.to_string_lossy().to_string(),
-        "--verbose".to_string(),
-        "--stats".to_string(),
-        "5s".to_string(),
-        "--stats-one-line".to_string(),
-        "--transfers".to_string(),
-        "8".to_string(),
-        "--checkers".to_string(),
-        "16".to_string(),
-        "--retries".to_string(),
-        "3".to_string(),
-        "--low-level-retries".to_string(),
-        "10".to_string(),
-    ]
 }
 
 /// Build the args for `rclone copyto <src> <dst>` — single-source,

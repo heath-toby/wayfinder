@@ -227,17 +227,6 @@ impl WayfinderSidebar {
         &self.imp().container
     }
 
-    /// Focus the places list (for Tab navigation from file list).
-    pub fn focus_list(&self) {
-        let list = &self.imp().places_list;
-        if list.selected_row().is_none() {
-            if let Some(row) = list.row_at_index(0) {
-                list.select_row(Some(&row));
-            }
-        }
-        list.grab_focus();
-    }
-
     pub fn connect_place_activated<F: Fn(String) + 'static>(&self, callback: F) {
         self.imp()
             .places_list

@@ -7,9 +7,7 @@ pub struct FileChooserBackend {
     pub gtk_tx: std::sync::mpsc::Sender<ChooserRequest>,
 }
 
-#[allow(dead_code)]
 pub struct ChooserRequest {
-    pub handle: String,
     pub title: String,
     pub options: HashMap<String, OwnedValue>,
     pub is_save: bool,
@@ -21,7 +19,7 @@ pub struct ChooserRequest {
 impl FileChooserBackend {
     async fn open_file(
         &self,
-        handle: &str,
+        _handle: &str,
         _app_id: &str,
         _parent_window: &str,
         title: &str,
@@ -31,7 +29,6 @@ impl FileChooserBackend {
 
         self.gtk_tx
             .send(ChooserRequest {
-                handle: handle.to_string(),
                 title: title.to_string(),
                 options,
                 is_save: false,
@@ -46,7 +43,7 @@ impl FileChooserBackend {
 
     async fn save_file(
         &self,
-        handle: &str,
+        _handle: &str,
         _app_id: &str,
         _parent_window: &str,
         title: &str,
@@ -56,7 +53,6 @@ impl FileChooserBackend {
 
         self.gtk_tx
             .send(ChooserRequest {
-                handle: handle.to_string(),
                 title: title.to_string(),
                 options,
                 is_save: true,
@@ -71,7 +67,7 @@ impl FileChooserBackend {
 
     async fn save_files(
         &self,
-        handle: &str,
+        _handle: &str,
         _app_id: &str,
         _parent_window: &str,
         title: &str,
@@ -81,7 +77,6 @@ impl FileChooserBackend {
 
         self.gtk_tx
             .send(ChooserRequest {
-                handle: handle.to_string(),
                 title: title.to_string(),
                 options,
                 is_save: true,
@@ -95,14 +90,11 @@ impl FileChooserBackend {
     }
 }
 
+/// (directory, current_folder, current_name). Multiple selection isn't
+/// offered, so `multiple` isn't read.
 pub fn parse_options(
     options: &HashMap<String, OwnedValue>,
-) -> (bool, bool, Option<String>, Option<String>) {
-    let multiple = options
-        .get("multiple")
-        .and_then(|v| <bool>::try_from(v.clone()).ok())
-        .unwrap_or(false);
-
+) -> (bool, Option<String>, Option<String>) {
     let directory = options
         .get("directory")
         .and_then(|v| <bool>::try_from(v.clone()).ok())
@@ -121,7 +113,7 @@ pub fn parse_options(
         .get("current_name")
         .and_then(|v| <String>::try_from(v.clone()).ok());
 
-    (multiple, directory, current_folder, current_name)
+    (directory, current_folder, current_name)
 }
 
 /// The file names a SaveFiles request wants saved (`files`, an array of

@@ -9,11 +9,6 @@ use gtk::AccessibleAnnouncementPriority;
 
 // Simple (non-progress) file operations
 
-pub fn trash_file(file: &gio::File) -> Result<(), glib::Error> {
-    file.trash(gio::Cancellable::NONE)?;
-    Ok(())
-}
-
 /// Result of attempting to trash a file.
 pub enum TrashResult {
     /// File was successfully moved to the Bin.

@@ -60,8 +60,7 @@ fn main() {
         while let Ok(request) = gtk_rx.try_recv() {
             log::info!("Received FileChooser request: {}", request.title);
 
-            let (_multiple, directory, current_folder, current_name) =
-                dbus::parse_options(&request.options);
+            let (directory, current_folder, current_name) = dbus::parse_options(&request.options);
 
             let accept_label = request
                 .options
@@ -87,11 +86,9 @@ fn main() {
                 &request.title,
                 &accept_label,
                 request.is_save && save_files.is_none(),
-                false,
                 directory || save_files.is_some(),
                 current_folder.as_deref(),
                 current_name.as_deref(),
-                vec![],
                 result_tx,
             );
 
