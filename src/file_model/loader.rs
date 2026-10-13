@@ -122,44 +122,57 @@ pub(super) fn list_uri(uri: &str) -> ListResult {
 
 /// Look up recently used files, skipping ones that no longer exist.
 ///
-/// Files on FUSE or network mounts are asked about by one worker per
-/// mount, and waited for only briefly (a mount that has stopped answering
-/// mustn't hold up the list): one that hasn't answered in time is listed
-/// by name (its type from that; size and date unknown). A mount whose
-/// worker from an earlier listing has been stuck a while isn't asked
-/// again, so stuck threads can't pile up.
+/// Files on FUSE or network mounts (by where they really are, links
+/// resolved) are asked about in parallel and waited for only briefly: a
+/// mount that has stopped answering mustn't hold up the list. One that
+/// hasn't answered in time — or can't be reached — is listed by name (its
+/// type from that; size and date unknown); only one the mount says isn't
+/// there is left out. A mount with a question still unanswered from
+/// before isn't asked again until it answers, so stuck threads can't pile
+/// up beyond one listing's worth.
 pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
-    // The mount table, read once for the whole list.
-    let mounts = super::remote_mountpoints();
-    let mount_of = |p: &str| {
-        mounts
-            .iter()
-            .find(|m| std::path::Path::new(p).starts_with(m))
-            .cloned()
-    };
-    let stuck = stuck_mounts();
+    // The mount table, read once for the whole list. Innermost first, so a
+    // mount inside another is found as itself.
+    let mut mounts: Vec<std::path::PathBuf> = super::remote_mountpoints().into_iter().collect();
+    mounts.sort_by_key(|m| std::cmp::Reverse(m.as_os_str().len()));
+    let busy = busy_mounts();
 
     let mut slots: Vec<Option<(String, FileInfoData)>> = Vec::new();
-    // Per mount: the (slot, path) pairs to ask it about.
-    let mut to_ask: Vec<(std::path::PathBuf, Vec<(usize, String)>)> = Vec::new();
-    for path in paths {
-        if slots.len() >= limit {
-            break;
-        }
+    let (tx, rx) = mpsc::channel::<(usize, Option<FileInfoData>)>();
+    let mut asked = 0;
+    // Looked at past the limit: some may turn out to be gone.
+    for path in paths.into_iter().take(limit * 2) {
         let p = std::path::Path::new(&path);
         let Some(parent) = p.parent().map(|d| d.to_string_lossy().to_string()) else {
             continue;
         };
-        if let Some(mount) = mount_of(&path) {
+        let real = crate::rclone_ops::resolve_links_outside_mounts(p);
+        if let Some(mount) = mounts.iter().find(|m| real.starts_with(m)).cloned() {
             // Listed by name now; replaced by what the mount says, if it
             // says in time.
             let index = slots.len();
             slots.push(Some((parent, name_only(p))));
-            if !stuck.contains(&mount) {
-                match to_ask.iter_mut().find(|(m, _)| *m == mount) {
-                    Some((_, list)) => list.push((index, path)),
-                    None => to_ask.push((mount, vec![(index, path)])),
-                }
+            if !busy.contains(&mount) {
+                asked += 1;
+                let tx = tx.clone();
+                let question = MountQuestion::start(&mount);
+                std::thread::spawn(move || {
+                    let found = match gio::File::for_path(&path).query_info(
+                        FUSE_ATTRS,
+                        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                        gio::Cancellable::NONE,
+                    ) {
+                        Ok(info) => Some(Some(FileInfoData::from_file_info(&info))),
+                        // Gone: left out.
+                        Err(e) if e.matches(gio::IOErrorEnum::NotFound) => Some(None),
+                        // Can't tell (mount dropped): keep it by name.
+                        Err(_) => None,
+                    };
+                    drop(question);
+                    if let Some(found) = found {
+                        let _ = tx.send((index, found));
+                    }
+                });
             }
             continue;
         }
@@ -171,30 +184,6 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
             continue;
         };
         slots.push(Some((parent, FileInfoData::from_file_info(&info))));
-    }
-
-    let (tx, rx) = mpsc::channel::<(usize, Option<FileInfoData>)>();
-    let mut asked = 0;
-    for (mount, files) in to_ask {
-        asked += files.len();
-        let tx = tx.clone();
-        let worker = MountWorker::start(&mount);
-        std::thread::spawn(move || {
-            let _worker = worker;
-            for (index, path) in files {
-                let found = gio::File::for_path(&path)
-                    .query_info(
-                        FUSE_ATTRS,
-                        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                        gio::Cancellable::NONE,
-                    )
-                    .ok()
-                    .map(|info| FileInfoData::from_file_info(&info));
-                if tx.send((index, found)).is_err() {
-                    break; // the listing has moved on
-                }
-            }
-        });
     }
     drop(tx);
 
@@ -212,12 +201,11 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
                     slot.1 = data;
                 }
             }
-            // Gone from the mount: not recent any more.
             None => slots[index] = None,
         }
     }
 
-    let entries: Vec<(String, FileInfoData)> = slots.into_iter().flatten().collect();
+    let entries: Vec<(String, FileInfoData)> = slots.into_iter().flatten().take(limit).collect();
     Ok(Listing {
         path: "recent:///".to_string(),
         real_path: "recent:///".to_string(),
@@ -245,40 +233,41 @@ fn name_only(path: &std::path::Path) -> FileInfoData {
     }
 }
 
-/// Mounts with a Recent Files worker still asking, and since when.
-static BUSY_MOUNTS: std::sync::Mutex<Vec<(std::path::PathBuf, Instant)>> =
+/// Mounts with Recent Files questions unanswered, and how many.
+static BUSY_MOUNTS: std::sync::Mutex<Vec<(std::path::PathBuf, u32)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Mounts whose worker has been asking for over two seconds: stuck.
-fn stuck_mounts() -> Vec<std::path::PathBuf> {
+fn busy_mounts() -> Vec<std::path::PathBuf> {
     BUSY_MOUNTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter(|(_, since)| since.elapsed() > std::time::Duration::from_secs(2))
         .map(|(mount, _)| mount.clone())
         .collect()
 }
 
-/// A worker asking a mount about recent files, while alive.
-struct MountWorker(std::path::PathBuf, Instant);
+/// A question being asked of a mount, while alive.
+struct MountQuestion(std::path::PathBuf);
 
-impl MountWorker {
+impl MountQuestion {
     fn start(mount: &std::path::Path) -> Self {
-        let since = Instant::now();
-        BUSY_MOUNTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((mount.to_path_buf(), since));
-        Self(mount.to_path_buf(), since)
+        let mut busy = BUSY_MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        match busy.iter_mut().find(|(m, _)| m == mount) {
+            Some((_, count)) => *count += 1,
+            None => busy.push((mount.to_path_buf(), 1)),
+        }
+        Self(mount.to_path_buf())
     }
 }
 
-impl Drop for MountWorker {
+impl Drop for MountQuestion {
     fn drop(&mut self) {
         let mut busy = BUSY_MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = busy.iter().position(|(m, t)| *m == self.0 && *t == self.1) {
-            busy.swap_remove(i);
+        if let Some(i) = busy.iter().position(|(m, _)| *m == self.0) {
+            busy[i].1 -= 1;
+            if busy[i].1 == 0 {
+                busy.swap_remove(i);
+            }
         }
     }
 }

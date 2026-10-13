@@ -185,12 +185,6 @@ pub fn decode_mount_path(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// FUSE mountpoints from /proc/mounts, to check many paths against at
-/// once (`is_fuse_path` reads the table every time).
-pub fn fuse_mount_list() -> Vec<String> {
-    fuse_mountpoints()
-}
-
 /// FUSE mountpoints from /proc/mounts.
 fn fuse_mountpoints() -> Vec<String> {
     let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
