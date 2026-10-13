@@ -955,10 +955,10 @@ impl WayfinderWindowInner {
                     let entry = entry_for_tab.clone();
                     let dlg = dlg_for_tab.clone();
                     let dlg_slow = dlg_for_tab.clone();
-                    let waiting = wayfinder::background::waiting_message(
-                        &wayfinder::path_complete::expand_tilde(&text),
-                    );
                     let typed = wayfinder::path_complete::absolute(&text, &here);
+                    let waiting = wayfinder::background::waiting_message(
+                        &wayfinder::path_complete::expand_tilde(&typed),
+                    );
                     wayfinder::background::run(
                         move || wayfinder::path_complete::complete(&typed),
                         move |completed| {
@@ -1012,6 +1012,15 @@ impl WayfinderWindowInner {
                 let path = wayfinder::path_complete::expand_tilde(
                     &wayfinder::path_complete::absolute(&entry_clone.text(), &here_for_go),
                 );
+                // From the Bin or Recent Files, a relative path has nothing
+                // to be relative to.
+                if !path.starts_with('/') {
+                    d.announce(
+                        "Type a full path, starting with / or ~",
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    return;
+                }
                 w.navigate_to_path(&path);
                 d.close();
             };

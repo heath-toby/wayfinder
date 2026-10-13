@@ -21,6 +21,22 @@ pub enum Completion {
     NoMatch,
 }
 
+/// An absolute path with `.`, `..`, doubled and trailing slashes resolved
+/// by name (`/a/b/../c/` is `/a/c`).
+pub fn clean(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name => parts.push(name),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
 /// `text` as a path from `base` (the folder being shown) if it's relative;
 /// as it is if it starts with `/` or `~`.
 pub fn absolute(text: &str, base: &str) -> String {
@@ -207,6 +223,14 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn paths_are_cleaned_by_name() {
+        assert_eq!(clean("/home/u/Projects/.."), "/home/u");
+        assert_eq!(clean("/a/./b//c/"), "/a/b/c");
+        assert_eq!(clean("/.."), "/");
+        assert_eq!(clean("/"), "/");
     }
 
     #[test]

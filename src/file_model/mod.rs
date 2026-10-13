@@ -746,23 +746,24 @@ fn spawn_size_job(
     std::thread::spawn(move || {
         // Resolve symlinks here, off the main thread, so mountpoints
         // match by path.
-        use std::os::unix::fs::MetadataExt;
         let base = std::fs::canonicalize(&base).unwrap_or_else(|_| base.into());
         // Inside a network mount (NFS, CIFS…), every walk would go over the
         // network: don't (the same reason FUSE folders aren't walked).
         let on_network = skip.iter().any(|m| base.starts_with(m));
-        let base_dev = std::fs::metadata(&base).map(|m| m.dev()).ok();
+        // Nor into anything mounted (/proc, /sys, a disk): its size isn't
+        // the folder's. By mountpoint, not device number — btrfs
+        // subvolumes and overlay layers have their own, but are the folder.
+        let mounts = all_mountpoints();
         for (key, name) in &dirs {
             let real = base.join(name);
             // A link to a folder isn't walked: it may lead anywhere — onto
-            // a mount, or round in a loop. Nor another filesystem mounted
-            // here (/proc, /sys, a disk): its size isn't this folder's.
+            // a mount, or round in a loop.
             let walkable = !on_network
-                && !skip.contains(&real)
+                && !mounts.contains(&real)
                 && real
                     .symlink_metadata()
-                    .is_ok_and(|m| !m.file_type().is_symlink() && Some(m.dev()) == base_dev);
-            let size = walkable.then(|| walk_dir_size(&real, &skip));
+                    .is_ok_and(|m| !m.file_type().is_symlink());
+            let size = walkable.then(|| walk_dir_size(&real, &mounts));
             let _ = tx.send((key.clone(), size));
         }
     });
@@ -888,21 +889,25 @@ fn walk_dir_size(
     dir: &std::path::Path,
     skip: &std::collections::HashSet<std::path::PathBuf>,
 ) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(dev) = dir.symlink_metadata().map(|m| m.dev()) else {
-        return 0;
-    };
-    walk_dir_size_impl(dir, skip, dev, 0)
+    walk_dir_size_impl(dir, skip, 0)
 }
 
-/// Never leaves the filesystem `dev` (a mount inside isn't this folder's).
+/// Every mountpoint, from /proc/mounts.
+fn all_mountpoints() -> std::collections::HashSet<std::path::PathBuf> {
+    std::fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|m| std::path::PathBuf::from(m.replace("\\040", " ")))
+        .collect()
+}
+
+/// Doesn't go into `skip` (mountpoints).
 fn walk_dir_size_impl(
     dir: &std::path::Path,
     skip: &std::collections::HashSet<std::path::PathBuf>,
-    dev: u64,
     depth: u32,
 ) -> u64 {
-    use std::os::unix::fs::MetadataExt;
     if depth > 100 {
         return 0;
     }
@@ -918,13 +923,10 @@ fn walk_dir_size_impl(
         let Ok(meta) = path.symlink_metadata() else {
             continue;
         };
-        if meta.dev() != dev {
-            continue;
-        }
         if meta.file_type().is_symlink() || meta.is_file() {
             total += meta.len();
         } else if meta.is_dir() {
-            total += walk_dir_size_impl(&path, skip, dev, depth + 1);
+            total += walk_dir_size_impl(&path, skip, depth + 1);
         }
     }
     total

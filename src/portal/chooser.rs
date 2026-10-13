@@ -502,9 +502,12 @@ pub fn show_chooser(
                 );
                 return;
             }
+            // `/a/b/` and `/a/b/..` as plain paths, as in the main window.
+            let path = wayfinder::path_complete::clean(&path);
             // Only a folder can be gone to (or saved in); checking may
             // touch a slow mount, so not on the main thread.
             let check = path.clone();
+            let generation = model.generation();
             let (nav, model, entry, sl, bb, fb, ub, sel, d) = (
                 nav.clone(),
                 model.clone(),
@@ -519,6 +522,10 @@ pub fn show_chooser(
             wayfinder::background::run(
                 move || std::path::Path::new(&check).is_dir(),
                 move |is_dir| {
+                    // Gone somewhere else while it was checked: leave it.
+                    if model.generation() != generation {
+                        return;
+                    }
                     if !is_dir {
                         d.announce(
                             &format!("Not a folder: {path}"),

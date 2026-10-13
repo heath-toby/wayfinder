@@ -158,6 +158,12 @@ fn mountpoints_inside_of(proc_mounts: &str, path: &str) -> Vec<String> {
         .collect()
 }
 
+/// FUSE mountpoints from /proc/mounts, to check many paths against at
+/// once (`is_fuse_path` reads the table every time).
+pub fn fuse_mount_list() -> Vec<String> {
+    fuse_mountpoints()
+}
+
 /// FUSE mountpoints from /proc/mounts.
 fn fuse_mountpoints() -> Vec<String> {
     let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
@@ -917,11 +923,12 @@ pub fn move_paths_with_progress(
 /// Rename a path via direct `rclone moveto`. Within the same remote this
 /// is server-side and nearly instant. `new_path` is the full new path,
 /// including the new basename.
+/// `on_complete` is told whether every rename succeeded.
 pub fn rename_with_progress(
     old_path: String,
     new_path: String,
     parent_window: &gtk::Window,
-    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(bool) + 'static>>,
 ) {
     let src_spec = spec_for_path(&old_path);
     let dst_spec = spec_for_path(&new_path);
@@ -944,7 +951,7 @@ pub fn rename_with_progress(
         parent_window,
         labels,
         summarise_copy_line,
-        ignore_outcome(on_complete),
+        on_complete,
         move |tx, cancel| {
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
@@ -956,15 +963,16 @@ pub fn rename_with_progress(
 /// sequentially through `rclone moveto`. Pairs whose endpoints aren't on
 /// rclone mounts are passed through verbatim and rclone treats them as
 /// local-to-local operations.
+/// `on_complete` is told whether every rename succeeded.
 pub fn batch_rename_with_progress(
     pairs: Vec<(String, String)>,
     parent_window: &gtk::Window,
-    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(bool) + 'static>>,
 ) {
     let total = pairs.len();
     if total == 0 {
         if let Some(cb) = on_complete {
-            cb();
+            cb(false);
         }
         return;
     }
@@ -994,7 +1002,7 @@ pub fn batch_rename_with_progress(
         parent_window,
         labels,
         summarise_copy_line,
-        ignore_outcome(on_complete),
+        on_complete,
         move |tx, cancel| {
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));

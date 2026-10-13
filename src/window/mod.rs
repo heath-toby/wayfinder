@@ -67,10 +67,14 @@ impl WayfinderWindow {
     pub fn navigate_to_path(&self, path: &str) {
         // `/a/b/` (as Tab completion leaves it) is `/a/b`: otherwise every
         // item's path would read `/a/b//name`, and remembered places miss.
-        let path = match path.trim_end_matches('/') {
-            "" if path.starts_with('/') => "/",
-            trimmed if !path.contains("://") => trimmed,
-            _ => path,
+        // `.` and `..` are resolved too (`~/Projects/..` is `~`), or Up
+        // and the folder's live updates would go by the literal path.
+        let cleaned;
+        let path = if path.starts_with('/') && !path.contains("://") {
+            cleaned = wayfinder::path_complete::clean(path);
+            cleaned.as_str()
+        } else {
+            path
         };
         // A folder in the Bin can't be opened (as a path it isn't one).
         if path.starts_with("trash:") && path.trim_end_matches('/') != "trash:" {
@@ -1993,8 +1997,12 @@ impl WayfinderWindow {
                             return;
                         }
                         let w_done = w.clone();
-                        let on_complete: Option<Box<dyn FnOnce() + 'static>> =
-                            Some(Box::new(move || {
+                        let renamed = vec![(old_path.clone(), new_path.clone())];
+                        let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
+                            Some(Box::new(move |succeeded| {
+                                if succeeded {
+                                    note_renames(&renamed);
+                                }
                                 w_done.forget_moved(&moved);
                                 w_done.reload_after_change(&changed);
                             }));
@@ -2329,8 +2337,12 @@ impl WayfinderWindow {
                         }
                         // The progress dialog announces the outcome.
                         let w_done = w.clone();
-                        let on_complete: Option<Box<dyn FnOnce() + 'static>> =
-                            Some(Box::new(move || {
+                        let renamed = pairs.clone();
+                        let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
+                            Some(Box::new(move |succeeded| {
+                                if succeeded {
+                                    note_renames(&renamed);
+                                }
                                 w_done.forget_moved(&moved);
                                 w_done.reload_after_change(&changed);
                             }));

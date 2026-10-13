@@ -301,6 +301,13 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         // Inside a two-way sync folder, the copy is already
                         // kept (both ways); downloading over it would undo
                         // local changes not yet synced.
+                        if wayfinder::offline::is_unpinning(&p) {
+                            w.announce(
+                                "The old offline copy is still being removed. Try again in a moment.",
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            );
+                            return;
+                        }
                         // Other pins' copies overlap this one's: don't download
                         // over (or clear) them.
                         if let Some(msg) = wayfinder::offline::pin_overlap(&p) {

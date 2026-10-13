@@ -122,32 +122,61 @@ pub(super) fn list_uri(uri: &str) -> ListResult {
 
 /// Look up recently used files, skipping ones that no longer exist.
 pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
+    // The mount table, read once for the whole list.
+    let mounts = crate::rclone_ops::fuse_mount_list();
+    let on_fuse = |p: &str| {
+        mounts
+            .iter()
+            .any(|m| std::path::Path::new(p).starts_with(m))
+    };
     let mut entries = Vec::new();
     for path in paths {
-        let is_fuse = crate::rclone_ops::is_fuse_path(&path);
+        let is_fuse = on_fuse(&path);
         if is_fuse {
-            // Not asked of the mount: one recent file on a mount that has
-            // stopped answering would hold up the whole list. Its name
-            // gives its type; size and date stay unknown.
+            // Asked in its own thread, and not waited for long: one recent
+            // file on a mount that has stopped answering mustn't hold up
+            // the list. If it doesn't answer, it's listed by name (its type
+            // from that; size and date unknown); if it's gone, it isn't.
+            let (tx, rx) = mpsc::channel();
+            let probe = path.clone();
+            std::thread::spawn(move || {
+                let found = gio::File::for_path(&probe)
+                    .query_info(
+                        FUSE_ATTRS,
+                        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                        gio::Cancellable::NONE,
+                    )
+                    .ok()
+                    .map(|info| FileInfoData::from_file_info(&info));
+                let _ = tx.send(found);
+            });
             let p = std::path::Path::new(&path);
-            let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+            let Some(parent) = p.parent().map(|d| d.to_string_lossy().to_string()) else {
                 continue;
             };
-            let name = name.to_string_lossy().to_string();
-            let (content_type, _) = gio::content_type_guess(Some(p), None);
-            entries.push((
-                parent.to_string_lossy().to_string(),
-                FileInfoData {
-                    display_name: name.clone(),
-                    name,
-                    is_hidden: false,
-                    is_directory: false,
-                    size: 0,
-                    modified: 0,
-                    modified_display: String::new(),
-                    content_type: content_type.to_string(),
-                },
-            ));
+            match rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                Ok(Some(data)) => entries.push((parent, data)),
+                Ok(None) => continue,
+                Err(_) => {
+                    let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                        continue;
+                    };
+                    let (content_type, _) = gio::content_type_guess(Some(p), None);
+                    entries.push((
+                        parent,
+                        FileInfoData {
+                            display_name: name.clone(),
+                            is_hidden: false,
+                            name,
+                            is_directory: false,
+                            size: 0,
+                            modified: 0,
+                            modified_display: String::new(),
+                            content_type: content_type.to_string(),
+                        },
+                    ));
+                }
+            }
             if entries.len() >= limit {
                 break;
             }

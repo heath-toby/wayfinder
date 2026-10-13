@@ -60,12 +60,12 @@
 - **Right-clicking among marked files** — right-clicking a file that isn't marked acts on that file and clears the marks, instead of acting on the marked files. Right-clicking empty space in the list opens the folder's menu (Paste, New Folder) rather than one for whichever file had focus.
 - **Bin names** — files moved to the Bin from another drive are shown and read out by their own names, not a long encoded path.
 - **Sorting** — sorting by Size puts folders in order once their sizes are worked out; folders stay above files in a descending sort; and sorting by clicking a column's own header keeps the sort buttons (and what Orca reads) and the saved sort in step.
-- **Folder sizes inside network shares and system folders** — sizes are no longer worked out by walking an NFS or SMB share over the network, or into another filesystem mounted inside a folder: `/proc` showed as about 134 million GB.
+- **Folder sizes inside network shares and system folders** — sizes are no longer worked out by walking an NFS or SMB share over the network, or into anything mounted inside a folder: `/proc` showed as about 134 million GB. (btrfs subvolumes, which aren't mounted, are still counted.)
 - **Folder sizes** — a folder created while you're looking at its parent gets its size worked out (it said "Calculating..." for good), and the last folder's size can no longer go missing.
 - **Dragging files** — a file whose name has `#`, `%` or spaces is dragged correctly, and other apps now accept files dragged from Wayfinder.
 - **Hidden files** — backup files (`name~`) and names listed in a folder's `.hidden` file are hidden along with dot files, as in other file managers.
-- **Recent Files** — a recent file on a mount that has stopped answering no longer holds up the whole list; renamed files stay in Recent Files under their new names.
-- **Go to Location** — a relative path (`Projects`) is taken from the folder you're in; a trailing `/` no longer leaves paths doubled (`Documents//file`) or loses your place when you come back.
+- **Recent Files** — a recent file on a mount that has stopped answering no longer holds up the whole list (it's listed by name if the mount doesn't answer quickly; deleted ones are left out); renamed files stay in Recent Files under their new names, on rclone mounts too.
+- **Go to Location** — a relative path (`Projects`, `..`) is taken from the folder you're in; `..` and a trailing `/` are resolved, so paths aren't doubled (`Documents//file`), Up goes up, and your place is kept when you come back. The same in the file chooser's location.
 - **Grid view focus** — focus returns to the selected item after opening a folder or switching back to the window.
 - **Row labels** — what Orca reads for a file follows changes to it, such as a download growing, instead of keeping its details from when it was first shown.
 - **Renaming on case-sensitive drives** — renaming `Report.txt` to `report.txt` where a separate `report.txt` exists is refused, instead of replacing it.

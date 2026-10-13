@@ -229,7 +229,44 @@ pub enum Unpinned {
     KeptForPin,
 }
 
+/// Offline copies being deleted right now (an unpin runs in the
+/// background): a new pin mustn't download into one meanwhile.
+static UNPINNING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether an offline copy at or around `original_path` is still being
+/// removed.
+pub fn is_unpinning(original_path: &str) -> bool {
+    UNPINNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| paths_overlap(Path::new(p), Path::new(original_path)))
+}
+
+/// Marks a path as being unpinned while alive.
+struct Unpinning(String);
+
+impl Unpinning {
+    fn new(path: &str) -> Self {
+        UNPINNING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path.to_string());
+        Self(path.to_string())
+    }
+}
+
+impl Drop for Unpinning {
+    fn drop(&mut self) {
+        let mut list = UNPINNING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = list.iter().position(|p| *p == self.0) {
+            list.swap_remove(i);
+        }
+    }
+}
+
 pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
+    let _unpinning = Unpinning::new(original_path);
     let mut manifest = load_manifest();
     if manifest.remove(original_path).is_none() {
         return Ok(Unpinned::Removed); // wasn't pinned
