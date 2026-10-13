@@ -145,6 +145,141 @@ thread_local! {
     static MOUNTING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// The widget names of `list`'s rows, in order.
+fn row_names(list: &gtk::ListBox) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut child = list.first_child();
+    while let Some(widget) = child {
+        names.push(widget.widget_name().to_string());
+        child = widget.next_sibling();
+    }
+    names
+}
+
+/// Where bookmarks go: after the places at the top, whichever of them are
+/// shown and in whatever order (not after File System, which may be hidden).
+fn bookmarks_insert_pos(names: &[String]) -> usize {
+    names
+        .iter()
+        .take_while(|n| {
+            n.starts_with("place:") && *n != "place:recent:///" && *n != "place:trash:///"
+        })
+        .count()
+}
+
+/// Where drives go: before the separator above Recent, or at the end while
+/// the list is being built.
+fn volumes_insert_pos(names: &[String]) -> usize {
+    match names.iter().position(|n| n == "place:recent:///") {
+        Some(pos) if pos > 0 => pos - 1,
+        _ => names.len(),
+    }
+}
+
+/// Eject (or unmount) the drive mounted at `mount_path`, and say how it
+/// went. `widget` is in the window that asked: GTK asks it for any password.
+fn eject_mount_at(widget: &gtk::Widget, mount_path: &str, label: &str) {
+    let mount = gio::VolumeMonitor::get().mounts().into_iter().find(|m| {
+        m.default_location()
+            .path()
+            .is_some_and(|p| p.to_string_lossy() == mount_path)
+    });
+    let Some(mount) = mount else {
+        widget.announce(
+            &format!("{label} is no longer mounted"),
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
+        return;
+    };
+    let window = widget.root().and_downcast::<gtk::Window>();
+    let op = gtk::MountOperation::new(window.as_ref());
+    // Said by the window: the drive's row goes once it's ejected.
+    let w: gtk::Widget = window.map(|w| w.upcast()).unwrap_or_else(|| widget.clone());
+    let name = label.to_string();
+    let done = move |result: Result<(), glib::Error>| match result {
+        Ok(()) => w.announce(
+            &format!("{name} can be removed"),
+            gtk::AccessibleAnnouncementPriority::Medium,
+        ),
+        Err(e) => {
+            log::error!("Failed to eject {name}: {e}");
+            w.announce(
+                &format!("Couldn't eject {name}: {e}"),
+                gtk::AccessibleAnnouncementPriority::High,
+            );
+        }
+    };
+    if mount.can_eject() {
+        mount.eject_with_operation(
+            gio::MountUnmountFlags::NONE,
+            Some(&op),
+            gio::Cancellable::NONE,
+            done,
+        );
+    } else if mount.can_unmount() {
+        mount.unmount_with_operation(
+            gio::MountUnmountFlags::NONE,
+            Some(&op),
+            gio::Cancellable::NONE,
+            done,
+        );
+    } else {
+        widget.announce(
+            &format!("{label} can't be ejected"),
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
+    }
+}
+
+/// Focus the row named `name`, or, if it's gone, the nearest selectable
+/// row at or before `index`.
+fn refocus_row(list: &gtk::ListBox, name: &str, index: i32) {
+    let mut row = None;
+    let mut i = 0;
+    while let Some(r) = list.row_at_index(i) {
+        if r.widget_name() == name {
+            row = Some(r);
+            break;
+        }
+        i += 1;
+    }
+    let row = row.or_else(|| {
+        (0..=index)
+            .rev()
+            .filter_map(|i| list.row_at_index(i))
+            .find(|r| r.is_selectable())
+    });
+    if let Some(row) = row {
+        list.select_row(Some(&row));
+        row.grab_focus();
+    }
+}
+
+/// An "Eject" item for `row`'s menu, if it's a drive that can be ejected
+/// (otherwise the eject button beside it is out of the keyboard's reach).
+fn eject_item(row: &gtk::ListBoxRow, popover: &gtk::Popover) -> Option<gtk::Button> {
+    let name = row.widget_name();
+    let mount_path = name.strip_prefix("volume:")?.to_string();
+    let mount = gio::VolumeMonitor::get().mounts().into_iter().find(|m| {
+        m.default_location()
+            .path()
+            .is_some_and(|p| p.to_string_lossy() == mount_path)
+    })?;
+    if !(mount.can_eject() || mount.can_unmount()) {
+        return None;
+    }
+    let label = mount.name().to_string();
+    let btn = gtk::Button::with_label(&format!("Eject {label}"));
+    btn.add_css_class("flat");
+    let pop = popover.clone();
+    let row = row.clone();
+    btn.connect_clicked(move |_| {
+        pop.popdown();
+        eject_mount_at(row.upcast_ref(), &mount_path, &label);
+    });
+    Some(btn)
+}
+
 /// `item` and, below it, Wayfinder's settings: the sidebar's menu is
 /// where they live.
 fn with_settings(item: &gtk::Widget) -> gtk::Box {
@@ -295,7 +430,10 @@ impl WayfinderSidebar {
                                 }
                                 MOUNTING.with(|m| m.borrow_mut().push(vol_id.clone()));
                                 let activation = ACTIVATIONS.with(|n| n.get());
-                                let mount_op = gio::MountOperation::new();
+                                // GTK's asks for a password, if needed, in a
+                                // dialog over this window.
+                                let window = list.root().and_downcast::<gtk::Window>();
+                                let mount_op = gtk::MountOperation::new(window.as_ref());
                                 let mounted = vol.clone();
                                 let callback = callback.clone();
                                 let list = list.clone();
@@ -503,31 +641,7 @@ impl WayfinderSidebar {
             return;
         }
 
-        // Find "File System" row position to insert after it
-        let mut fs_pos: i32 = -1;
-        let mut pos: i32 = 0;
-        let mut child = list.first_child();
-        while let Some(widget) = child {
-            if widget.widget_name() == "place:/" {
-                fs_pos = pos;
-                break;
-            }
-            pos += 1;
-            child = widget.next_sibling();
-        }
-
-        let insert_pos = if fs_pos >= 0 {
-            fs_pos + 1
-        } else {
-            // Count all children and insert before the end
-            let mut count: i32 = 0;
-            let mut c = list.first_child();
-            while let Some(widget) = c {
-                count += 1;
-                c = widget.next_sibling();
-            }
-            count
-        };
+        let insert_pos = bookmarks_insert_pos(&row_names(list)) as i32;
 
         // Insert bookmark separator
         let sep_row = gtk::ListBoxRow::new();
@@ -580,6 +694,15 @@ impl WayfinderSidebar {
     /// Refresh the volumes section in the sidebar using GIO VolumeMonitor.
     pub fn refresh_volumes(&self) {
         let list = &self.imp().places_list;
+
+        // A drive's row with focus may be about to go (ejected): keep focus
+        // in the sidebar, on the row that takes its place.
+        let focused = list.focus_child().and_then(|c| {
+            let name = c.widget_name().to_string();
+            let row = c.downcast::<gtk::ListBoxRow>().ok()?;
+            (name.starts_with("volume:") || name.starts_with("volume-unmounted:"))
+                .then(|| (name, row.index()))
+        });
 
         // Remove existing volume rows and volume separator
         let mut child = list.first_child();
@@ -649,24 +772,13 @@ impl WayfinderSidebar {
         }
 
         if volume_rows.is_empty() {
+            if let Some((name, index)) = focused {
+                refocus_row(list, &name, index);
+            }
             return;
         }
 
-        // Find the Bin row and insert before its preceding separator.
-        // The Bin separator is the unnamed one just before "place:trash:///".
-        let mut insert_pos: i32 = 0;
-        let mut pos: i32 = 0;
-        let mut child = list.first_child();
-        while let Some(widget) = child {
-            if widget.widget_name() == "place:trash:///" {
-                // Insert before the separator that precedes Bin (one row back)
-                insert_pos = (pos - 1).max(0);
-                break;
-            }
-            pos += 1;
-            insert_pos = pos;
-            child = widget.next_sibling();
-        }
+        let insert_pos = volumes_insert_pos(&row_names(list)) as i32;
 
         // Insert volume separator
         let sep_row = gtk::ListBoxRow::new();
@@ -712,44 +824,9 @@ impl WayfinderSidebar {
                     .strip_prefix("volume:")
                     .unwrap_or("")
                     .to_string();
-                let list_clone = list.clone();
-                eject_btn.connect_clicked(move |_| {
-                    let vm = gio::VolumeMonitor::get();
-                    for mount in vm.mounts() {
-                        let root = mount.default_location();
-                        let p = root
-                            .path()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        if p == mount_path {
-                            if mount.can_eject() {
-                                mount.eject_with_operation(
-                                    gio::MountUnmountFlags::NONE,
-                                    gio::MountOperation::NONE,
-                                    gio::Cancellable::NONE,
-                                    |result| {
-                                        if let Err(e) = result {
-                                            log::error!("Failed to eject: {e}");
-                                        }
-                                    },
-                                );
-                            } else if mount.can_unmount() {
-                                mount.unmount_with_operation(
-                                    gio::MountUnmountFlags::NONE,
-                                    gio::MountOperation::NONE,
-                                    gio::Cancellable::NONE,
-                                    |result| {
-                                        if let Err(e) = result {
-                                            log::error!("Failed to unmount: {e}");
-                                        }
-                                    },
-                                );
-                            }
-                            break;
-                        }
-                    }
-                    // Remove the row after ejecting — will reappear on next signal
-                    let _ = &list_clone; // keep reference alive
+                let label = label.clone();
+                eject_btn.connect_clicked(move |btn| {
+                    eject_mount_at(btn.upcast_ref(), &mount_path, &label);
                 });
 
                 row_box.append(&eject_btn);
@@ -763,6 +840,9 @@ impl WayfinderSidebar {
             ))]);
 
             list.insert(&row, insert_pos + 1 + i as i32);
+        }
+        if let Some((name, index)) = focused {
+            refocus_row(list, &name, index);
         }
     }
 
@@ -855,6 +935,9 @@ impl WayfinderSidebar {
             popover.set_parent(&list);
             popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
+            let eject = list
+                .row_at_y(y as i32)
+                .and_then(|row| eject_item(&row, &popover));
 
             let btn = gtk::Button::with_label("Edit Sidebar");
             btn.add_css_class("flat");
@@ -868,7 +951,11 @@ impl WayfinderSidebar {
                 s.show_edit_dialog(&p);
             });
 
-            popover.set_child(Some(&with_settings(btn.upcast_ref())));
+            let menu = with_settings(btn.upcast_ref());
+            if let Some(eject) = eject {
+                menu.prepend(&eject);
+            }
+            popover.set_child(Some(&menu));
             popover.connect_closed(|pop| pop.unparent());
             popover.popup();
         });
@@ -905,6 +992,9 @@ impl WayfinderSidebar {
                 .unwrap_or_else(|| list2.clone().upcast());
             popover.set_parent(&anchor);
             popover.set_has_arrow(false);
+            let eject = list2
+                .selected_row()
+                .and_then(|row| eject_item(&row, &popover));
 
             let btn = gtk::Button::with_label("Edit Sidebar");
             btn.add_css_class("flat");
@@ -918,7 +1008,11 @@ impl WayfinderSidebar {
                 s.show_edit_dialog(&p);
             });
 
-            popover.set_child(Some(&with_settings(btn.upcast_ref())));
+            let menu = with_settings(btn.upcast_ref());
+            if let Some(eject) = eject {
+                menu.prepend(&eject);
+            }
+            popover.set_child(Some(&menu));
             popover.connect_closed(|pop| pop.unparent());
             popover.popup();
             glib::Propagation::Stop
@@ -934,6 +1028,19 @@ impl WayfinderSidebar {
             .default_width(350)
             .default_height(450)
             .build();
+
+        // Escape closes it, as Close (Cancel) does.
+        let key_ctrl = gtk::EventControllerKey::new();
+        let d = dlg.clone();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                d.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        dlg.add_controller(key_ctrl);
         dlg.update_property(&[gtk::accessible::Property::Label("Edit sidebar places")]);
 
         // Load current config
@@ -1467,7 +1574,46 @@ impl Default for WayfinderSidebar {
 
 #[cfg(test)]
 mod tests {
-    use super::bookmark_path;
+    use super::{bookmark_path, bookmarks_insert_pos, volumes_insert_pos};
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bookmarks_go_after_the_places_shown() {
+        // File System hidden: still above the drives and Recent / Bin.
+        let rows = names(&[
+            "place:/home/u",
+            "place:/home/u/Music",
+            "volume-separator",
+            "volume:/media/usb",
+            "GtkListBoxRow",
+            "place:recent:///",
+            "place:trash:///",
+        ]);
+        assert_eq!(bookmarks_insert_pos(&rows), 2);
+        // While the list is first built.
+        assert_eq!(
+            bookmarks_insert_pos(&names(&["place:/home/u", "place:/"])),
+            2
+        );
+    }
+
+    #[test]
+    fn drives_go_above_recent_and_bin() {
+        let rows = names(&[
+            "place:/home/u",
+            "bookmark-separator",
+            "bookmark:/data",
+            "GtkListBoxRow",
+            "place:recent:///",
+            "place:trash:///",
+        ]);
+        // Before the separator above Recent.
+        assert_eq!(volumes_insert_pos(&rows), 3);
+        assert_eq!(volumes_insert_pos(&names(&["place:/home/u"])), 1);
+    }
 
     #[test]
     fn bookmark_uris_are_decoded() {

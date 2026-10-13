@@ -410,6 +410,19 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
         .default_width(400)
         .default_height(250)
         .build();
+
+    // Escape closes it, as Close (Cancel) does.
+    let key_ctrl = gtk::EventControllerKey::new();
+    let d = dlg.clone();
+    key_ctrl.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            d.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    dlg.add_controller(key_ctrl);
     dlg.update_property(&[gtk::accessible::Property::Label("Compress files")]);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);

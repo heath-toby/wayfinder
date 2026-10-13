@@ -455,6 +455,7 @@ pub fn show_chooser(
         let ub = up_btn.clone();
         let sel = selection.clone();
         let d = dlg.clone();
+        let lv = list_view.clone();
         sidebar.connect_place_activated(move |path| {
             // The Bin and Recent Files aren't folders to choose from.
             if path.starts_with("trash:") || path.starts_with("recent:") {
@@ -469,6 +470,9 @@ pub fn show_chooser(
             }
             nav.borrow_mut().navigate_to(PathBuf::from(&path));
             load_dir(&model, &path, &le, &sl, &nav, &bb, &fb, &ub, &sel, &d);
+            // To its files, as in the main window: Tab can't leave the
+            // sidebar's list.
+            lv.grab_focus();
         });
     }
 
@@ -493,6 +497,7 @@ pub fn show_chooser(
         let ub = up_btn.clone();
         let sel = selection.clone();
         let d = dlg.clone();
+        let lv = list_view.clone();
         location_entry.connect_activate(move |entry| {
             let path = wayfinder::path_complete::expand_tilde(entry.text().trim());
             if !path.starts_with('/') {
@@ -508,7 +513,7 @@ pub fn show_chooser(
             // touch a slow mount, so not on the main thread.
             let check = path.clone();
             let generation = model.generation();
-            let (nav, model, entry, sl, bb, fb, ub, sel, d) = (
+            let (nav, model, entry, sl, bb, fb, ub, sel, d, lv) = (
                 nav.clone(),
                 model.clone(),
                 entry.clone(),
@@ -518,6 +523,7 @@ pub fn show_chooser(
                 ub.clone(),
                 sel.clone(),
                 d.clone(),
+                lv.clone(),
             );
             wayfinder::background::run(
                 move || std::path::Path::new(&check).is_dir(),
@@ -535,6 +541,7 @@ pub fn show_chooser(
                     }
                     nav.borrow_mut().navigate_to(PathBuf::from(&path));
                     load_dir(&model, &path, &entry, &sl, &nav, &bb, &fb, &ub, &sel, &d);
+                    lv.grab_focus();
                 },
                 || {},
             );

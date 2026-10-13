@@ -85,20 +85,29 @@ pub fn connect_to_app(app: &gtk::Application, rx: mpsc::Receiver<DbusRequest>) {
 
 fn handle_request(app: &gtk::Application, request: DbusRequest) {
     match request {
+        // One window each: in one window, each would replace the last.
         DbusRequest::Folders(uris) => {
-            for uri in uris {
-                let path = uri_to_path(&uri);
-                open_or_raise(app, &path);
+            for (i, uri) in uris.iter().enumerate() {
+                open_or_raise(app, &uri_to_path(uri), i > 0);
             }
         }
         DbusRequest::Items(uris) => {
-            for uri in uris {
-                show_item(app, &uri_to_path(&uri));
+            // One window per folder: items in the same one share it.
+            let paths: Vec<String> = uris.iter().map(|u| uri_to_path(u)).collect();
+            let mut folders: Vec<Option<PathBuf>> = Vec::new();
+            for path in paths {
+                let folder = PathBuf::from(&path).parent().map(PathBuf::from);
+                if folders.contains(&folder) {
+                    continue;
+                }
+                let fresh = !folders.is_empty();
+                folders.push(folder);
+                show_item(app, &path, fresh, false);
             }
         }
         DbusRequest::ItemProperties(uris) => {
             if let Some(uri) = uris.first() {
-                show_item(app, &uri_to_path(uri));
+                show_item(app, &uri_to_path(uri), false, true);
             }
         }
     }
@@ -115,11 +124,12 @@ fn uri_to_path(uri: &str) -> String {
     uri.to_string()
 }
 
-/// Open the folder holding `path` with `path` selected ("Show in folder").
-fn show_item(app: &gtk::Application, path: &str) {
+/// Open the folder holding `path` with `path` selected ("Show in folder"),
+/// in a new window if `fresh`; then show its properties, if `properties`.
+fn show_item(app: &gtk::Application, path: &str, fresh: bool, properties: bool) {
     let path = PathBuf::from(path);
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        open_or_raise(app, &path.to_string_lossy());
+        open_or_raise(app, &path.to_string_lossy(), fresh);
         return;
     };
     let parent = parent.to_string_lossy().to_string();
@@ -127,16 +137,20 @@ fn show_item(app: &gtk::Application, path: &str) {
     let window = app
         .windows()
         .into_iter()
+        .filter(|_| !fresh)
         .find_map(|w| w.downcast::<crate::window::WayfinderWindow>().ok());
     let window = window.unwrap_or_else(|| crate::window::WayfinderWindow::new(app));
     window.remember_selection(&parent, &name);
+    if properties {
+        window.show_properties_when_opened(&parent, &name);
+    }
     window.navigate_to_path(&parent);
     window.present();
 }
 
-fn open_or_raise(app: &gtk::Application, path: &str) {
+fn open_or_raise(app: &gtk::Application, path: &str, fresh: bool) {
     // Try to reuse an existing window
-    for window in app.windows() {
+    for window in app.windows().into_iter().filter(|_| !fresh) {
         if let Some(wf_window) = window.downcast_ref::<crate::window::WayfinderWindow>() {
             wf_window.navigate_to_path(path);
             wf_window.present();

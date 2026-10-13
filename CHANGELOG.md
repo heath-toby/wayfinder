@@ -107,6 +107,12 @@
 - **Right-click** — right-clicking a file opens the menu for that file; it used to act on whichever file was selected before.
 - **After renaming** — the renamed file stays selected, so a key pressed next acts on it and not on its neighbour.
 - **Marked files hidden by a search** — actions use the focused file when none of the marked files are in view, instead of doing nothing.
+- **Drives in the sidebar** — Eject is in the sidebar's menu (Menu key or Shift+F10 on a drive), since the eject button can't be reached from the keyboard; ejecting says whether it worked, and focus stays in the sidebar when the drive's row goes. Drives that need a password to mount now ask for it.
+- **Sidebar order** — with File System hidden, new bookmarks no longer appear below the Bin; drives are listed above Recent instead of between a separator and Recent.
+- **Bookmarking the Bin or Recent Files** — Ctrl+D there says only folders can be bookmarked, instead of adding a bookmark that opens nothing.
+- **Escape** — closes the Properties, Compress and Edit Sidebar windows, as in the other dialogs.
+- **File chooser** — choosing a place in its sidebar, or going to a typed location, moves focus to the files (Tab can't leave the sidebar's list).
+- **Requests from other apps** — "show these folders" with several folders opens a window for each (each used to replace the last in one window), and items in several folders likewise; "show properties" now opens the Properties window once the folder is shown.
 - **Undo trash and cancelled deletes** — undo says the name a restored file actually went back under; a cancelled delete says how far it got. In rclone progress windows, focus moves to a working button when Cancel is pressed or rclone stops unexpectedly.
 
 ### Development

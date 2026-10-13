@@ -92,6 +92,9 @@ pub struct WayfinderWindowInner {
     /// Remembers the last-selected filename per directory so that
     /// navigating back into a folder restores the previous selection.
     pub last_position: RefCell<std::collections::HashMap<String, String>>,
+    /// (folder, name): show this file's properties once the folder has
+    /// been opened (asked for over D-Bus).
+    pub pending_properties: RefCell<Option<(String, String)>>,
     pub breadcrumb_box: gtk::Box,
     pub breadcrumb_scroll: gtk::ScrolledWindow,
     pub breadcrumb_toggle: gtk::ToggleButton,
@@ -223,6 +226,7 @@ impl Default for WayfinderWindowInner {
             last_trashed: RefCell::new(Vec::new()),
             trashing: RefCell::new(std::collections::HashSet::new()),
             last_position: RefCell::new(std::collections::HashMap::new()),
+            pending_properties: RefCell::new(None),
             breadcrumb_box: gtk::Box::new(gtk::Orientation::Horizontal, 0),
             breadcrumb_scroll: gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -791,6 +795,15 @@ impl WayfinderWindowInner {
         let action = gio::SimpleAction::new("bookmark", None);
         action.connect_activate(move |_, _| {
             let path = w.imp().model.current_path();
+            // The Bin and Recent Files aren't folders: a bookmark to them
+            // would open nothing.
+            if !path.starts_with('/') {
+                w.announce(
+                    "Only folders can be bookmarked",
+                    AccessibleAnnouncementPriority::Medium,
+                );
+                return;
+            }
             if wayfinder::sidebar::add_bookmark(&path) {
                 w.imp().sidebar.refresh_bookmarks();
                 w.announce(

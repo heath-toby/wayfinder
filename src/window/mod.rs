@@ -318,6 +318,14 @@ impl WayfinderWindow {
                         AccessibleAnnouncementPriority::Medium,
                     );
                 }
+
+                let pending = imp.pending_properties.take();
+                if let Some((folder, name)) = pending {
+                    if folder == path && self.get_selected_file().is_some_and(|f| f.name() == name)
+                    {
+                        self.show_properties();
+                    }
+                }
             }
             Err(e) => {
                 log::error!("Failed to load directory {path}: {e}");
@@ -897,6 +905,13 @@ impl WayfinderWindow {
     }
 
     /// Select `name` the next time `folder` is opened.
+    /// Show the properties of `name` in `folder` once it's been opened.
+    pub fn show_properties_when_opened(&self, folder: &str, name: &str) {
+        self.imp()
+            .pending_properties
+            .replace(Some((folder.to_string(), name.to_string())));
+    }
+
     pub fn remember_selection(&self, folder: &str, name: &str) {
         self.imp()
             .last_position
