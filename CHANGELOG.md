@@ -47,6 +47,7 @@
 - **Compress** — file names beginning with `-` are no longer mistaken for options, and an existing archive of the same name is reported instead of being added to or replaced.
 - **File chooser (portal)** — Back, Forward and Up no longer crash it. The chosen file is passed to the app correctly when its name has spaces, `#`, `%` or accented letters (it could open the wrong file). Saving over an existing file asks first. A file chosen in one folder is no longer returned after moving to another, the selected file is shown and read out, and when choosing a folder, the folder being shown can be chosen. Enter in the file name field saves; Escape cancels.
 - **Dates** — Date Modified (and the date in Properties) is shown in local time; it was shown in UTC, off by the time zone.
+- **Links to folders** — pressing Enter on one goes into the folder, instead of opening it in another app. (It's still listed as a link.)
 - **Copying links** — a link is copied as a link, so a folder holding a link to a folder copies instead of failing; onto drives that can't hold links (USB sticks, cloud drives), a link to a file is copied as the file.
 - **Right-clicking among marked files** — right-clicking a file that isn't marked acts on that file and clears the marks, instead of acting on the marked files. Right-clicking empty space in the list opens the folder's menu (Paste, New Folder) rather than one for whichever file had focus.
 - **Bin names** — files moved to the Bin from another drive are shown and read out by their own names, not a long encoded path.

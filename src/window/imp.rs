@@ -522,6 +522,14 @@ impl ObjectImpl for WayfinderWindowInner {
     }
 }
 
+impl Drop for WayfinderWindowInner {
+    fn drop(&mut self) {
+        // Seen with RUST_LOG=debug once a closed window is really freed;
+        // if it never appears, something still holds the window.
+        log::debug!("window freed");
+    }
+}
+
 impl WidgetImpl for WayfinderWindowInner {}
 impl WindowImpl for WayfinderWindowInner {
     fn close_request(&self) -> glib::Propagation {

@@ -578,6 +578,30 @@ impl WayfinderWindow {
 
     /// Open a file, checking per-file app association first, then MIME default
     pub fn open_file(&self, file: &FileObject) {
+        // A link (listed as one, not followed): if it leads to a folder, go
+        // into it. Finding out follows it — maybe onto a slow mount — so
+        // not on the main thread.
+        if file.mime_type() == "inode/symlink" {
+            let path = file.path();
+            let target = path.clone();
+            let file = file.clone();
+            self.run_blocking(
+                &path,
+                move || std::fs::metadata(&target).is_ok_and(|m| m.is_dir()),
+                move |w, is_dir| {
+                    if is_dir {
+                        w.navigate_to_path(&file.path());
+                    } else {
+                        w.open_file_now(&file);
+                    }
+                },
+            );
+            return;
+        }
+        self.open_file_now(file);
+    }
+
+    fn open_file_now(&self, file: &FileObject) {
         let path = file.path();
 
         // Check for per-file app association (always takes priority)
