@@ -369,6 +369,8 @@ impl WayfinderWindow {
             }
             Err(e) => {
                 log::error!("Failed to load {uri}: {e}");
+                // Replace any "Waiting for …" notice.
+                self.update_status();
                 self.announce(
                     &format!("Error: could not open {label}: {e}"),
                     AccessibleAnnouncementPriority::High,
@@ -962,11 +964,13 @@ impl WayfinderWindow {
         // The folders this paste changes: the destination, and for a move
         // the folders the files leave.
         let mut changed = vec![dest_dir_str.clone()];
-        let moved: Vec<String> = if state.operation == ClipboardOperation::Cut {
-            source_paths.clone()
-        } else {
-            Vec::new()
-        };
+        // Locations whose cached listings (and everything inside) are now
+        // stale: what a move takes away, and what the paste lands on — a
+        // folder of the same name may be merged into or replaced.
+        let mut moved: Vec<String> = landing_paths(&source_paths, &dest_dir_str);
+        if state.operation == ClipboardOperation::Cut {
+            moved.extend(source_paths.iter().cloned());
+        }
         if state.operation == ClipboardOperation::Cut {
             for p in &source_paths {
                 if let Some(parent) = parent_dir(p) {
@@ -1907,6 +1911,7 @@ impl WayfinderWindow {
         let dest_dir_str = imp.model.current_path();
         let parent_window: gtk::Window = self.clone().upcast();
         let changed = vec![dest_dir_str.clone()];
+        let landed = landing_paths(&paths, &dest_dir_str);
 
         let src_rclone = paths
             .iter()
@@ -1916,6 +1921,7 @@ impl WayfinderWindow {
             let w = self.clone();
             let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
                 let _g = guard;
+                w.forget_moved(&landed);
                 w.reload_after_change(&changed);
             }));
             wayfinder::rclone_ops::copy_paths_with_progress(
@@ -1932,8 +1938,10 @@ impl WayfinderWindow {
                 let w = self.clone();
                 let guard_held = shared_guard.clone();
                 let changed = changed.clone();
+                let landed = landed.clone();
                 let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
                     let _g = guard_held;
+                    w.forget_moved(&landed);
                     w.reload_after_change(&changed);
                 }));
                 let source = gio::File::for_path(path);
@@ -2622,6 +2630,20 @@ fn dropped_paths(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Where `sources` land when copied or moved into `dest_dir`.
+fn landing_paths(sources: &[String], dest_dir: &str) -> Vec<String> {
+    sources
+        .iter()
+        .filter_map(|p| std::path::Path::new(p).file_name())
+        .map(|name| {
+            std::path::Path::new(dest_dir)
+                .join(name)
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect()
+}
+
 /// The folder holding `path`.
 fn parent_dir(path: &str) -> Option<String> {
     std::path::Path::new(path)
@@ -2644,7 +2666,16 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dropped_paths, position_near_removed};
+    use super::{dropped_paths, landing_paths, position_near_removed};
+
+    #[test]
+    fn pasted_items_land_in_the_destination_under_their_names() {
+        let sources = vec!["/a/Photos".to_string(), "/b/notes.txt".to_string()];
+        assert_eq!(
+            landing_paths(&sources, "/mnt/cloud/Docs"),
+            vec!["/mnt/cloud/Docs/Photos", "/mnt/cloud/Docs/notes.txt"]
+        );
+    }
 
     #[test]
     fn dropped_uris_are_decoded() {

@@ -77,17 +77,11 @@ fn complete_with(partial: &str, home: Option<&Path>) -> Completion {
         _ => path.to_string(),
     };
 
-    let (dir_str, prefix) = if expanded.ends_with('/') {
-        (expanded.as_str(), "")
-    } else {
-        let p = Path::new(&expanded);
-        let (Some(dir), Some(prefix)) = (
-            p.parent().and_then(|d| d.to_str()),
-            p.file_name().and_then(|f| f.to_str()),
-        ) else {
-            return Completion::NoMatch;
-        };
-        (dir, prefix)
+    // Split at the last `/` as typed: `Path` would tidy away a trailing
+    // `.`, turning `~/.` (hidden files, please) into `~`.
+    let (dir_str, prefix) = match expanded.rfind('/') {
+        Some(i) => (&expanded[..=i], &expanded[i + 1..]),
+        None => ("", expanded.as_str()),
     };
 
     let dir = if dir_str.is_empty() { "." } else { dir_str };
@@ -112,8 +106,12 @@ fn complete_with(partial: &str, home: Option<&Path>) -> Completion {
             } else {
                 format!("{dir_str}/{name}")
             };
-            // Add trailing / for directories
-            if e.file_type().ok()?.is_dir() {
+            // Add trailing / for directories, and links to them
+            let file_type = e.file_type().ok()?;
+            let is_dir = file_type.is_dir()
+                || (file_type.is_symlink()
+                    && std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir()));
+            if is_dir {
                 Some(format!("{full}/"))
             } else {
                 Some(full)
@@ -297,6 +295,24 @@ mod tests {
         let completed = text(complete_with("~/doc", Some(&f.home()))).unwrap();
         assert_eq!(completed, "~/Documents/");
         assert_eq!(added_text("~/doc", &completed), "Documents/");
+    }
+
+    /// `~/.` asks for hidden files; the dot mustn't be tidied away.
+    #[test]
+    fn dot_asks_for_hidden_files() {
+        let f = Fixture::new("dot", &[".config"], &["visible.txt"]);
+        let completed = text(complete_with("~/.", Some(&f.home()))).unwrap();
+        assert_eq!(completed, "~/.config/");
+    }
+
+    #[test]
+    fn link_to_a_folder_completes_as_a_folder() {
+        let f = Fixture::new("link", &["real"], &[]);
+        std::os::unix::fs::symlink(f.home().join("real"), f.home().join("cloud")).unwrap();
+        assert_eq!(
+            text(complete_with("~/clo", Some(&f.home()))).unwrap(),
+            "~/cloud/"
+        );
     }
 
     #[test]
