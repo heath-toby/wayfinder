@@ -44,7 +44,7 @@ pub fn show<W>(
     parent: &gtk::Window,
     labels: ProgressLabels,
     summarise: SummariseFn,
-    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(bool) + 'static>>,
     worker: W,
 ) where
     W: FnOnce(Sender<RcloneEvent>, Arc<AtomicBool>) + Send + 'static,
@@ -243,6 +243,7 @@ pub fn show<W>(
                     close_clone.set_sensitive(true);
                     close_clone.grab_focus();
                     let was_cancelled = cancel_flag_poll.load(Ordering::Relaxed);
+                    let succeeded = !was_cancelled && matches!(&result, Ok(r) if r.success);
                     match result {
                         Ok(r) if r.success && !was_cancelled => {
                             let msg = success_message
@@ -279,7 +280,7 @@ pub fn show<W>(
                         }
                     }
                     if let Some(cb) = on_complete_holder.take() {
-                        cb();
+                        cb(succeeded);
                     }
                     return glib::ControlFlow::Break;
                 }
@@ -292,7 +293,7 @@ pub fn show<W>(
                     status_clone.set_text(msg);
                     parent_clone.announce(msg, AccessibleAnnouncementPriority::High);
                     if let Some(cb) = on_complete_holder.take() {
-                        cb();
+                        cb(false);
                     }
                     return glib::ControlFlow::Break;
                 }

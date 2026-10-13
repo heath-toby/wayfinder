@@ -177,6 +177,14 @@ struct Cached {
 thread_local! {
     static CACHE: RefCell<HashMap<String, Cached>> = RefCell::new(HashMap::new());
     static PREFETCHING: Cell<bool> = const { Cell::new(false) };
+    /// Counts the times cached listings were dropped as out of date.
+    static CHANGES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A mark to pass to `store`: a listing begun now mustn't be cached if
+/// something is forgotten before it's done — it may predate the change.
+pub(super) fn changes() -> u64 {
+    CHANGES.with(Cell::get)
 }
 
 /// The cached listing of `path`, if its mount is still there. Once it has
@@ -190,8 +198,12 @@ pub(super) fn cached(path: &str) -> Option<Vec<FileInfoData>> {
     })
 }
 
-/// Cache the listing of `listing.path`.
-pub(super) fn store(listing: &Listing) {
+/// Cache the listing of `listing.path`, begun at the mark `since` (from
+/// `changes`) — unless listings have been forgotten since then.
+pub(super) fn store(listing: &Listing, since: u64) {
+    if changes() != since {
+        return;
+    }
     let entries = listing.entries.iter().map(|(_, e)| e.clone()).collect();
     CACHE.with(|c| {
         let mut cache = c.borrow_mut();
@@ -227,6 +239,7 @@ pub(super) fn forget_under(path: &str) {
 }
 
 fn forget_matching(path: &str, with_inside: bool) {
+    CHANGES.with(|c| c.set(c.get() + 1));
     CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         // The same folder may be cached under another path (reached
@@ -262,6 +275,7 @@ pub(super) fn prefetch(path: &str) {
     }
     PREFETCHING.with(|p| p.set(true));
     let path = path.to_string();
+    let since = changes();
     let rx = {
         let path = path.clone();
         spawn(move || list_dir(&path, false))
@@ -269,7 +283,7 @@ pub(super) fn prefetch(path: &str) {
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         match rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
-            Ok(Ok(listing)) if listing.is_fuse => store(&listing),
+            Ok(Ok(listing)) if listing.is_fuse => store(&listing, since),
             _ => {}
         }
         PREFETCHING.with(|p| p.set(false));
@@ -305,7 +319,7 @@ mod tests {
     #[test]
     fn cache_is_not_used_once_the_mount_has_gone() {
         let path = "/nonexistent-wayfinder-test/Docs";
-        store(&listing(path, path));
+        store(&listing(path, path), changes());
         assert!(cached(path).is_none());
     }
 
@@ -318,7 +332,7 @@ mod tests {
             "/t-wf/Docs/Older",
             "/t-wf/Docs",
         ] {
-            store(&listing(p, p));
+            store(&listing(p, p), changes());
         }
         forget_under("/t-wf/Docs/Old");
         assert!(!cached_at("/t-wf/Docs/Old"));
@@ -334,17 +348,31 @@ mod tests {
         let cached_at = |p: &str| CACHE.with(|c| c.borrow().contains_key(p));
         let real = "/t-wf-sym/mnt/Docs";
         let link = "/t-wf-sym/home/cloud/Docs";
-        store(&listing(real, real));
-        store(&listing(link, real));
+        store(&listing(real, real), changes());
+        store(&listing(link, real), changes());
         forget(link);
         assert!(!cached_at(link));
         assert!(!cached_at(real));
     }
 
+    /// A listing begun before a folder was changed (and forgotten) isn't
+    /// cached when it arrives: it may not show the change.
+    #[test]
+    fn listing_from_before_a_change_is_not_cached() {
+        let path = "/t-wf-race/Docs";
+        let since = changes();
+        forget("/t-wf-race/Elsewhere");
+        CACHE.with(|c| c.borrow_mut().remove(path));
+        store(&listing(path, path), since);
+        assert!(CACHE.with(|c| !c.borrow().contains_key(path)));
+        store(&listing(path, path), changes());
+        assert!(CACHE.with(|c| c.borrow().contains_key(path)));
+    }
+
     #[test]
     fn forgotten_listings_are_gone() {
         let path = "/nonexistent-wayfinder-test/Other";
-        store(&listing(path, path));
+        store(&listing(path, path), changes());
         forget(path);
         assert!(CACHE.with(|c| !c.borrow().contains_key(path)));
     }

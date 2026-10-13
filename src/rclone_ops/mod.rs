@@ -649,7 +649,7 @@ pub fn pin_with_progress(
         parent_window,
         labels,
         summarise_copy_line,
-        on_complete,
+        ignore_outcome(on_complete),
         move |tx, _cancel| {
             if let Err(e) = run_streaming(&args, tx.clone()) {
                 let _ = tx.send(RcloneEvent::Finished(Err(e)));
@@ -664,10 +664,19 @@ pub fn pin_with_progress(
 /// Each path must resolve via `rclone_for_path`. Paths are processed
 /// sequentially. The Cancel button kills the current rclone process and
 /// stops the loop.
+/// For progress callers that only need to know the operation is over.
+fn ignore_outcome(
+    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+) -> Option<Box<dyn FnOnce(bool) + 'static>> {
+    on_complete.map(|cb| Box::new(move |_| cb()) as Box<dyn FnOnce(bool)>)
+}
+
+/// `on_complete` is told whether every delete succeeded (not cancelled,
+/// no error).
 pub fn delete_with_progress(
     paths: Vec<(String, bool)>, // (local_path, is_directory)
     parent_window: &gtk::Window,
-    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(bool) + 'static>>,
 ) {
     // Resolve every path up front. If any can't be resolved, refuse.
     let mut resolved: Vec<(String, RcloneTarget, bool)> = Vec::with_capacity(paths.len());
@@ -683,7 +692,7 @@ pub fn delete_with_progress(
                     gtk::AccessibleAnnouncementPriority::High,
                 );
                 if let Some(cb) = on_complete.take() {
-                    cb();
+                    cb(false);
                 }
                 return;
             }
@@ -784,7 +793,7 @@ pub fn copy_paths_with_progress(
         parent_window,
         labels,
         summarise_copy_line,
-        on_complete,
+        ignore_outcome(on_complete),
         move |tx, cancel| {
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
@@ -839,7 +848,7 @@ pub fn move_paths_with_progress(
         parent_window,
         labels,
         summarise_copy_line,
-        on_complete,
+        ignore_outcome(on_complete),
         move |tx, cancel| {
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
@@ -877,7 +886,7 @@ pub fn rename_with_progress(
         parent_window,
         labels,
         summarise_copy_line,
-        on_complete,
+        ignore_outcome(on_complete),
         move |tx, cancel| {
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
@@ -927,7 +936,7 @@ pub fn batch_rename_with_progress(
         parent_window,
         labels,
         summarise_copy_line,
-        on_complete,
+        ignore_outcome(on_complete),
         move |tx, cancel| {
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));

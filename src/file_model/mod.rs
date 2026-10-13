@@ -78,6 +78,8 @@ pub struct DirectoryModel {
     /// so one left waiting on a dead mount after the user moved on still
     /// counts.
     refreshes_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// A refresh was asked for while a navigation was loading.
+    refresh_after_load: Rc<Cell<bool>>,
 }
 
 impl Default for DirectoryModel {
@@ -153,6 +155,7 @@ impl DirectoryModel {
             on_background_update: Rc::new(RefCell::new(None)),
             on_background_error: Rc::new(RefCell::new(None)),
             refreshes_in_flight: Default::default(),
+            refresh_after_load: Default::default(),
         }
     }
 
@@ -257,6 +260,9 @@ impl DirectoryModel {
     /// fresh) or happened meanwhile.
     pub fn refresh(&self, on_done: impl FnOnce(bool) + 'static) {
         if self.loading.get() {
+            // The navigation's listing may have begun before whatever
+            // this refresh is for: list again once it's in.
+            self.refresh_after_load.set(true);
             on_done(false);
             return;
         }
@@ -369,6 +375,7 @@ impl DirectoryModel {
         let gen = self.generation.get() + 1;
         self.generation.set(gen);
         self.loading.set(false);
+        self.refresh_after_load.set(false);
         *self.current_path.borrow_mut() = location.to_string();
         self.is_fuse.set(is_fuse);
         *self.monitor.borrow_mut() = None;
@@ -387,6 +394,7 @@ impl DirectoryModel {
     ) {
         let seq = self.next_seq.get() + 1;
         self.next_seq.set(seq);
+        let since = loader::changes();
         let rx = if apply == Apply::Replace {
             loader::spawn(job)
         } else {
@@ -400,9 +408,10 @@ impl DirectoryModel {
         };
         if apply == Apply::Replace {
             match rx.recv_timeout(SYNC_WAIT) {
-                Ok(result) => return self.finish(gen, seq, result, apply, on_done),
+                Ok(result) => return self.finish(gen, seq, since, result, apply, on_done),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return self.finish(gen, seq, Err("listing failed".into()), apply, on_done)
+                    let failed = Err("listing failed".into());
+                    return self.finish(gen, seq, since, failed, apply, on_done);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => self.loading.set(true),
             }
@@ -426,16 +435,19 @@ impl DirectoryModel {
                 }
             };
             if let (Some(result), Some(on_done)) = (result, on_done.take()) {
-                model.finish(gen, seq, result, apply, on_done);
+                model.finish(gen, seq, since, result, apply, on_done);
             }
             glib::ControlFlow::Break
         });
     }
 
+    /// Apply a finished listing job, begun at the cache mark `since`.
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         &self,
         gen: u64,
         seq: u64,
+        since: u64,
         result: loader::ListResult,
         apply: Apply,
         on_done: LoadDone,
@@ -481,7 +493,7 @@ impl DirectoryModel {
         *self.current_path.borrow_mut() = listing.path.clone();
         self.is_fuse.set(listing.is_fuse);
         if listing.is_fuse {
-            loader::store(&listing);
+            loader::store(&listing, since);
         }
         match apply {
             Apply::Replace => self.replace_all(&listing),
@@ -497,6 +509,9 @@ impl DirectoryModel {
             self.calculate_folder_sizes();
         }
         on_done(Some(Ok(self.store.n_items())));
+        if apply == Apply::Replace && self.refresh_after_load.replace(false) {
+            self.refresh(|_| {});
+        }
     }
 
     fn replace_all(&self, listing: &Listing) {

@@ -1155,6 +1155,11 @@ impl WayfinderWindow {
             }
         }
 
+        // Reloading and re-selecting for the files that did go to the Bin
+        // waits while "Delete permanently?" is open, so nothing moves
+        // behind the question; it runs once that's answered.
+        let after_question: Deferred = Default::default();
+
         // If some files can't be trashed (e.g. FUSE mount), offer permanent deletion
         if !needs_perm_delete.is_empty() {
             let window = self.clone();
@@ -1185,11 +1190,15 @@ impl WayfinderWindow {
             let file_path_dirs: Vec<bool> =
                 needs_perm_delete.iter().map(|f| f.is_directory()).collect();
             let from = from.clone();
+            let after_question = after_question.clone();
 
             dialog.choose(
                 Some(&window.clone()),
                 gio::Cancellable::NONE,
                 move |result| {
+                    if let Some(trashed) = after_question.borrow_mut().take() {
+                        trashed();
+                    }
                     if let Ok(choice) = result {
                         if choice == 1 {
                             // Prefer rclone-direct delete when every path is on
@@ -1249,30 +1258,38 @@ impl WayfinderWindow {
             .find(|f| trashed_paths.contains(&f.path()))
             .map(|f| f.name())
             .unwrap_or_default();
-        self.reload_after_removal(from, move |w, relisted| {
-            if failed == 0 && success > 0 {
-                // Unless the folder was just listed again, the current
-                // view's emptiness says nothing about it.
-                let now_empty = relisted && w.imp().selection.n_items() == 0;
-                let msg = if success == 1 {
-                    if now_empty {
-                        format!("Moved {first_name} to Bin, folder is now empty")
+        let window = self.clone();
+        let finish = move || {
+            window.reload_after_removal(from, move |w, relisted| {
+                if failed == 0 && success > 0 {
+                    // Unless the folder was just listed again, the current
+                    // view's emptiness says nothing about it.
+                    let now_empty = relisted && w.imp().selection.n_items() == 0;
+                    let msg = if success == 1 {
+                        if now_empty {
+                            format!("Moved {first_name} to Bin, folder is now empty")
+                        } else {
+                            format!("Moved {first_name} to Bin")
+                        }
+                    } else if now_empty {
+                        format!("Moved {success} files to Bin, folder is now empty")
                     } else {
-                        format!("Moved {first_name} to Bin")
-                    }
-                } else if now_empty {
-                    format!("Moved {success} files to Bin, folder is now empty")
-                } else {
-                    format!("Moved {success} files to Bin")
-                };
+                        format!("Moved {success} files to Bin")
+                    };
 
-                if relisted {
-                    w.announce(&msg, AccessibleAnnouncementPriority::Medium);
-                } else {
-                    w.announce_after_navigation(msg);
+                    if relisted {
+                        w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                    } else {
+                        w.announce_after_navigation(msg);
+                    }
                 }
-            }
-        });
+            });
+        };
+        if needs_perm_delete.is_empty() {
+            finish();
+        } else {
+            *after_question.borrow_mut() = Some(Box::new(finish));
+        }
     }
 
     /// After items were removed `from` a folder: list it again, select the
@@ -2516,6 +2533,9 @@ fn is_fuse_mount(path: &str) -> bool {
     wayfinder::rclone_ops::is_fuse_path(path)
 }
 
+/// Work put off until something is answered.
+type Deferred = std::rc::Rc<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>;
+
 /// Where items are being removed from, to select near them afterwards.
 #[derive(Clone)]
 struct RemovedFrom {
@@ -2600,11 +2620,18 @@ fn run_rclone_direct_delete(
 ) {
     let parent: gtk::Window = window.clone().upcast();
     let win = window.clone();
-    let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-        win.reload_after_removal(from, |_, _| {});
+    let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> = Some(Box::new(move |succeeded| {
         // The progress dialog already announced success/failure — don't
         // override it with a misleading "Deleted N" if rclone errored or
         // the user cancelled.
+        if succeeded {
+            win.reload_after_removal(from, |_, _| {});
+        } else {
+            // Some items may be gone: show what's there now, but leave the
+            // selection where the user put it.
+            win.forget_moved(&from.removed);
+            win.reload_after_change(std::slice::from_ref(&from.folder));
+        }
     }));
     wayfinder::rclone_ops::delete_with_progress(rclone_items, &parent, on_complete);
 }
