@@ -445,6 +445,8 @@ fn transfer_with_progress(
     // mount, so it happens off the main thread.
     let source = source.clone();
     let parent = parent_window.clone();
+    let parent_slow = parent_window.clone();
+    let waiting = crate::background::waiting_message(&dest_path);
     let dest_for_check = dest.clone();
     crate::background::run(
         move || dest_for_check.query_exists(gio::Cancellable::NONE),
@@ -525,7 +527,11 @@ fn transfer_with_progress(
                 );
             }
         },
-        || {},
+        move || {
+            if let Some(msg) = waiting {
+                parent_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+            }
+        },
     );
 }
 
@@ -633,9 +639,11 @@ fn copy_directory_recursive(
             copy_directory_recursive(&child_source, &child_dest, cancellable, progress, replace)?;
         } else {
             let ps = progress.clone();
+            // A link is copied as a link: following one to a folder would
+            // fail the whole copy (GIO can't copy a folder that way).
             child_source.copy(
                 &child_dest,
-                flags,
+                flags | gio::FileCopyFlags::NOFOLLOW_SYMLINKS,
                 Some(cancellable),
                 Some(&mut |current, total| {
                     let mut state = ps.lock().unwrap();
@@ -798,7 +806,8 @@ fn run_with_progress(
     let cancellable_clone = cancellable.clone();
 
     // Channel for thread -> main thread result
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    // Err carries whether it was a cancellation, and the message.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), (bool, String)>>();
     let done_flag = Arc::new(AtomicBool::new(false));
     let done_flag_thread = done_flag.clone();
 
@@ -873,14 +882,19 @@ fn run_with_progress(
             }
         };
 
-        let _ = tx.send(result.map_err(|e| e.to_string()));
+        let _ =
+            tx.send(result.map_err(|e| (e.matches(gio::IOErrorEnum::Cancelled), e.to_string())));
         done_flag_thread.store(true, Ordering::Relaxed);
     });
 
     // Poll for completion from the main thread
     let op_name_str = if is_move { "Moved" } else { "Copied" };
     let parent_window = parent_window.clone();
-    let display_name_done = display_name.clone();
+    // The name it now has ("Rename (keep both)" gives it a new one).
+    let display_name_done = dest_path_buf
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| display_name.clone());
     let on_complete = std::cell::RefCell::new(on_complete);
 
     glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
@@ -902,14 +916,14 @@ fn run_with_progress(
                         cb();
                     }
                 }
-                Err(e) if e.contains("cancelled") || e.contains("Cancelled") => {
+                Err((true, _)) => {
                     parent_window
                         .announce("Transfer cancelled", AccessibleAnnouncementPriority::Medium);
                     if let Some(cb) = on_complete.borrow_mut().take() {
                         cb();
                     }
                 }
-                Err(e) => {
+                Err((false, e)) => {
                     parent_window.announce(
                         &format!("Failed: {e}"),
                         AccessibleAnnouncementPriority::High,

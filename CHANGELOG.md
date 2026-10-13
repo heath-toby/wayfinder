@@ -9,6 +9,8 @@
 - **Overwriting on rclone mounts** — pasting onto an rclone mount where a file or folder of the same name already exists now asks Skip, Replace or Rename, as everywhere else, instead of silently overwriting it; renaming to a name that's taken, or a batch rename that would give two files the same name, is refused.
 - **rclone copies and moves** — empty folders are copied and moved too, and moving a folder no longer leaves an empty copy of its folder tree behind. When rclone fails, its error message is read out in full.
 - **rclone mounts started with flags** — mounts started with options such as `--daemon` or `-v` before the remote name are recognised, so they get the faster direct rclone operations.
+- **Copying folders with links** — a folder containing a link to another folder is copied, the link as a link, instead of the whole copy failing.
+- **Copy and move messages** — after "Rename (keep both)", the announcement names the copy's new name; a cancelled copy is recognised as cancelled whatever the system language; and "Waiting for rclone" is said if checking for a clash takes a moment.
 - **Responsiveness** — paste, delete and rename on many files no longer run `ps` once per file on the main thread, and emptying the Bin no longer freezes the window.
 - **Crash in Go to Location** — pressing Tab after typing a full path inside your home folder (such as `/home/you/Docu`), or after a name with accented letters, could close Wayfinder. Completions now keep the form you typed: `~/…` stays `~/…`, and a full path stays a full path.
 - **`~` in Go to Location** — only `~` on its own or `~/…` stands for your home folder, so `~bob` is no longer turned into a path inside it, and a folder next to home such as `/home/youx` is no longer shown as `~x`.
