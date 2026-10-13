@@ -9,6 +9,9 @@ use crate::file_object::FileObject;
 pub struct ListViewInner {
     pub column_view: ColumnView,
     pub scrolled_window: ScrolledWindow,
+    /// Whether sorting is remembered for next time (not in the portal's
+    /// file chooser, which mustn't change Wayfinder's own sort).
+    pub persist_sort: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl Default for ListViewInner {
@@ -17,6 +20,8 @@ impl Default for ListViewInner {
             .show_column_separators(true)
             .show_row_separators(true)
             .build();
+
+        let persist_sort = std::rc::Rc::new(std::cell::Cell::new(true));
 
         // Whether the sort is descending: the folders-first rule reads it
         // (see folders_first).
@@ -180,6 +185,7 @@ impl Default for ListViewInner {
                 let asc = sort_ascending.clone();
                 let btns = all_buttons.clone();
                 let desc = descending.clone();
+                let persist = persist_sort.clone();
 
                 btn.connect_clicked(move |_| {
                     if idx.get() == i {
@@ -197,7 +203,9 @@ impl Default for ListViewInner {
                     };
                     desc.set(!asc.get());
                     cv.sort_by_column(Some(&c), order);
-                    crate::state::save_sort_state(idx.get() as u32, asc.get());
+                    if persist.get() {
+                        crate::state::save_sort_state(idx.get() as u32, asc.get());
+                    }
 
                     // Update all button labels
                     let mut sorted_name = String::new();
@@ -259,6 +267,7 @@ impl Default for ListViewInner {
             let asc = sort_ascending.clone();
             let desc = descending.clone();
             let btns = all_buttons.clone();
+            let persist = persist_sort.clone();
             view_sorter.connect_changed(move |view_sorter, _| {
                 let Some(col) = view_sorter.primary_sort_column() else {
                     return;
@@ -271,7 +280,9 @@ impl Default for ListViewInner {
                 idx.set(i);
                 asc.set(ascending);
                 desc.set(!ascending);
-                crate::state::save_sort_state(i as u32, ascending);
+                if persist.get() {
+                    crate::state::save_sort_state(i as u32, ascending);
+                }
                 for (j, (name, button)) in btns.iter().enumerate() {
                     if j == i {
                         let dir = if ascending { "ascending" } else { "descending" };
@@ -325,6 +336,7 @@ impl Default for ListViewInner {
         Self {
             column_view,
             scrolled_window,
+            persist_sort,
         }
     }
 }

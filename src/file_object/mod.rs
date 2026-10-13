@@ -22,6 +22,13 @@ pub struct FileInfoData {
 }
 
 impl FileInfoData {
+    /// This entry is a link to a folder: list, sort and open it as one.
+    pub fn mark_link_to_folder(&mut self) {
+        self.is_directory = true;
+        self.size = 0;
+        self.content_type = "inode/directory".to_string();
+    }
+
     pub fn from_file_info(info: &gio::FileInfo) -> Self {
         let name = info.name().to_string_lossy().to_string();
         let file_type = info.file_type();

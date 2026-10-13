@@ -551,23 +551,35 @@ fn execute_desktop_action(
 ) {
     let commands = desktop_commands(&action.exec, files);
     std::thread::spawn(move || {
-        // One command per file for %f/%u; stop at the first failure.
+        // One command per file for %f/%u, all started at once (an editor
+        // opens every file, not one after another as each is closed).
+        // Done when all are; the first failure is reported.
+        let running: Vec<_> = commands
+            .into_iter()
+            .map(|cmd_str| {
+                std::thread::spawn(move || {
+                    match std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&cmd_str)
+                        .output()
+                    {
+                        Ok(output) if output.status.success() => Ok(()),
+                        Ok(output) => {
+                            let err = String::from_utf8_lossy(&output.stderr);
+                            Err(err.lines().next().unwrap_or("unknown error").to_string())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+            })
+            .collect();
         let mut msg = Ok(());
-        for cmd_str in &commands {
-            let result = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd_str)
-                .output();
-            msg = match result {
-                Ok(output) if output.status.success() => Ok(()),
-                Ok(output) => {
-                    let err = String::from_utf8_lossy(&output.stderr);
-                    Err(err.lines().next().unwrap_or("unknown error").to_string())
-                }
-                Err(e) => Err(e.to_string()),
-            };
-            if msg.is_err() {
-                break;
+        for run in running {
+            let result = run
+                .join()
+                .unwrap_or_else(|_| Err("internal error".to_string()));
+            if msg.is_ok() {
+                msg = result;
             }
         }
         let _ = tx.send(msg);

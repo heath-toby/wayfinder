@@ -40,6 +40,11 @@ impl WayfinderListView {
         );
     }
 
+    /// Whether sort changes are saved for next time (default: yes).
+    pub fn set_persist_sort(&self, persist: bool) {
+        self.imp().persist_sort.set(persist);
+    }
+
     pub fn grab_focus(&self) {
         self.imp().column_view.grab_focus();
     }

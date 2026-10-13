@@ -644,7 +644,7 @@ impl DirectoryModel {
                                 gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
                                 gio::Cancellable::NONE,
                             ) {
-                                let file_obj = FileObject::from_file_info(&path, &info);
+                                let file_obj = monitored_object(&path, &info);
                                 store.append(&file_obj);
                                 sorter.changed(gtk::SorterChange::Different);
                                 // It says "Calculating...": do so.
@@ -673,7 +673,7 @@ impl DirectoryModel {
                                     gio::Cancellable::NONE,
                                 ) {
                                     // Update in place, keeping the selection on it.
-                                    let new_obj = FileObject::from_file_info(&path, &info);
+                                    let new_obj = monitored_object(&path, &info);
                                     if let Some(fo) = store.item(idx).and_downcast::<FileObject>() {
                                         fo.update_from(&new_obj);
                                         resort_if_needed(&sort_model, &[fo]);
@@ -728,6 +728,20 @@ impl DirectoryModel {
 /// order (the sort model places new items, but doesn't notice changes).
 /// Only then: re-sorting replaces every row, which can make Orca lose or
 /// repeat its place.
+/// An object for an entry the monitor reported in the local folder `dir`:
+/// a link to a folder is a folder, as in a listing.
+fn monitored_object(dir: &str, info: &gio::FileInfo) -> FileObject {
+    let mut data = crate::file_object::FileInfoData::from_file_info(info);
+    if loader::link_is_dir(std::path::Path::new(dir), info) {
+        data.mark_link_to_folder();
+    }
+    let obj = FileObject::from_data(dir, &data);
+    if data.is_directory {
+        obj.set_size_display("Calculating...".to_string());
+    }
+    obj
+}
+
 /// Work out the sizes of the folders `dirs` ((key in the store, name in
 /// `base`)) on a worker thread, and show each as it comes in.
 fn spawn_size_job(

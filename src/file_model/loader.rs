@@ -28,8 +28,8 @@ const LOCAL_ATTRS: &str = "standard::*,time::modified";
 /// Attributes for FUSE folders. Sniffing reads every ambiguous file, which
 /// on rclone is a download per file, so the type is guessed from the name.
 const FUSE_ATTRS: &str = "standard::name,standard::display-name,standard::type,\
-standard::size,standard::is-hidden,standard::is-symlink,standard::fast-content-type,\
-time::modified";
+standard::size,standard::is-hidden,standard::is-symlink,standard::symlink-target,\
+standard::fast-content-type,time::modified";
 
 pub(super) fn attrs_for(is_fuse: bool) -> &'static str {
     if is_fuse {
@@ -74,12 +74,12 @@ pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
     let real_path = real.to_string_lossy().to_string();
     let is_fuse = crate::rclone_ops::is_fuse_path(&real_path);
 
-    // Links are followed (this is a worker thread), so a link to a folder
-    // is listed, sorted and opened as a folder.
+    // Links aren't followed: that would read (sniff) what they point to,
+    // perhaps on a mount. A link to a folder is recognised by link_is_dir.
     let enumerator = gio::File::for_path(&dir)
         .enumerate_children(
             attrs_for(is_fuse),
-            gio::FileQueryInfoFlags::NONE,
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
             gio::Cancellable::NONE,
         )
         .map_err(|e| e.to_string())?;
@@ -88,7 +88,11 @@ pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
         .next_file(gio::Cancellable::NONE)
         .map_err(|e| e.to_string())?
     {
-        entries.push((path.clone(), FileInfoData::from_file_info(&info)));
+        let mut data = FileInfoData::from_file_info(&info);
+        if link_is_dir(&dir, &info) {
+            data.mark_link_to_folder();
+        }
+        entries.push((path.clone(), data));
     }
     Ok(Listing {
         path,
@@ -96,6 +100,41 @@ pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
         is_fuse,
         entries,
     })
+}
+
+/// Whether `info`, an entry of `dir`, is a link to a folder. Its target is
+/// looked at only off FUSE — on a mount that could hang (or download), and
+/// a mount's own mountpoint is a folder anyway. Lexical: `..` in the
+/// target is resolved by path, so a link into a mount is seen as such.
+pub(crate) fn link_is_dir(dir: &std::path::Path, info: &gio::FileInfo) -> bool {
+    if !info.is_symlink() {
+        return false;
+    }
+    let Some(target) = info.symlink_target() else {
+        return false;
+    };
+    let target = normalize(&dir.join(target));
+    let target_str = target.to_string_lossy();
+    if crate::rclone_ops::is_fuse_path(&target_str) {
+        return crate::rclone_ops::is_mountpoint(&target_str);
+    }
+    std::fs::metadata(&target).is_ok_and(|m| m.is_dir())
+}
+
+/// `path` with `.` and `..` resolved by name alone (no filesystem access).
+fn normalize(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// List a GIO location such as `trash:///`.
@@ -395,6 +434,14 @@ mod tests {
         assert!(cached_at("/t-wf-slash/Docs"));
         forget("/t-wf-slash/Docs");
         assert!(!cached_at("/t-wf-slash/Docs"));
+    }
+
+    #[test]
+    fn link_targets_are_resolved_by_name() {
+        assert_eq!(
+            normalize(std::path::Path::new("/home/u/../mnt/./drive")),
+            std::path::PathBuf::from("/home/mnt/drive")
+        );
     }
 
     #[test]

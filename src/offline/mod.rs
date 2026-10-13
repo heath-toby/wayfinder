@@ -249,6 +249,15 @@ pub fn in_sync_folder(cached: &Path) -> bool {
         .any(|pair| paths_overlap(cached, Path::new(&pair.sync_local_path)))
 }
 
+/// Whether the offline copy at `cached` is (inside) a two-way sync
+/// folder's local side — kept offline by the sync already. (Otherwise an
+/// overlap means it holds one.)
+pub fn inside_sync_folder(cached: &Path) -> bool {
+    crate::rclone_sync::load_pairs()
+        .values()
+        .any(|pair| cached.starts_with(&pair.sync_local_path))
+}
+
 /// Whether one of `a` and `b` is, or is inside, the other.
 fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)

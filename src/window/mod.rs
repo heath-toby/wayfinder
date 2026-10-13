@@ -719,6 +719,28 @@ impl WayfinderWindow {
         }
     }
 
+    /// Right-clicking a file that isn't among the marked ones (Ctrl+Space)
+    /// acts on that file: drop the marks, as other file managers do, so the
+    /// menu's actions don't go to the marked files instead. (The Menu key
+    /// keeps them: it's how the marked files get a menu.)
+    pub fn drop_marks_unless_clicked_is_marked(&self) {
+        let Some(file) = self.get_selected_file() else {
+            return;
+        };
+        let imp = self.imp();
+        let dropped = {
+            let mut marks = imp.file_selection.borrow_mut();
+            let drop = marks.count() > 0 && !marks.selected.contains(&file.path());
+            if drop {
+                marks.clear();
+            }
+            drop
+        };
+        if dropped {
+            self.update_status();
+        }
+    }
+
     /// Select `name` the next time `folder` is opened.
     pub fn remember_selection(&self, folder: &str, name: &str) {
         self.imp()
@@ -1453,7 +1475,14 @@ impl WayfinderWindow {
     /// changed and return true: the change would land on the copy, not the
     /// drive the location bar names.
     fn refuse_in_offline_view(&self) -> bool {
-        if !self.imp().offline_view.get() {
+        // Also inside it (a subfolder opened from the offline copy is
+        // listed by its cache path): changes there would be undone by the
+        // next offline refresh. A two-way sync folder's local side lives
+        // there too, and that one is meant to be changed.
+        let current = std::path::PathBuf::from(self.imp().model.current_path());
+        let in_cache = current.starts_with(wayfinder::offline::cache_root())
+            && !wayfinder::offline::in_sync_folder(&current);
+        if !self.imp().offline_view.get() && !in_cache {
             return false;
         }
         self.announce(

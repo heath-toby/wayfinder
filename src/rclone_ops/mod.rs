@@ -99,6 +99,18 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     found
 }
 
+/// Whether something is mounted exactly at `path` (from /proc/mounts).
+pub fn is_mountpoint(path: &str) -> bool {
+    let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    let path = path.trim_end_matches('/');
+    proc_mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|m| m.replace("\\040", " ") == path)
+}
+
 /// Filesystems mounted inside `path` (not at it): deleting `path` would
 /// reach into them — a whole remote drive, perhaps. By path, from
 /// /proc/mounts; no filesystem access.
@@ -155,10 +167,25 @@ fn parse_rclone_mount(line: &str, fuse_mounts: &[String]) -> Option<(String, Str
     let mount_pos = args
         .iter()
         .position(|t| fuse_mounts.iter().any(|m| m == t))?;
-    let remote = args[..mount_pos]
+    // Candidates: `name:` or `name:path` (or `:backend:…`), not `:5572`.
+    let before = &args[..mount_pos];
+    let candidates: Vec<usize> = (0..before.len())
+        .filter(|&i| {
+            let t = before[i];
+            !t.starts_with('-') && t.contains(':') && (!t.starts_with(':') || t[1..].contains(':'))
+        })
+        .collect();
+    // A flag's value (`--rc-addr localhost:5572`) is preferably not the
+    // remote — but a boolean flag (`--daemon Proton:`) may come right
+    // before it, so if nothing else fits, take it anyway.
+    let after_flag =
+        |i: usize| i > 0 && before[i - 1].starts_with("--") && !before[i - 1].contains('=');
+    let remote = candidates
         .iter()
         .rev()
-        .find(|t| !t.starts_with('-') && t.contains(':'))?;
+        .find(|&&i| !after_flag(i))
+        .or_else(|| candidates.last())
+        .map(|&i| before[i])?;
     Some((args[mount_pos].to_string(), remote.to_string()))
 }
 
@@ -1058,6 +1085,20 @@ mod mount_parse_tests {
         assert_eq!(
             parse_rclone_mount(line, &mounts()),
             Some(("/home/u/proton".into(), "Proton:Docs".into()))
+        );
+    }
+
+    #[test]
+    fn flag_values_with_colons_are_not_the_remote() {
+        let line = "rclone mount Proton: --rc-addr localhost:5572 /home/u/proton";
+        assert_eq!(
+            parse_rclone_mount(line, &mounts()),
+            Some(("/home/u/proton".into(), "Proton:".into()))
+        );
+        let line = "rclone mount Proton: --rc-addr :5572 /home/u/proton";
+        assert_eq!(
+            parse_rclone_mount(line, &mounts()),
+            Some(("/home/u/proton".into(), "Proton:".into()))
         );
     }
 

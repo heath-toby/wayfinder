@@ -638,22 +638,55 @@ fn copy_directory_recursive(
         if info.file_type() == gio::FileType::Directory {
             copy_directory_recursive(&child_source, &child_dest, cancellable, progress, replace)?;
         } else {
-            let ps = progress.clone();
-            // A link is copied as a link: following one to a folder would
-            // fail the whole copy (GIO can't copy a folder that way).
-            child_source.copy(
-                &child_dest,
-                flags | gio::FileCopyFlags::NOFOLLOW_SYMLINKS,
-                Some(cancellable),
-                Some(&mut |current, total| {
-                    let mut state = ps.lock().unwrap();
-                    *state = (current, total);
-                }),
-            )?;
+            copy_keeping_links(&child_source, &child_dest, flags, cancellable, progress)?;
         }
     }
 
     Ok(())
+}
+
+/// Copy a file — a link as a link. Where the destination can't hold links
+/// (FAT drives, most cloud drives), copy what a link points to instead: a
+/// file; a link to a folder is left out (with a warning in the log) rather
+/// than failing the whole copy.
+fn copy_keeping_links(
+    src: &gio::File,
+    dst: &gio::File,
+    flags: gio::FileCopyFlags,
+    cancellable: &gio::Cancellable,
+    progress: &Arc<Mutex<(i64, i64)>>,
+) -> Result<(), glib::Error> {
+    let copy = |flags: gio::FileCopyFlags| {
+        let ps = progress.clone();
+        src.copy(
+            dst,
+            flags,
+            Some(cancellable),
+            Some(&mut |current, total| {
+                let mut state = ps.lock().unwrap();
+                *state = (current, total);
+            }),
+        )
+    };
+    match copy(flags | gio::FileCopyFlags::NOFOLLOW_SYMLINKS) {
+        Err(e)
+            if !e.matches(gio::IOErrorEnum::Cancelled)
+                && src.query_file_type(
+                    gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                    Some(cancellable),
+                ) == gio::FileType::SymbolicLink =>
+        {
+            if src.query_file_type(gio::FileQueryInfoFlags::NONE, Some(cancellable))
+                == gio::FileType::Directory
+            {
+                log::warn!("Not copied: {} is a link to a folder: {e}", src.uri());
+                Ok(())
+            } else {
+                copy(flags)
+            }
+        }
+        other => other,
+    }
 }
 
 struct ProgressOp {
@@ -848,18 +881,8 @@ fn run_with_progress(
                         copy_directory_recursive(&src, &dst, &cancellable_clone, &ps, replace)
                             .and_then(|()| delete_recursive_gio(&src, &cancellable_clone))
                     } else {
-                        src.copy(
-                            &dst,
-                            // A link is copied as a link (to a folder, it can't
-                            // be copied by following it).
-                            flags | gio::FileCopyFlags::NOFOLLOW_SYMLINKS,
-                            Some(&cancellable_clone),
-                            Some(&mut |current, total| {
-                                let mut state = ps.lock().unwrap();
-                                *state = (current, total);
-                            }),
-                        )
-                        .and_then(|()| src.delete(Some(&cancellable_clone)))
+                        copy_keeping_links(&src, &dst, flags, &cancellable_clone, &ps)
+                            .and_then(|()| src.delete(Some(&cancellable_clone)))
                     }
                 }
                 other => other,
@@ -872,17 +895,7 @@ fn run_with_progress(
             if file_type == gio::FileType::Directory {
                 copy_directory_recursive(&src, &dst, &cancellable_clone, &ps, replace)
             } else {
-                src.copy(
-                    &dst,
-                    // A link is copied as a link (to a folder, it can't
-                    // be copied by following it).
-                    flags | gio::FileCopyFlags::NOFOLLOW_SYMLINKS,
-                    Some(&cancellable_clone),
-                    Some(&mut |current, total| {
-                        let mut state = ps.lock().unwrap();
-                        *state = (current, total);
-                    }),
-                )
+                copy_keeping_links(&src, &dst, flags, &cancellable_clone, &ps)
             }
         };
 
@@ -1021,8 +1034,36 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
 
 #[cfg(test)]
 mod tests {
-    use super::{placement, Placement};
+    use super::{copy_keeping_links, placement, Placement};
+    use gtk::gio;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn links_are_copied_as_links() {
+        let d = std::env::temp_dir().join(format!("wayfinder-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("folder")).unwrap();
+        std::fs::write(d.join("file.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink("folder", d.join("to-folder")).unwrap();
+        let copy = |from: &str, to: &str| {
+            copy_keeping_links(
+                &gio::File::for_path(d.join(from)),
+                &gio::File::for_path(d.join(to)),
+                gio::FileCopyFlags::NONE,
+                &gio::Cancellable::new(),
+                &Arc::new(Mutex::new((0, 0))),
+            )
+        };
+        copy("to-folder", "copied-link").unwrap();
+        assert!(std::fs::symlink_metadata(d.join("copied-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        copy("file.txt", "copied.txt").unwrap();
+        assert_eq!(std::fs::read(d.join("copied.txt")).unwrap(), b"x");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn pasting_into_its_own_folder_is_onto_itself() {

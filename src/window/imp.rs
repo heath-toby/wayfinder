@@ -1510,6 +1510,7 @@ impl WayfinderWindowInner {
         let window = self.obj().clone();
         click_controller.connect_pressed(move |gesture, _n, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
+            window.drop_marks_unless_clicked_is_marked();
             crate::context_menu::show_context_menu(&window, x, y);
         });
         self.list_view
@@ -1522,6 +1523,7 @@ impl WayfinderWindowInner {
         let window2 = self.obj().clone();
         click_controller2.connect_pressed(move |gesture, _n, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
+            window2.drop_marks_unless_clicked_is_marked();
             crate::context_menu::show_context_menu(&window2, x, y);
         });
         self.grid_view.grid_view().add_controller(click_controller2);

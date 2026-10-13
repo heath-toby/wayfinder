@@ -290,13 +290,14 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         // Inside a two-way sync folder, the copy is already
                         // kept (both ways); downloading over it would undo
                         // local changes not yet synced.
-                        if wayfinder::offline::in_sync_folder(&wayfinder::offline::cache_path_for(
-                            &p,
-                        )) {
-                            w.announce(
-                                "Already available offline through two-way sync",
-                                gtk::AccessibleAnnouncementPriority::Medium,
-                            );
+                        let cached = wayfinder::offline::cache_path_for(&p);
+                        if wayfinder::offline::in_sync_folder(&cached) {
+                            let msg = if wayfinder::offline::inside_sync_folder(&cached) {
+                                "Already available offline through two-way sync"
+                            } else {
+                                "Can't keep this folder offline: it holds a two-way sync folder, which keeps its own copy. Keep the folders beside it offline instead."
+                            };
+                            w.announce(msg, gtk::AccessibleAnnouncementPriority::Medium);
                             return;
                         }
                         let parent_window: gtk::Window = w.clone().upcast();

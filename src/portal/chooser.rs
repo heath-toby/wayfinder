@@ -226,7 +226,9 @@ pub fn show_chooser(
 
     dlg.set_child(Some(&paned));
 
-    // Wire ColumnView sorter
+    // Wire ColumnView sorter. Sorting here isn't Wayfinder's own sort:
+    // don't save it over that.
+    list_view.set_persist_sort(false);
     let columns = list_view.column_view().columns();
     if let Some(first_col) = columns.item(0).and_downcast::<gtk::ColumnViewColumn>() {
         list_view
@@ -474,7 +476,8 @@ pub fn show_chooser(
         if key == gtk::gdk::Key::space {
             if let Some(item) = sel_for_space.selected_item() {
                 if let Some(file) = item.downcast_ref::<FileObject>() {
-                    if !file.is_directory() || directory_mode {
+                    // Choosing folders: only a folder; files: only a file.
+                    if file.is_directory() == directory_mode {
                         *sf.borrow_mut() = Some(file.path());
                         if let Some(ref entry) = fn_entry {
                             entry.set_text(&file.name());
@@ -508,7 +511,8 @@ pub fn show_chooser(
         if key == gtk::gdk::Key::space {
             if let Some(item) = sel_for_space2.selected_item() {
                 if let Some(file) = item.downcast_ref::<FileObject>() {
-                    if !file.is_directory() || directory_mode {
+                    // Choosing folders: only a folder; files: only a file.
+                    if file.is_directory() == directory_mode {
                         *sf2.borrow_mut() = Some(file.path());
                         if let Some(ref entry) = fn_entry2 {
                             entry.set_text(&file.name());
