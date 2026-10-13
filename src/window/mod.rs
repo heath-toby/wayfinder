@@ -389,6 +389,14 @@ impl WayfinderWindow {
     /// in): drop their cached listings, so none is shown out of date — if
     /// the user went elsewhere while a slow mount answered, or the reload
     /// is cut short — and reload the current folder.
+    /// Files or folders at `paths` were moved or renamed away: drop the
+    /// cached listings of the old locations and everything inside them.
+    pub fn forget_moved(&self, paths: &[String]) {
+        for path in paths {
+            self.imp().model.forget_cached_under(path);
+        }
+    }
+
     pub fn reload_after_change(&self, folders: &[String]) {
         let model = &self.imp().model;
         for folder in folders {
@@ -954,6 +962,11 @@ impl WayfinderWindow {
         // The folders this paste changes: the destination, and for a move
         // the folders the files leave.
         let mut changed = vec![dest_dir_str.clone()];
+        let moved: Vec<String> = if state.operation == ClipboardOperation::Cut {
+            source_paths.clone()
+        } else {
+            Vec::new()
+        };
         if state.operation == ClipboardOperation::Cut {
             for p in &source_paths {
                 if let Some(parent) = parent_dir(p) {
@@ -973,6 +986,7 @@ impl WayfinderWindow {
             let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
                 // Move guard into the closure so it drops here on success.
                 let _g = guard;
+                w.forget_moved(&moved);
                 w.reload_after_change(&changed);
             }));
             match state.operation {
@@ -1002,8 +1016,10 @@ impl WayfinderWindow {
                 let w = self.clone();
                 let guard_held = shared_guard.clone();
                 let changed = changed.clone();
+                let moved = moved.clone();
                 let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
                     let _g = guard_held;
+                    w.forget_moved(&moved);
                     w.reload_after_change(&changed);
                 }));
                 match state.operation {
@@ -1198,7 +1214,7 @@ impl WayfinderWindow {
 
         // Store trashed paths for undo (only successfully trashed ones)
         if !trashed_paths.is_empty() {
-            *imp.last_trashed.borrow_mut() = trashed_paths;
+            *imp.last_trashed.borrow_mut() = trashed_paths.clone();
         }
 
         // Announce failures FIRST (before focus changes trigger Orca)
@@ -1223,7 +1239,12 @@ impl WayfinderWindow {
 
         // Refresh, then focus the item above the deleted one (or the new
         // last item) and confirm.
-        let first_name = files[0].name();
+        // Name a file that really went to the Bin.
+        let first_name = files
+            .iter()
+            .find(|f| trashed_paths.contains(&f.path()))
+            .map(|f| f.name())
+            .unwrap_or_default();
         self.reload_after_removal(from, move |w, relisted| {
             if failed == 0 && success > 0 {
                 // Unless the folder was just listed again, the current
@@ -1274,14 +1295,15 @@ impl WayfinderWindow {
         }
         let w = self.clone();
         model.refresh(move |listed| {
-            let relisted = listed && w.imp().model.generation() == from.generation;
-            if listed {
-                w.update_status();
-            }
-            if relisted {
+            w.update_status();
+            // Same view of the folder (no navigation since): move off the
+            // removed items — even if listing failed and they're still
+            // shown, as reloading always did.
+            let same_view = w.imp().model.generation() == from.generation;
+            if same_view {
                 w.select_near_removed(from.old_pos);
             }
-            after(&w, relisted);
+            after(&w, listed && same_view);
         });
     }
 
@@ -1508,7 +1530,9 @@ impl WayfinderWindow {
                     .unwrap_or_else(|| new_name.clone());
                 let w_done = w.clone();
                 let changed: Vec<String> = parent_dir(&file_path).into_iter().collect();
+                let moved = vec![file_path.clone()];
                 let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                    w_done.forget_moved(&moved);
                     w_done.reload_after_change(&changed);
                 }));
                 wayfinder::rclone_ops::rename_with_progress(
@@ -1524,6 +1548,7 @@ impl WayfinderWindow {
             d.close();
             let path = file_path.clone();
             let changed: Vec<String> = parent_dir(&file_path).into_iter().collect();
+            let moved = vec![file_path.clone()];
             w.run_blocking(
                 &file_path,
                 move || {
@@ -1538,6 +1563,7 @@ impl WayfinderWindow {
                             AccessibleAnnouncementPriority::Medium,
                         );
                         // Reload directory as fallback in case file monitor doesn't catch the rename
+                        w.forget_moved(&moved);
                         w.reload_after_change(&changed);
                     }
                     Err(e) => {
@@ -1779,7 +1805,9 @@ impl WayfinderWindow {
                 let w_done = w.clone();
                 let pair_count = pairs.len();
                 let changed = vec![w.imp().model.current_path()];
+                let moved: Vec<String> = pairs.iter().map(|(old, _)| old.clone()).collect();
                 let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                    w_done.forget_moved(&moved);
                     w_done.reload_after_change(&changed);
                     w_done.announce(
                         &format!("Renamed {pair_count} files"),
@@ -1794,6 +1822,7 @@ impl WayfinderWindow {
             d.close();
             let current = w.imp().model.current_path();
             let changed = vec![current.clone()];
+            let moved: Vec<String> = pairs.iter().map(|(old, _)| old.clone()).collect();
             w.run_blocking(
                 &current,
                 move || {
@@ -1824,6 +1853,7 @@ impl WayfinderWindow {
                     w.announce(&msg, AccessibleAnnouncementPriority::Medium);
 
                     // Reload directory
+                    w.forget_moved(&moved);
                     w.reload_after_change(&changed);
                 },
             );

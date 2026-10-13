@@ -17,8 +17,10 @@
 - **File chooser** — when a recently seen folder turns out to be gone, the file chooser now says so, and keeps its item count up to date when a folder changes.
 - **Status bar after a failed refresh** — the item count is brought up to date again, as before 2.5.0, while "Waiting for rclone… Press Alt+Left to go back" stays up for as long as a folder is still opening.
 - **Deleted folders reappearing** — going Forward into a folder you've just deleted no longer lists its old contents, and undoing a move to the Bin shows the restored files in their folders straight away.
+- **Moved and renamed folders** — going back to a folder you've just moved or renamed on a mount no longer opens its old contents as if it were still there.
+- **Move to Bin messages** — when some of the selected files had to be deleted permanently instead, "Moved … to Bin" names a file that really went to the Bin.
 - **Cancelled deletes** — cancelling a permanent delete on a mount (or one where nothing could be deleted) no longer moves the selection.
-- **File chooser memory** — each file chooser dialog is freed when it closes; the portal no longer grows with every Open or Save dialog.
+- **Memory** — each closed window, and each file chooser dialog, is now freed; previously they stayed in memory until Wayfinder quit. A file chooser closed while a folder was still opening on a stuck mount stops waiting for it.
 - **`~` with an unusual home setting** — Tab completion of `~/…` works when `$HOME` ends in `/`, or is `/` itself.
 
 ### Development

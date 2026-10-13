@@ -323,6 +323,14 @@ impl DirectoryModel {
         loader::forget(path);
     }
 
+    /// Stop waiting for the load under way (its window is closing): its
+    /// listing will be dropped when it comes, and nothing polls for it
+    /// meanwhile.
+    pub fn abandon_loading(&self) {
+        self.generation.set(self.generation.get() + 1);
+        self.loading.set(false);
+    }
+
     /// Drop the cached listings of `path` and every folder inside it (it
     /// was removed or moved away).
     pub fn forget_cached_under(&self, path: &str) {

@@ -606,7 +606,10 @@ pub fn show_chooser(
 
     // Close window = cancel
     let tx_close = result_tx.clone();
+    let m = model.clone();
     dlg.connect_close_request(move |_| {
+        // Don't keep polling a folder still opening on a stuck mount.
+        m.abandon_loading();
         if let Some(tx) = tx_close.borrow_mut().take() {
             let _ = tx.send(ChooserResult {
                 uris: vec![],

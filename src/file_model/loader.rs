@@ -215,19 +215,34 @@ pub(super) fn store(listing: &Listing) {
     });
 }
 
-/// Drop a location's cached listing (it can't be listed any more).
+/// Drop a location's cached listing (it can't be listed any more, or has
+/// changed) — under whatever path it was reached by, symlinks included.
 pub(super) fn forget(path: &str) {
-    CACHE.with(|c| {
-        c.borrow_mut().remove(path);
-    });
+    forget_matching(path, false);
 }
 
 /// Drop the cached listings of `path` and every location inside it.
 pub(super) fn forget_under(path: &str) {
-    let inside = format!("{}/", path.trim_end_matches('/'));
+    forget_matching(path, true);
+}
+
+fn forget_matching(path: &str, with_inside: bool) {
     CACHE.with(|c| {
-        c.borrow_mut()
-            .retain(|location, _| location != path && !location.starts_with(&inside));
+        let mut cache = c.borrow_mut();
+        // The same folder may be cached under another path (reached
+        // through a symlink): match where it really is, too.
+        let mut targets = vec![path.to_string()];
+        if let Some(cached) = cache.get(path) {
+            if cached.real_path != path {
+                targets.push(cached.real_path.clone());
+            }
+        }
+        let matches = |p: &str| {
+            targets.iter().any(|t| {
+                p == t || (with_inside && p.starts_with(&format!("{}/", t.trim_end_matches('/'))))
+            })
+        };
+        cache.retain(|location, cached| !matches(location) && !matches(&cached.real_path));
     });
 }
 
@@ -311,6 +326,19 @@ mod tests {
         // A sibling whose name merely starts the same, and the parent, stay.
         assert!(cached_at("/t-wf/Docs/Older"));
         assert!(cached_at("/t-wf/Docs"));
+    }
+
+    /// A folder reached through a symlink and directly is one folder.
+    #[test]
+    fn forgetting_covers_the_same_folder_by_another_path() {
+        let cached_at = |p: &str| CACHE.with(|c| c.borrow().contains_key(p));
+        let real = "/t-wf-sym/mnt/Docs";
+        let link = "/t-wf-sym/home/cloud/Docs";
+        store(&listing(real, real));
+        store(&listing(link, real));
+        forget(link);
+        assert!(!cached_at(link));
+        assert!(!cached_at(real));
     }
 
     #[test]

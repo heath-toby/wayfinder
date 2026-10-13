@@ -482,15 +482,22 @@ impl ObjectImpl for WayfinderWindowInner {
 
         // A cached FUSE folder is shown at once and checked in the
         // background; keep the item count right if the check changed it.
-        let w = window.clone();
-        self.model
-            .set_on_background_update(move || w.update_status());
+        // (Weak: the model holds these, and the window holds the model.)
+        let w = window.downgrade();
+        self.model.set_on_background_update(move || {
+            if let Some(w) = w.upgrade() {
+                w.update_status();
+            }
+        });
 
         // A background check found the folder can't be listed any more
         // (deleted, mount gone): report it as a failed load, which also
         // falls back to the offline copy where there is one.
-        let w = window.clone();
+        let w = window.downgrade();
         self.model.set_on_background_error(move |location, e| {
+            let Some(w) = w.upgrade() else {
+                return;
+            };
             if location.starts_with('/') {
                 w.finish_open_directory(&location, Err(e));
             } else {
