@@ -133,6 +133,8 @@ impl WayfinderWindow {
 
     fn open_directory(&self, path: &str, resolve: bool) {
         self.leave_location(path);
+        // In the session from the start: a slow mount may never answer.
+        self.note_session_location(path);
         // Show where we're going straight away, so Back works while a slow
         // mount is still answering.
         self.show_location(path, path != "/");
@@ -337,6 +339,7 @@ impl WayfinderWindow {
 
     fn open_special_uri(&self, uri: &str) {
         self.leave_location(uri);
+        self.note_session_location(uri);
         self.show_location(uri, false);
 
         let is_recent = uri == "recent:///";
@@ -834,7 +837,18 @@ impl WayfinderWindow {
                 .map(|(_, l)| l.clone())
                 .collect()
         });
-        wayfinder::state::save_window_session(&locations);
+        // Written only when it changed (this runs on every navigation).
+        let changed = LAST_SAVED.with(|last| {
+            let mut last = last.borrow_mut();
+            let changed = *last != locations;
+            if changed {
+                *last = locations.clone();
+            }
+            changed
+        });
+        if changed {
+            wayfinder::state::save_window_session(&locations);
+        }
     }
 
     /// Select `name` the next time `folder` is opened.
@@ -2339,10 +2353,27 @@ impl WayfinderWindow {
                         let w_done = w.clone();
                         let renamed = pairs.clone();
                         let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
-                            Some(Box::new(move |succeeded| {
-                                if succeeded {
-                                    note_renames(&renamed);
-                                }
+                            Some(Box::new(move |_| {
+                                // Some may have gone through even if others
+                                // failed: see which (off the main thread, the
+                                // mount may be slow) and keep those in Recent.
+                                let probe_at = renamed
+                                    .first()
+                                    .map(|(old, _)| old.clone())
+                                    .unwrap_or_default();
+                                w_done.run_blocking(
+                                    &probe_at,
+                                    move || {
+                                        renamed
+                                            .into_iter()
+                                            .filter(|(old, new)| {
+                                                !std::path::Path::new(old).exists()
+                                                    && std::path::Path::new(new).exists()
+                                            })
+                                            .collect::<Vec<_>>()
+                                    },
+                                    |_, done| note_renames(&done),
+                                );
                                 w_done.forget_moved(&moved);
                                 w_done.reload_after_change(&changed);
                             }));
@@ -3206,6 +3237,11 @@ fn restore_newest(paths: &[String]) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+thread_local! {
+    /// The session as last written to disk.
+    static LAST_SAVED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {

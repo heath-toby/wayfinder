@@ -153,9 +153,34 @@ fn mountpoints_inside_of(proc_mounts: &str, path: &str) -> Vec<String> {
     proc_mounts
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
-        .map(|m| m.replace("\\040", " "))
+        .map(decode_mount_path)
         .filter(|m| m.starts_with(&inside))
         .collect()
+}
+
+/// A mountpoint as /proc/mounts writes it, decoded: the kernel escapes
+/// space, tab, newline and backslash as octal (`\040`, `\011`, `\012`,
+/// `\134`).
+pub fn decode_mount_path(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| bytes[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        match octal {
+            Some(d) => {
+                out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// FUSE mountpoints from /proc/mounts, to check many paths against at
@@ -177,7 +202,7 @@ fn fuse_mountpoints() -> Vec<String> {
             let fstype = parts.next()?;
             fstype
                 .contains("fuse")
-                .then(|| mountpoint.replace("\\040", " "))
+                .then(|| decode_mount_path(mountpoint))
         })
         .collect()
 }
@@ -524,7 +549,7 @@ pub fn current_rclone_fuse_mountpoints() -> Vec<String> {
         if parts.len() < 3 {
             continue;
         }
-        let mountpoint = parts[1].replace("\\040", " ");
+        let mountpoint = decode_mount_path(parts[1]);
         let fstype = parts[2];
         if fstype == "fuse.rclone" || fstype.starts_with("fuse.rclone") {
             out.push(mountpoint);
@@ -544,7 +569,7 @@ fn fstype_for_path(path: &str) -> Option<String> {
         if parts.len() < 3 {
             continue;
         }
-        let mountpoint = parts[1].replace("\\040", " ");
+        let mountpoint = decode_mount_path(parts[1]);
         let fstype = parts[2];
         let is_prefix = path == mountpoint || path.starts_with(&format!("{mountpoint}/"));
         if is_prefix && mountpoint.len() > best_len {
@@ -1101,6 +1126,16 @@ mod mount_parse_tests {
             std::fs::canonicalize(&d).unwrap().join("data/Work/x.txt")
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn mount_paths_are_decoded() {
+        assert_eq!(
+            super::decode_mount_path("/home/u/My\\040Drive"),
+            "/home/u/My Drive"
+        );
+        assert_eq!(super::decode_mount_path("/m/a\\134b\\011c"), "/m/a\\b\tc");
+        assert_eq!(super::decode_mount_path("/plain"), "/plain");
     }
 
     #[test]

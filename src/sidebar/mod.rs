@@ -147,22 +147,12 @@ fn with_settings(item: &gtk::Widget) -> gtk::Box {
 }
 
 /// "Reopen All Windows at Startup", on or off. A check box, so Orca says
-/// which; changing it is saved and said at once.
+/// which; changing it is saved at once.
 fn settings_check() -> gtk::CheckButton {
     let check = gtk::CheckButton::with_label("Reopen All Windows at Startup");
     check.set_active(crate::state::load_reopen_windows());
-    check.connect_toggled(|check| {
-        let on = check.is_active();
-        crate::state::save_reopen_windows(on);
-        check.announce(
-            if on {
-                "All windows will be reopened at startup"
-            } else {
-                "Only one window will open at startup"
-            },
-            gtk::AccessibleAnnouncementPriority::Medium,
-        );
-    });
+    // (Orca reads the box ticked or not; nothing more to say.)
+    check.connect_toggled(|check| crate::state::save_reopen_windows(check.is_active()));
     check
 }
 

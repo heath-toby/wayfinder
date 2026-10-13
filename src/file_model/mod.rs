@@ -880,7 +880,8 @@ fn remote_mountpoints() -> std::collections::HashSet<std::path::PathBuf> {
             let mountpoint = parts.nth(1)?;
             let fstype = parts.next()?;
             let remote = fstype.starts_with("fuse") || NETWORK.contains(&fstype);
-            remote.then(|| std::path::PathBuf::from(mountpoint.replace("\\040", " ")))
+            remote
+                .then(|| std::path::PathBuf::from(crate::rclone_ops::decode_mount_path(mountpoint)))
         })
         .collect()
 }
@@ -898,7 +899,7 @@ fn all_mountpoints() -> std::collections::HashSet<std::path::PathBuf> {
         .unwrap_or_default()
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
-        .map(|m| std::path::PathBuf::from(m.replace("\\040", " ")))
+        .map(|m| std::path::PathBuf::from(crate::rclone_ops::decode_mount_path(m)))
         .collect()
 }
 

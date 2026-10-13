@@ -121,89 +121,151 @@ pub(super) fn list_uri(uri: &str) -> ListResult {
 }
 
 /// Look up recently used files, skipping ones that no longer exist.
+///
+/// Files on FUSE mounts are asked about all at once, each in its own
+/// thread, and waited for only briefly (a mount that has stopped answering
+/// mustn't hold up the list): one that doesn't answer in time is listed by
+/// name (its type from that; size and date unknown). A mount still busy
+/// with an earlier such question isn't asked again, so stuck threads can't
+/// pile up.
 pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
     // The mount table, read once for the whole list.
     let mounts = crate::rclone_ops::fuse_mount_list();
-    let on_fuse = |p: &str| {
+    let mount_of = |p: &str| {
         mounts
             .iter()
-            .any(|m| std::path::Path::new(p).starts_with(m))
+            .find(|m| std::path::Path::new(p).starts_with(m))
+            .cloned()
     };
-    let mut entries = Vec::new();
+
+    // Mounts an earlier listing's questions are still stuck on.
+    let stuck: Vec<String> = BUSY_MOUNTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    let mut slots: Vec<Option<(String, FileInfoData)>> = Vec::new();
+    let (tx, rx) = mpsc::channel::<(usize, Option<FileInfoData>)>();
+    let mut asked = 0;
     for path in paths {
-        let is_fuse = on_fuse(&path);
-        if is_fuse {
-            // Asked in its own thread, and not waited for long: one recent
-            // file on a mount that has stopped answering mustn't hold up
-            // the list. If it doesn't answer, it's listed by name (its type
-            // from that; size and date unknown); if it's gone, it isn't.
-            let (tx, rx) = mpsc::channel();
-            let probe = path.clone();
-            std::thread::spawn(move || {
-                let found = gio::File::for_path(&probe)
-                    .query_info(
-                        FUSE_ATTRS,
-                        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                        gio::Cancellable::NONE,
-                    )
-                    .ok()
-                    .map(|info| FileInfoData::from_file_info(&info));
-                let _ = tx.send(found);
-            });
-            let p = std::path::Path::new(&path);
-            let Some(parent) = p.parent().map(|d| d.to_string_lossy().to_string()) else {
-                continue;
-            };
-            match rx.recv_timeout(std::time::Duration::from_millis(300)) {
-                Ok(Some(data)) => entries.push((parent, data)),
-                Ok(None) => continue,
-                Err(_) => {
-                    let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
-                        continue;
-                    };
-                    let (content_type, _) = gio::content_type_guess(Some(p), None);
-                    entries.push((
-                        parent,
-                        FileInfoData {
-                            display_name: name.clone(),
-                            is_hidden: false,
-                            name,
-                            is_directory: false,
-                            size: 0,
-                            modified: 0,
-                            modified_display: String::new(),
-                            content_type: content_type.to_string(),
-                        },
-                    ));
-                }
-            }
-            if entries.len() >= limit {
-                break;
+        if slots.iter().filter(|s| s.is_some()).count() + asked >= limit {
+            break;
+        }
+        let p = std::path::Path::new(&path);
+        let Some(parent) = p.parent().map(|d| d.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if let Some(mount) = mount_of(&path) {
+            // Listed by name now; replaced by what the mount says, if it
+            // says in time.
+            let index = slots.len();
+            slots.push(Some((parent, name_only(p))));
+            if !stuck.contains(&mount) {
+                let probe = MountProbe::start(&mount);
+                asked += 1;
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let found = gio::File::for_path(&path)
+                        .query_info(
+                            FUSE_ATTRS,
+                            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                            gio::Cancellable::NONE,
+                        )
+                        .ok()
+                        .map(|info| FileInfoData::from_file_info(&info));
+                    drop(probe);
+                    let _ = tx.send((index, found));
+                });
             }
             continue;
         }
         let Ok(info) = gio::File::for_path(&path).query_info(
-            attrs_for(is_fuse),
+            LOCAL_ATTRS,
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
             gio::Cancellable::NONE,
         ) else {
             continue;
         };
-        let parent = std::path::Path::new(&path)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        entries.push((parent, FileInfoData::from_file_info(&info)));
-        if entries.len() >= limit {
+        slots.push(Some((parent, FileInfoData::from_file_info(&info))));
+    }
+    drop(tx);
+
+    // One short wait for all of them together.
+    let deadline = Instant::now() + std::time::Duration::from_millis(300);
+    while asked > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok((index, found)) = rx.recv_timeout(left) else {
             break;
+        };
+        asked -= 1;
+        match found {
+            Some(data) => {
+                if let Some(slot) = slots[index].as_mut() {
+                    slot.1 = data;
+                }
+            }
+            // Gone from the mount: not recent any more.
+            None => slots[index] = None,
         }
     }
+
+    let entries: Vec<(String, FileInfoData)> = slots.into_iter().flatten().take(limit).collect();
     Ok(Listing {
         path: "recent:///".to_string(),
         real_path: "recent:///".to_string(),
         is_fuse: false,
         entries,
     })
+}
+
+/// An entry for `path` from its name alone.
+fn name_only(path: &std::path::Path) -> FileInfoData {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let (content_type, _) = gio::content_type_guess(Some(path), None);
+    FileInfoData {
+        display_name: name.clone(),
+        is_hidden: name.starts_with('.'),
+        name,
+        is_directory: false,
+        size: 0,
+        modified: 0,
+        modified_display: String::new(),
+        content_type: content_type.to_string(),
+    }
+}
+
+/// Mounts with Recent Files questions unanswered, and how many.
+static BUSY_MOUNTS: std::sync::Mutex<std::collections::BTreeMap<String, u32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// A question being asked of a mount, while alive.
+struct MountProbe(String);
+
+impl MountProbe {
+    fn start(mount: &str) -> Self {
+        *BUSY_MOUNTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(mount.to_string())
+            .or_default() += 1;
+        Self(mount.to_string())
+    }
+}
+
+impl Drop for MountProbe {
+    fn drop(&mut self) {
+        let mut busy = BUSY_MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = busy.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                busy.remove(&self.0);
+            }
+        }
+    }
 }
 
 /// Run `job` on its own thread.

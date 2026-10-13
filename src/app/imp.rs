@@ -7,7 +7,11 @@ use crate::window::WayfinderWindow;
 use wayfinder::file_object::FileObject;
 
 #[derive(Default)]
-pub struct WayfinderApplicationInner;
+pub struct WayfinderApplicationInner {
+    /// The last session has been reopened (only ever at the first start:
+    /// launching again while running just opens a window).
+    restored: std::cell::Cell<bool>,
+}
 
 #[glib::object_subclass]
 impl ObjectSubclass for WayfinderApplicationInner {
@@ -45,7 +49,8 @@ impl ApplicationImpl for WayfinderApplicationInner {
         // Open every window of the last session again (unless that's
         // turned off in the sidebar's menu).
         let session = wayfinder::state::load_window_session();
-        if wayfinder::state::load_reopen_windows() && session.len() > 1 {
+        let first_start = !self.restored.replace(true);
+        if first_start && wayfinder::state::load_reopen_windows() && session.len() > 1 {
             wayfinder::state::clear_window_session();
             for dir in &session {
                 let window = WayfinderWindow::new(app.upcast_ref());
