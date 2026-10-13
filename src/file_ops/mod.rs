@@ -31,7 +31,30 @@ pub fn trash_or_delete(file: &gio::File) -> Result<TrashResult, glib::Error> {
     }
 }
 
+/// Delete `file`, and if it's a folder, everything in it — but never go
+/// into a drive mounted inside it (a whole remote, perhaps). Checked on
+/// the real path, so a folder reached through a link counts too.
 pub fn delete_file_recursive(file: &gio::File) -> Result<(), glib::Error> {
+    refuse_mounts_inside(file)?;
+    delete_tree(file)
+}
+
+/// An error if a filesystem is mounted inside `file` (a folder).
+fn refuse_mounts_inside(file: &gio::File) -> Result<(), glib::Error> {
+    let Some(path) = file.path() else {
+        return Ok(());
+    };
+    let real = std::fs::canonicalize(&path).unwrap_or(path);
+    match crate::rclone_ops::mountpoints_inside(&real.to_string_lossy()).first() {
+        Some(mount) => Err(glib::Error::new(
+            gio::IOErrorEnum::Busy,
+            &format!("{mount} is mounted inside it; unmount it first"),
+        )),
+        None => Ok(()),
+    }
+}
+
+fn delete_tree(file: &gio::File) -> Result<(), glib::Error> {
     let file_type = file.query_file_type(
         gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
         gio::Cancellable::NONE,
@@ -44,7 +67,7 @@ pub fn delete_file_recursive(file: &gio::File) -> Result<(), glib::Error> {
         )?;
         while let Some(info) = enumerator.next_file(gio::Cancellable::NONE)? {
             let child = file.child(info.name());
-            delete_file_recursive(&child)?;
+            delete_tree(&child)?;
         }
     }
     file.delete(gio::Cancellable::NONE)?;
@@ -379,7 +402,37 @@ pub fn copy_with_progress(
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce() + 'static>>,
 ) {
-    transfer_with_progress(source, dest_dir, parent_window, on_complete, false);
+    transfer_with_progress(
+        source,
+        dest_dir,
+        parent_window,
+        ignore_outcome(on_complete),
+        false,
+    );
+}
+
+/// Like `copy_with_progress`; `on_done` is told whether the copy was made
+/// (not skipped, cancelled or failed).
+pub fn copy_with_outcome(
+    source: &gio::File,
+    dest_dir: &gio::File,
+    parent_window: &gtk::Window,
+    on_done: impl FnOnce(bool) + 'static,
+) {
+    transfer_with_progress(
+        source,
+        dest_dir,
+        parent_window,
+        Some(Box::new(on_done)),
+        false,
+    );
+}
+
+/// Called with whether a copy or move was made.
+type TransferDone = Box<dyn FnOnce(bool) + 'static>;
+
+fn ignore_outcome(on_complete: Option<Box<dyn FnOnce() + 'static>>) -> Option<TransferDone> {
+    on_complete.map(|cb| Box::new(move |_| cb()) as TransferDone)
 }
 
 /// Move with a progress dialog.
@@ -390,26 +443,32 @@ pub fn move_with_progress(
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce() + 'static>>,
 ) {
-    transfer_with_progress(source, dest_dir, parent_window, on_complete, true);
+    transfer_with_progress(
+        source,
+        dest_dir,
+        parent_window,
+        ignore_outcome(on_complete),
+        true,
+    );
 }
 
 fn transfer_with_progress(
     source: &gio::File,
     dest_dir: &gio::File,
     parent_window: &gtk::Window,
-    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+    on_complete: Option<TransferDone>,
     is_move: bool,
 ) {
     let Some(name) = source.basename() else {
         if let Some(cb) = on_complete {
-            cb();
+            cb(false);
         }
         return;
     };
     let dest = dest_dir.child(&name);
     let Some(dest_path_buf) = dest_dir.path() else {
         if let Some(cb) = on_complete {
-            cb();
+            cb(false);
         }
         return;
     };
@@ -430,7 +489,7 @@ fn transfer_with_progress(
         if let Some(msg) = refusal {
             parent_window.announce(&msg, AccessibleAnnouncementPriority::High);
             if let Some(cb) = on_complete {
-                cb();
+                cb(false);
             }
             return;
         }
@@ -459,7 +518,7 @@ fn transfer_with_progress(
                             parent_for_choice
                                 .announce("Skipped", AccessibleAnnouncementPriority::Medium);
                             if let Some(cb) = on_complete {
-                                cb();
+                                cb(false);
                             }
                         }
                         ConflictChoice::Replace
@@ -474,7 +533,7 @@ fn transfer_with_progress(
                                 AccessibleAnnouncementPriority::High,
                             );
                             if let Some(cb) = on_complete {
-                                cb();
+                                cb(false);
                             }
                         }
                         ConflictChoice::Replace => {
@@ -555,8 +614,43 @@ pub fn placement(source: &std::path::Path, dest: &std::path::Path) -> Placement 
     }
 }
 
+/// Why copying or moving `src` to `dst` must not go ahead, judged on the
+/// real paths (links resolved): into itself, or replacing itself or the
+/// folder that holds it (which would delete it first).
+fn real_placement_refusal(src: &str, dst: &str, is_move: bool, replace: bool) -> Option<String> {
+    let real_src = std::fs::canonicalize(src).ok()?;
+    let dst = std::path::Path::new(dst);
+    let real_dst = std::fs::canonicalize(dst).ok().or_else(|| {
+        Some(
+            std::fs::canonicalize(dst.parent()?)
+                .ok()?
+                .join(dst.file_name()?),
+        )
+    })?;
+    match placement(&real_src, &real_dst) {
+        Placement::IntoItself => Some(format!(
+            "it can't be {} into itself",
+            if is_move { "moved" } else { "copied" }
+        )),
+        Placement::Same | Placement::OverItsParent if replace => {
+            Some("it can't replace itself".to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Recursively delete a directory using a cancellable (for cross-device move fallback).
 fn delete_recursive_gio(
+    file: &gio::File,
+    cancellable: &gio::Cancellable,
+) -> Result<(), glib::Error> {
+    // Replacing a folder, or a move's source after copying: never into a
+    // drive mounted inside it.
+    refuse_mounts_inside(file)?;
+    delete_tree_cancellable(file, cancellable)
+}
+
+fn delete_tree_cancellable(
     file: &gio::File,
     cancellable: &gio::Cancellable,
 ) -> Result<(), glib::Error> {
@@ -572,7 +666,7 @@ fn delete_recursive_gio(
         )?;
         while let Some(info) = enumerator.next_file(Some(cancellable))? {
             let child = file.child(info.name());
-            delete_recursive_gio(&child, cancellable)?;
+            delete_tree_cancellable(&child, cancellable)?;
         }
     }
     file.delete(Some(cancellable))?;
@@ -596,6 +690,9 @@ fn copy_directory_recursive(
         );
         if dest_type == gio::FileType::Directory {
             delete_recursive_gio(dest, cancellable)?;
+        } else if dest_type == gio::FileType::SymbolicLink {
+            // Replace the link itself, not what's in the folder it leads to.
+            dest.delete(Some(cancellable))?;
         }
     }
 
@@ -694,7 +791,7 @@ struct ProgressOp {
 fn run_with_progress(
     op: ProgressOp,
     parent_window: &gtk::Window,
-    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+    on_complete: Option<TransferDone>,
 ) {
     let ProgressOp {
         source,
@@ -815,7 +912,7 @@ fn run_with_progress(
     let Some(source_path_buf) = source.path() else {
         dlg.close();
         if let Some(cb) = on_complete {
-            cb();
+            cb(false);
         }
         return;
     };
@@ -823,7 +920,7 @@ fn run_with_progress(
     let Some(dest_path_buf) = dest.path() else {
         dlg.close();
         if let Some(cb) = on_complete {
-            cb();
+            cb(false);
         }
         return;
     };
@@ -846,7 +943,13 @@ fn run_with_progress(
             gio::FileCopyFlags::NONE
         };
 
-        let result = if is_move {
+        // Checked before on the paths as shown; again here on real paths,
+        // as a folder reached through a link is the same folder.
+        let refusal = real_placement_refusal(&source_path, &dest_path_str, is_move, replace);
+
+        let result = if let Some(msg) = refusal {
+            Err(glib::Error::new(gio::IOErrorEnum::InvalidArgument, &msg))
+        } else if is_move {
             let move_result = src.move_(
                 &dst,
                 flags,
@@ -922,14 +1025,14 @@ fn run_with_progress(
                         AccessibleAnnouncementPriority::Medium,
                     );
                     if let Some(cb) = on_complete.borrow_mut().take() {
-                        cb();
+                        cb(true);
                     }
                 }
                 Err((true, _)) => {
                     parent_window
                         .announce("Transfer cancelled", AccessibleAnnouncementPriority::Medium);
                     if let Some(cb) = on_complete.borrow_mut().take() {
-                        cb();
+                        cb(false);
                     }
                 }
                 Err((false, e)) => {
@@ -938,7 +1041,7 @@ fn run_with_progress(
                         AccessibleAnnouncementPriority::High,
                     );
                     if let Some(cb) = on_complete.borrow_mut().take() {
-                        cb();
+                        cb(false);
                     }
                 }
             }
@@ -1087,6 +1190,22 @@ mod tests {
     }
 
     /// Path components, not text: /u/ab isn't inside /u/a.
+    /// The same folder reached through a link is still itself.
+    #[test]
+    fn replacing_itself_through_a_link_is_refused() {
+        let d = std::env::temp_dir().join(format!("wayfinder-self-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("data/Docs/Photos")).unwrap();
+        std::os::unix::fs::symlink(d.join("data/Docs"), d.join("Docs")).unwrap();
+        let src = d.join("data/Docs/Photos").to_string_lossy().to_string();
+        let dst = d.join("Docs/Photos").to_string_lossy().to_string();
+        assert!(super::real_placement_refusal(&src, &dst, false, true).is_some());
+        assert!(super::real_placement_refusal(&src, &dst, false, false).is_none());
+        let into = d.join("Docs/Photos/Photos").to_string_lossy().to_string();
+        assert!(super::real_placement_refusal(&src, &into, false, false).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn similar_names_are_elsewhere() {
         assert_eq!(

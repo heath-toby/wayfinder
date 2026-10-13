@@ -273,12 +273,16 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                 move || {
                     if was_pinned {
                         match wayfinder::offline::unpin_path(&p) {
-                            Ok(false) => w.announce(
+                            Ok(wayfinder::offline::Unpinned::Removed) => w.announce(
                                 "Offline copy removed",
                                 gtk::AccessibleAnnouncementPriority::Medium,
                             ),
-                            Ok(true) => w.announce(
+                            Ok(wayfinder::offline::Unpinned::KeptForSync) => w.announce(
                                 "No longer kept offline. The copy stays: it's part of a two-way sync folder",
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            ),
+                            Ok(wayfinder::offline::Unpinned::KeptForPin) => w.announce(
+                                "No longer kept offline. The copy stays, for another item kept offline inside it or around it",
                                 gtk::AccessibleAnnouncementPriority::Medium,
                             ),
                             Err(e) => w.announce(
@@ -303,8 +307,13 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         let parent_window: gtk::Window = w.clone().upcast();
                         let pin_path_str = p.clone();
                         let w_done = w.clone();
-                        let on_complete: Option<Box<dyn FnOnce() + 'static>> =
-                            Some(Box::new(move || {
+                        let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
+                            Some(Box::new(move |downloaded| {
+                                // A cancelled or failed download isn't a pin
+                                // (the progress dialog has said what happened).
+                                if !downloaded {
+                                    return;
+                                }
                                 // Recording the pin stats the original on the mount.
                                 let path = pin_path_str.clone();
                                 w_done.run_blocking(
@@ -354,11 +363,15 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                             }
                             let source = gio::File::for_path(&p);
                             let dest_dir = gio::File::for_path(&cache_parent);
-                            wayfinder::file_ops::copy_with_progress(
+                            wayfinder::file_ops::copy_with_outcome(
                                 &source,
                                 &dest_dir,
                                 &parent_window,
-                                on_complete,
+                                move |downloaded| {
+                                    if let Some(cb) = on_complete {
+                                        cb(downloaded);
+                                    }
+                                },
                             );
                         }
                     }

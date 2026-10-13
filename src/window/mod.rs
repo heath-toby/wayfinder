@@ -65,6 +65,15 @@ impl WayfinderWindow {
     /// Navigate to a path, updating history. If the path doesn't exist,
     /// the nearest existing parent directory is opened instead.
     pub fn navigate_to_path(&self, path: &str) {
+        // A folder in the Bin can't be opened (as a path it isn't one).
+        if path.starts_with("trash:") && path.trim_end_matches('/') != "trash:" {
+            let name = wayfinder::file_model::display_name(path);
+            self.announce(
+                &format!("{name} is in the Bin. Restore it to open it."),
+                AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
         self.imp().nav.borrow_mut().navigate_to(PathBuf::from(path));
         self.open_directory(path, true);
     }
@@ -578,21 +587,40 @@ impl WayfinderWindow {
 
     /// Open a file, checking per-file app association first, then MIME default
     pub fn open_file(&self, file: &FileObject) {
-        // A link (listed as one, not followed): if it leads to a folder, go
-        // into it. Finding out follows it — maybe onto a slow mount — so
-        // not on the main thread.
+        if self.is_in_trash() {
+            self.announce(
+                &format!("{} is in the Bin. Restore it to open it.", file.name()),
+                AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
+        // A link (listed as one, not followed): find where it leads — that
+        // follows it, maybe onto a slow mount, so not on the main thread.
+        // A folder is gone into; a file is opened as the file it is (its
+        // real path tells whether it's on a mount, its name its type).
         if file.mime_type() == "inode/symlink" {
             let path = file.path();
             let target = path.clone();
-            let file = file.clone();
+            let generation = self.imp().model.generation();
             self.run_blocking(
-                &path,
-                move || std::fs::metadata(&target).is_ok_and(|m| m.is_dir()),
-                move |w, is_dir| {
-                    if is_dir {
-                        w.navigate_to_path(&file.path());
-                    } else {
-                        w.open_file_now(&file);
+                &path.clone(),
+                move || {
+                    let real = std::fs::canonicalize(&target).ok()?;
+                    let is_dir = std::fs::metadata(&real).is_ok_and(|m| m.is_dir());
+                    Some((is_dir, real))
+                },
+                move |w, found| {
+                    // Gone elsewhere while the mount answered: leave it.
+                    if w.imp().model.generation() != generation {
+                        return;
+                    }
+                    match found {
+                        Some((true, _)) => w.navigate_to_path(&path),
+                        Some((false, real)) => w.open_file_now(&link_target(&real)),
+                        None => w.announce(
+                            "The link leads nowhere",
+                            AccessibleAnnouncementPriority::High,
+                        ),
                     }
                 },
             );
@@ -782,51 +810,68 @@ impl WayfinderWindow {
     }
 
     pub fn restore_selected(&self) {
-        let Some(file) = self.get_selected_file() else {
+        // Every selected (marked) item, not just the focused one.
+        let files = self.get_selected_files();
+        if files.is_empty() {
             return;
-        };
-        let imp = self.imp();
-        let old_pos = imp.selection.selected();
-
-        // The Bin's own name for it (the shown name may differ: see
-        // FileInfoData::display_name). child() escapes it: `#` or `%41` in
-        // it must stay part of it.
-        let trash_name = file
-            .path()
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        let gio_file = gio::File::for_uri("trash:///").child(trash_name);
-        match wayfinder::file_ops::restore_from_trash(&gio_file) {
-            Ok(dest) => {
-                // Reload the trash listing so the restored item disappears
-                if self.is_in_trash() {
-                    self.load_special_uri("trash:///");
-                    // Focus the item near where the restored one was
-                    let n_items = imp.selection.n_items();
-                    if n_items > 0 {
-                        let new_pos = if old_pos >= n_items {
-                            n_items - 1
-                        } else {
-                            old_pos
-                        };
-                        imp.selection.set_selected(new_pos);
-                        self.restore_focus_to_selected();
-                    }
-                }
-                self.announce(
-                    &format!("Restored {} to {}", file.name(), dest),
-                    AccessibleAnnouncementPriority::Medium,
-                );
-            }
-            Err(e) => {
-                self.announce(
-                    &format!("Failed to restore {}: {}", file.name(), e),
-                    AccessibleAnnouncementPriority::High,
-                );
-            }
         }
+        let uris: Vec<(String, String)> = files.iter().map(|f| (f.name(), f.path())).collect();
+        let old_pos = self.imp().selection.selected();
+        // Restoring moves files back, maybe onto a slow drive: not on the
+        // main thread.
+        self.run_blocking(
+            "trash:///",
+            move || {
+                uris.into_iter()
+                    .map(|(name, uri)| {
+                        let result =
+                            wayfinder::file_ops::restore_from_trash(&gio::File::for_uri(&uri))
+                                .map_err(|e| e.to_string());
+                        (name, result)
+                    })
+                    .collect::<Vec<_>>()
+            },
+            move |w, results| {
+                let restored: Vec<(String, String)> = results
+                    .iter()
+                    .filter_map(|(name, r)| {
+                        r.as_ref().ok().map(|dest| (name.clone(), dest.clone()))
+                    })
+                    .collect();
+                let failed: Vec<(String, String)> = results
+                    .iter()
+                    .filter_map(|(name, r)| r.as_ref().err().map(|e| (name.clone(), e.clone())))
+                    .collect();
+                if let Some((name, e)) = failed.first() {
+                    let msg = if failed.len() == 1 {
+                        format!("Failed to restore {name}: {e}")
+                    } else {
+                        format!("{} items could not be restored", failed.len())
+                    };
+                    w.announce(&msg, AccessibleAnnouncementPriority::High);
+                }
+                if restored.is_empty() {
+                    return;
+                }
+                w.imp().file_selection.borrow_mut().clear();
+                // Reload the trash listing so the restored items disappear
+                if w.is_in_trash() {
+                    // Then focus the item now where the (first) restored one was.
+                    let win = w.clone();
+                    w.imp().model.refresh(move |listed| {
+                        win.update_status();
+                        if listed {
+                            win.select_near_removed(old_pos.saturating_add(1));
+                        }
+                    });
+                }
+                let msg = match restored.as_slice() {
+                    [(name, dest)] => format!("Restored {name} to {dest}"),
+                    _ => format!("Restored {} items", restored.len()),
+                };
+                w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+            },
+        );
     }
 
     pub fn empty_trash(&self) {
@@ -1012,7 +1057,7 @@ impl WayfinderWindow {
     }
 
     fn paste_from(&self, clipboard: Option<ClipboardState>, source: PasteSource) {
-        if self.refuse_in_offline_view() {
+        if self.refuse_in_offline_view() || self.refuse_in_special_location("pasted") {
             return;
         }
         let imp = self.imp();
@@ -1141,12 +1186,22 @@ impl WayfinderWindow {
             }
 
             // rclone overwrites (or merges into) whatever is in the way
-            // without asking. If anything is, go the per-file way, which
-            // asks Skip, Replace or Rename.
+            // without asking — including another of the files pasted, if
+            // two have one name — and leaves out links, saying nothing.
+            // If any of that applies, go the per-file way, which asks Skip,
+            // Replace or Rename, and copies links.
             let landing = landing_paths(&plan.source_paths, &plan.dest_dir);
+            let sources = plan.source_paths.clone();
             self.run_blocking(
                 &plan.dest_dir.clone(),
-                move || landing.iter().any(|p| std::path::Path::new(p).exists()),
+                move || {
+                    landing.iter().any(|p| std::path::Path::new(p).exists())
+                        || has_duplicate(&landing)
+                        || sources.iter().any(|p| {
+                            !wayfinder::rclone_ops::is_fuse_path(p)
+                                && holds_link(std::path::Path::new(p))
+                        })
+                },
                 move |w, clash| {
                     if clash {
                         w.paste_with_gio(plan, guard);
@@ -1228,6 +1283,11 @@ impl WayfinderWindow {
 
     pub fn trash_selected(&self) {
         if self.refuse_in_offline_view() {
+            return;
+        }
+        // In the Bin, Delete means delete for good (after asking).
+        if self.is_in_trash() {
+            self.delete_selected();
             return;
         }
         // Pressing Delete again while a slow mount is still answering would
@@ -1495,6 +1555,21 @@ impl WayfinderWindow {
         });
     }
 
+    /// In the Bin or Recent Files, which aren't folders, say that files
+    /// can't be `what` (pasted, created…) here and return true.
+    fn refuse_in_special_location(&self, what: &str) -> bool {
+        let location = self.imp().model.current_path();
+        if !location.contains("://") {
+            return false;
+        }
+        let place = wayfinder::file_model::display_name(&location);
+        self.announce(
+            &format!("Files can't be {what} in {place}"),
+            AccessibleAnnouncementPriority::Medium,
+        );
+        true
+    }
+
     /// In the offline copy (mount unreachable), say that files can't be
     /// changed and return true: the change would land on the copy, not the
     /// drive the location bar names.
@@ -1607,6 +1682,43 @@ impl WayfinderWindow {
             gio::Cancellable::NONE,
             move |result| {
                 if let Ok(choice) = result {
+                    if choice == 1 && window.is_in_trash() {
+                        // Items in the Bin are deleted through the Bin itself
+                        // (their paths are trash:/// URIs).
+                        let uris: Vec<(String, String)> = file_paths.clone();
+                        window.run_blocking(
+                            "trash:///",
+                            move || {
+                                uris.iter()
+                                    .map(|(name, uri)| {
+                                        gio::File::for_uri(uri)
+                                            .delete(gio::Cancellable::NONE)
+                                            .map_err(|e| format!("{name}: {e}"))
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                            move |w, results| {
+                                let failed: Vec<&String> =
+                                    results.iter().filter_map(|r| r.as_ref().err()).collect();
+                                let deleted = results.len() - failed.len();
+                                if let Some(e) = failed.first() {
+                                    w.announce(
+                                        &format!("Could not delete: {e}"),
+                                        AccessibleAnnouncementPriority::High,
+                                    );
+                                }
+                                if deleted > 0 {
+                                    w.reload_after_removal(from, move |w, _| {
+                                        w.announce(
+                                            &format!("Deleted {deleted} from the Bin"),
+                                            AccessibleAnnouncementPriority::Medium,
+                                        );
+                                    });
+                                }
+                            },
+                        );
+                        return;
+                    }
                     if choice == 1 {
                         // If every path lives on an rclone FUSE mount, dispatch
                         // direct to rclone — much faster, real progress, proper
@@ -1713,6 +1825,13 @@ impl WayfinderWindow {
         if self.refuse_in_offline_view() {
             return;
         }
+        if self.is_in_trash() {
+            self.announce(
+                "Items in the Bin can't be renamed. Restore it first.",
+                AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
         let Some(file) = self.get_selected_file() else {
             return;
         };
@@ -1776,6 +1895,14 @@ impl WayfinderWindow {
             let new_name = entry_clone.text().to_string();
             if new_name.is_empty() || new_name == file.name() {
                 d.close();
+                return;
+            }
+            // A name, not a path: `/` or `..` would move it elsewhere.
+            if !is_plain_name(&new_name) {
+                w.announce(
+                    "A name can't contain / or be . or ..",
+                    AccessibleAnnouncementPriority::High,
+                );
                 return;
             }
 
@@ -1888,7 +2015,7 @@ impl WayfinderWindow {
     }
 
     pub fn batch_rename(&self) {
-        if self.refuse_in_offline_view() {
+        if self.refuse_in_offline_view() || self.refuse_in_special_location("renamed") {
             return;
         }
         let files = self.get_selected_files();
@@ -2058,6 +2185,13 @@ impl WayfinderWindow {
                 if new_name == *name {
                     continue;
                 }
+                if !is_plain_name(&new_name) {
+                    w.announce(
+                        &format!("Not renamed: {new_name} isn't a plain name (no / or ..)"),
+                        AccessibleAnnouncementPriority::High,
+                    );
+                    return;
+                }
                 let old_path = &file_paths[i];
                 let new_path = std::path::Path::new(old_path)
                     .parent()
@@ -2203,7 +2337,7 @@ impl WayfinderWindow {
     }
 
     pub fn handle_drop(&self, uri_str: &str) {
-        if self.refuse_in_offline_view() {
+        if self.refuse_in_offline_view() || self.refuse_in_special_location("dropped") {
             return;
         }
         let imp = self.imp();
@@ -2244,7 +2378,7 @@ impl WayfinderWindow {
     }
 
     pub fn create_new_folder(&self) {
-        if self.refuse_in_offline_view() {
+        if self.refuse_in_offline_view() || self.refuse_in_special_location("created") {
             return;
         }
         let window = self.clone();
@@ -2366,86 +2500,55 @@ impl WayfinderWindow {
             self.announce("Nothing to undo", AccessibleAnnouncementPriority::Medium);
             return;
         }
-
-        let trash = gio::File::for_uri("trash:///");
-        let mut restored = 0;
-        for path in &paths {
-            let name = std::path::Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            // Find the item in trash by original path — the most recently
-            // trashed, if an older copy from the same place is there too.
-            let mut newest: Option<(String, std::path::PathBuf)> = None;
-            if let Ok(enumerator) = trash.enumerate_children(
-                "standard::name,trash::orig-path,trash::deletion-date",
-                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                gio::Cancellable::NONE,
-            ) {
-                while let Ok(Some(info)) = enumerator.next_file(gio::Cancellable::NONE) {
-                    let orig = info
-                        .attribute_byte_string("trash::orig-path")
-                        .map(|p| p.to_string())
-                        .unwrap_or_default();
-                    if orig != *path {
-                        continue;
-                    }
-                    // ISO 8601 local time: later sorts after.
-                    let date = info
-                        .attribute_string("trash::deletion-date")
-                        .map(|d| d.to_string())
-                        .unwrap_or_default();
-                    if newest.as_ref().is_none_or(|(d, _)| date > *d) {
-                        newest = Some((date, info.name()));
-                    }
-                }
-            }
-            if let Some((_, trashed_name)) = newest {
-                match wayfinder::file_ops::restore_from_trash(&trash.child(trashed_name)) {
-                    Ok(_) => restored += 1,
-                    Err(e) => {
-                        log::error!("Failed to restore {name}: {e}");
-                    }
-                }
-            }
-        }
-
         self.imp().last_trashed.borrow_mut().clear();
 
-        if restored > 0 {
-            // Reload directory to show restored files, and drop the cached
-            // listings of the folders they went back to.
-            let mut folders: Vec<String> = Vec::new();
-            for parent in paths.iter().filter_map(|p| parent_dir(p)) {
-                if !folders.contains(&parent) {
-                    folders.push(parent);
+        // Going through the Bin, and moving files back (maybe onto a slow
+        // drive), isn't for the main thread.
+        let work_paths = paths.clone();
+        self.run_blocking(
+            "trash:///",
+            move || {
+                let trash = gio::File::for_uri("trash:///");
+                work_paths
+                    .iter()
+                    .filter(|path| restore_newest(&trash, path))
+                    .cloned()
+                    .collect::<Vec<String>>()
+            },
+            move |w, restored| {
+                if restored.is_empty() {
+                    w.announce(
+                        "Could not restore files",
+                        AccessibleAnnouncementPriority::High,
+                    );
+                    return;
                 }
-            }
-            self.reload_after_change(&folders);
-
-            if restored == 1 {
-                self.announce(
-                    &format!(
-                        "Restored {}",
-                        std::path::Path::new(&paths[0])
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                    ),
-                    AccessibleAnnouncementPriority::Medium,
-                );
-            } else {
-                self.announce(
-                    &format!("Restored {restored} files"),
-                    AccessibleAnnouncementPriority::Medium,
-                );
-            }
-        } else {
-            self.announce(
-                "Could not restore files",
-                AccessibleAnnouncementPriority::High,
-            );
-        }
+                // Reload, and drop the cached listings of the folders the
+                // files went back to.
+                let mut folders: Vec<String> = Vec::new();
+                for parent in restored.iter().filter_map(|p| parent_dir(p)) {
+                    if !folders.contains(&parent) {
+                        folders.push(parent);
+                    }
+                }
+                w.reload_after_change(&folders);
+                let name = |p: &String| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                };
+                let mut msg = match restored.as_slice() {
+                    [one] => format!("Restored {}", name(one)),
+                    _ => format!("Restored {} files", restored.len()),
+                };
+                let missed = paths.len() - restored.len();
+                if missed > 0 {
+                    msg.push_str(&format!(", {missed} could not be restored"));
+                }
+                w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+            },
+        );
     }
 
     pub fn open_terminal_here(&self) {
@@ -2748,18 +2851,18 @@ impl WayfinderWindow {
     /// Adjust zoom level by `delta` percent (e.g. +10 or -10).
     /// Passing 0 just re-applies the current level (used by reset).
     pub fn apply_zoom(&self, delta: i32) {
-        let imp = self.imp();
-        let new_level = (imp.zoom_level.get() + delta).clamp(50, 300);
-        imp.zoom_level.set(new_level);
+        let level = ZOOM.with(|(_, level)| level.get());
+        self.set_zoom(level + delta);
+    }
 
-        let pt = new_level as f64 / 100.0 * 10.0;
-        imp.zoom_css
-            .load_from_string(&format!("* {{ font-size: {pt}pt; }}"));
-
-        wayfinder::state::save_zoom_level(new_level);
-
+    /// Set the zoom (in percent) for every window: its CSS applies to the
+    /// whole display. 100% is the theme's own size.
+    pub fn set_zoom(&self, level: i32) {
+        let level = level.clamp(50, 300);
+        apply_zoom_css(level);
+        wayfinder::state::save_zoom_level(level);
         self.announce(
-            &format!("Zoom {new_level}%"),
+            &format!("Zoom {level}%"),
             AccessibleAnnouncementPriority::Medium,
         );
     }
@@ -2943,6 +3046,105 @@ fn run_rclone_direct_delete(
     wayfinder::rclone_ops::delete_with_progress(rclone_items, &parent, on_complete);
 }
 
+thread_local! {
+    /// The zoom CSS, shared by every window, and its level in percent.
+    static ZOOM: (gtk::CssProvider, std::cell::Cell<i32>) =
+        (gtk::CssProvider::new(), std::cell::Cell::new(100));
+}
+
+/// Set up zoom once, for the display `window` is on, at the saved level.
+fn init_zoom(window: &WayfinderWindow) {
+    static ADDED: std::sync::Once = std::sync::Once::new();
+    ADDED.call_once(|| {
+        ZOOM.with(|(provider, _)| {
+            gtk::style_context_add_provider_for_display(
+                &WidgetExt::display(window),
+                provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        });
+        apply_zoom_css(wayfinder::state::load_zoom_level().clamp(50, 300));
+    });
+}
+
+fn apply_zoom_css(level: i32) {
+    ZOOM.with(|(provider, current)| {
+        current.set(level);
+        if level == 100 {
+            provider.load_from_string("");
+        } else {
+            let pt = level as f64 / 100.0 * 10.0;
+            provider.load_from_string(&format!("* {{ font-size: {pt}pt; }}"));
+        }
+    });
+}
+
+/// Restore the most recently trashed item that came from `path` (an older
+/// one from the same place may be in the Bin too). Whether it was.
+fn restore_newest(trash: &gio::File, path: &str) -> bool {
+    let Ok(enumerator) = trash.enumerate_children(
+        "standard::name,trash::orig-path,trash::deletion-date",
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        gio::Cancellable::NONE,
+    ) else {
+        return false;
+    };
+    let mut newest: Option<(String, std::path::PathBuf)> = None;
+    while let Ok(Some(info)) = enumerator.next_file(gio::Cancellable::NONE) {
+        let orig = info
+            .attribute_byte_string("trash::orig-path")
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        if orig != path {
+            continue;
+        }
+        // ISO 8601 local time: later sorts after.
+        let date = info
+            .attribute_string("trash::deletion-date")
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        if newest.as_ref().is_none_or(|(d, _)| date > *d) {
+            newest = Some((date, info.name()));
+        }
+    }
+    let Some((_, name)) = newest else {
+        return false;
+    };
+    match wayfinder::file_ops::restore_from_trash(&trash.child(name)) {
+        Ok(_) => true,
+        Err(e) => {
+            log::error!("Failed to restore {path}: {e}");
+            false
+        }
+    }
+}
+
+/// A file object for the file at `real` (a link's target), its type
+/// guessed from its name: enough to open it.
+fn link_target(real: &std::path::Path) -> FileObject {
+    let name = real
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let (content_type, _) = gio::content_type_guess(Some(real), None);
+    let parent = real
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    FileObject::from_data(
+        &parent,
+        &wayfinder::file_object::FileInfoData {
+            name: name.clone(),
+            display_name: name,
+            is_directory: false,
+            size: 0,
+            modified: 0,
+            modified_display: String::new(),
+            content_type: content_type.to_string(),
+        },
+    )
+}
+
 /// The local paths in dropped text: a `text/uri-list` (one URI per line,
 /// `#` lines are comments) or a plain path. URIs are decoded, so
 /// `file:///home/u/My%20Report.pdf` gives `/home/u/My Report.pdf`.
@@ -2962,6 +3164,33 @@ fn dropped_paths(text: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Whether `name` is a plain file name: not empty, `.` or `..`, and
+/// without `/`.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
+
+/// Whether any path appears twice.
+fn has_duplicate(paths: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    paths.iter().any(|p| !seen.insert(p))
+}
+
+/// Whether `path` is a link, or a folder with one somewhere inside.
+/// (Not following links; local paths only.)
+fn holds_link(path: &std::path::Path) -> bool {
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    meta.is_dir()
+        && std::fs::read_dir(path)
+            .map(|entries| entries.flatten().any(|e| holds_link(&e.path())))
+            .unwrap_or(false)
 }
 
 /// Where `sources` land when copied or moved into `dest_dir`.
@@ -3028,8 +3257,38 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dropped_paths, duplicate_target, landing_paths, position_near_removed, rename_clash,
+        dropped_paths, duplicate_target, has_duplicate, holds_link, landing_paths,
+        position_near_removed, rename_clash,
     };
+
+    #[test]
+    fn names_must_be_plain() {
+        use super::is_plain_name;
+        assert!(is_plain_name("report.pdf"));
+        assert!(is_plain_name("..hidden"));
+        assert!(!is_plain_name("Q1/report.pdf"));
+        assert!(!is_plain_name(".."));
+        assert!(!is_plain_name(""));
+    }
+
+    #[test]
+    fn pasting_two_files_of_one_name_is_noticed() {
+        let landing = vec!["/d/report.pdf".to_string(), "/d/report.pdf".to_string()];
+        assert!(has_duplicate(&landing));
+        assert!(!has_duplicate(&landing[..1]));
+    }
+
+    #[test]
+    fn links_inside_folders_are_found() {
+        let d = std::env::temp_dir().join(format!("wayfinder-holds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("plain/sub")).unwrap();
+        std::fs::create_dir_all(d.join("linked/sub")).unwrap();
+        std::os::unix::fs::symlink("../..", d.join("linked/sub/up")).unwrap();
+        assert!(!holds_link(&d.join("plain")));
+        assert!(holds_link(&d.join("linked")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn renaming_onto_another_file_clashes() {

@@ -151,6 +151,14 @@ fn parse_rclone_mount(
         + tokens[rclone_idx + 1..]
             .iter()
             .position(|t| *t == "mount")?;
+    // A mount with its own config: its remote names mean something else
+    // to an rclone run with the default one, so don't go to it directly.
+    if tokens
+        .iter()
+        .any(|t| *t == "--config" || t.starts_with("--config="))
+    {
+        return None;
+    }
     let args = &tokens[mount_idx + 1..];
     let mount_pos = args
         .iter()
@@ -177,7 +185,8 @@ fn parse_rclone_mount(
     let remote = candidates
         .iter()
         .rev()
-        .find(|i| is_configured(i))
+        .find(|&&i| is_configured(&i) && !after_flag(i))
+        .or_else(|| candidates.iter().rev().find(|i| is_configured(i)))
         .or_else(|| candidates.iter().rev().find(|&&i| !after_flag(i)))
         .or_else(|| candidates.last())
         .map(|&i| before[i])?;
@@ -588,10 +597,11 @@ fn run_serial(
 ///
 /// The caller should have already verified `rclone_for_path(local_path)` is
 /// `Some` and `rclone_available()` is true.
+/// `on_complete` is told whether the download completed.
 pub fn pin_with_progress(
     local_path: &str,
     parent_window: &gtk::Window,
-    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(bool) + 'static>>,
 ) {
     let Some(target) = rclone_for_path(local_path) else {
         parent_window.announce(
@@ -599,7 +609,7 @@ pub fn pin_with_progress(
             gtk::AccessibleAnnouncementPriority::High,
         );
         if let Some(cb) = on_complete {
-            cb();
+            cb(false);
         }
         return;
     };
@@ -611,7 +621,7 @@ pub fn pin_with_progress(
             gtk::AccessibleAnnouncementPriority::High,
         );
         if let Some(cb) = on_complete {
-            cb();
+            cb(false);
         }
         return;
     };
@@ -621,7 +631,7 @@ pub fn pin_with_progress(
             gtk::AccessibleAnnouncementPriority::High,
         );
         if let Some(cb) = on_complete {
-            cb();
+            cb(false);
         }
         return;
     }
@@ -648,7 +658,7 @@ pub fn pin_with_progress(
         parent_window,
         labels,
         summarise_copy_line,
-        ignore_outcome(on_complete),
+        on_complete,
         move |tx, _cancel| {
             if let Err(e) = run_streaming(&args, tx.clone()) {
                 let _ = tx.send(RcloneEvent::Finished(Err(e)));
@@ -1089,6 +1099,20 @@ mod mount_parse_tests {
             parse_rclone_mount(line, &mounts(), &[]),
             Some(("/home/u/proton".into(), "Proton:".into()))
         );
+    }
+
+    /// `--backup-dir Proton:Old` names a configured remote too, but as a
+    /// flag's value; and a mount with its own config isn't ours to run.
+    #[test]
+    fn remote_flag_values_and_own_configs() {
+        let remotes = vec!["Proton:".to_string()];
+        let line = "rclone mount Proton:Docs --backup-dir Proton:Old /home/u/proton";
+        assert_eq!(
+            parse_rclone_mount(line, &mounts(), &remotes),
+            Some(("/home/u/proton".into(), "Proton:Docs".into()))
+        );
+        let line = "rclone --config work.conf mount Proton: /home/u/proton";
+        assert_eq!(parse_rclone_mount(line, &mounts(), &remotes), None);
     }
 
     #[test]

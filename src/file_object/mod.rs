@@ -72,7 +72,14 @@ impl FileObject {
     /// Build a FileObject from pre-extracted plain data (safe to call on the
     /// main thread after the data was gathered in a background thread).
     pub fn from_data(parent_path: &str, data: &FileInfoData) -> Self {
-        let path = if parent_path == "/" {
+        let path = if parent_path.contains("://") {
+            // In the Bin (trash:///): a URI, with the name escaped in it.
+            use gio::prelude::FileExt;
+            gio::File::for_uri(parent_path)
+                .child(&data.name)
+                .uri()
+                .to_string()
+        } else if parent_path == "/" {
             format!("/{}", data.name)
         } else {
             format!("{parent_path}/{}", data.name)

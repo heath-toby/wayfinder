@@ -88,8 +88,6 @@ pub struct WayfinderWindowInner {
     /// Remembers the last-selected filename per directory so that
     /// navigating back into a folder restores the previous selection.
     pub last_position: RefCell<std::collections::HashMap<String, String>>,
-    pub zoom_level: Cell<i32>,
-    pub zoom_css: gtk::CssProvider,
     pub breadcrumb_box: gtk::Box,
     pub breadcrumb_scroll: gtk::ScrolledWindow,
     pub breadcrumb_toggle: gtk::ToggleButton,
@@ -219,8 +217,6 @@ impl Default for WayfinderWindowInner {
             last_trashed: RefCell::new(Vec::new()),
             trashing: RefCell::new(std::collections::HashSet::new()),
             last_position: RefCell::new(std::collections::HashMap::new()),
-            zoom_level: Cell::new(100),
-            zoom_css: gtk::CssProvider::new(),
             breadcrumb_box: gtk::Box::new(gtk::Orientation::Horizontal, 0),
             breadcrumb_scroll: gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -357,21 +353,9 @@ impl ObjectImpl for WayfinderWindowInner {
         // Register keyboard shortcuts
         crate::shortcuts::register_shortcuts(&window);
 
-        // Register zoom CSS provider
-        gtk::style_context_add_provider_for_display(
-            &gtk::prelude::WidgetExt::display(&*window),
-            &self.zoom_css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-        // Restore saved zoom level
-        let saved_zoom = wayfinder::state::load_zoom_level();
-        self.zoom_level.set(saved_zoom);
-        if saved_zoom != 100 {
-            self.zoom_css.load_from_string(&format!(
-                "* {{ font-size: {}pt; }}",
-                saved_zoom as f64 / 100.0 * 10.0,
-            ));
-        }
+        // Zoom: one setting for the whole display (CSS applies to every
+        // window), set up by the first window.
+        super::init_zoom(&window);
 
         // Connect list view activation (Enter / double-click)
         self.connect_activation();
@@ -857,8 +841,7 @@ impl WayfinderWindowInner {
         let w = window.clone();
         let action = gio::SimpleAction::new("zoom-reset", None);
         action.connect_activate(move |_, _| {
-            w.imp().zoom_level.set(100);
-            w.apply_zoom(0);
+            w.set_zoom(100);
         });
         window.add_action(&action);
     }
@@ -1434,9 +1417,15 @@ impl WayfinderWindowInner {
         self.search_entry.connect_search_changed(move |entry| {
             let text = entry.text().to_string();
             let imp = window.imp();
+            // Cleared already (on leaving a folder): nothing to announce —
+            // the count would be the old folder's.
+            let was_active = imp.model.search.is_active();
             imp.model.search.set_query(&text);
             window.update_status();
 
+            if text.is_empty() && !was_active {
+                return;
+            }
             if text.is_empty() {
                 let count = imp.model.item_count();
                 window.announce(

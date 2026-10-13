@@ -218,26 +218,42 @@ fn check_downloaded(src_meta: &std::fs::Metadata, cached: &Path) -> Result<(), S
 }
 
 /// Unpin a path: remove from manifest and delete its cached copy.
-/// Returns whether the offline copy was kept because it's part of a
-/// two-way sync folder.
-pub fn unpin_path(original_path: &str) -> Result<bool, String> {
+/// What became of an offline copy when it was unpinned.
+#[derive(Debug, PartialEq)]
+pub enum Unpinned {
+    /// Deleted.
+    Removed,
+    /// Kept: it's part of a two-way sync folder.
+    KeptForSync,
+    /// Kept: another pinned item is inside it, or holds it.
+    KeptForPin,
+}
+
+pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
     let mut manifest = load_manifest();
     if manifest.remove(original_path).is_none() {
-        return Ok(false); // wasn't pinned
+        return Ok(Unpinned::Removed); // wasn't pinned
     }
     save_manifest(&manifest)?;
     let cached = cache_path_for(original_path);
     if in_sync_folder(&cached) {
         // The copy is also two-way sync's local side: deleting it would
         // make the next sync delete the files on the remote too.
-        return Ok(true);
+        return Ok(Unpinned::KeptForSync);
+    }
+    if manifest
+        .keys()
+        .any(|other| paths_overlap(Path::new(other), Path::new(original_path)))
+    {
+        // Another pin's copy is in this one (or holds it): keep it.
+        return Ok(Unpinned::KeptForPin);
     }
     if cached.is_dir() {
         let _ = std::fs::remove_dir_all(&cached);
     } else if cached.is_file() {
         let _ = std::fs::remove_file(&cached);
     }
-    Ok(false)
+    Ok(Unpinned::Removed)
 }
 
 /// Whether the offline copy at `cached` overlaps a two-way sync folder's
