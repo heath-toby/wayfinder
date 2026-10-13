@@ -985,6 +985,34 @@ impl WayfinderWindow {
         // panics in the progress callback or worker.
         let guard = PastingGuard::new(self.clone());
 
+        // rclone doesn't refuse these: a folder into itself, or a move to
+        // where it already is.
+        if use_rclone {
+            use wayfinder::file_ops::{placement, Placement};
+            let is_move = state.operation == ClipboardOperation::Cut;
+            for (src, dest) in source_paths
+                .iter()
+                .zip(landing_paths(&source_paths, &dest_dir_str))
+            {
+                let name = std::path::Path::new(src)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let msg = match placement(std::path::Path::new(src), std::path::Path::new(&dest)) {
+                    Placement::IntoItself => Some(format!(
+                        "Cannot {} {name} into itself",
+                        if is_move { "move" } else { "copy" }
+                    )),
+                    Placement::Same if is_move => Some(format!("{name} is already here")),
+                    _ => None,
+                };
+                if let Some(msg) = msg {
+                    self.announce(&msg, AccessibleAnnouncementPriority::High);
+                    return;
+                }
+            }
+        }
+
         if use_rclone {
             let w = self.clone();
             let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {

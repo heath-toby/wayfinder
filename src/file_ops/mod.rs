@@ -295,10 +295,7 @@ pub fn delete_with_progress(
                     let msg = if ok {
                         format!("Deleted {basename}")
                     } else {
-                        format!(
-                            "Failed: {basename}: {}",
-                            error.unwrap_or_default()
-                        )
+                        format!("Failed: {basename}: {}", error.unwrap_or_default())
                     };
                     status_clone.set_text(&msg);
                 }
@@ -424,6 +421,26 @@ fn transfer_with_progress(
     let dest_path = dest_path_buf.to_string_lossy().to_string();
     let display_name = name.to_string_lossy().to_string();
 
+    // A folder can't go inside itself, and moving something to where it
+    // already is does nothing.
+    if let (Some(src), Some(dst)) = (source.path(), dest.path()) {
+        let refusal = match placement(&src, &dst) {
+            Placement::IntoItself => Some(format!(
+                "Cannot {} {display_name} into itself",
+                if is_move { "move" } else { "copy" }
+            )),
+            Placement::Same if is_move => Some(format!("{display_name} is already here")),
+            _ => None,
+        };
+        if let Some(msg) = refusal {
+            parent_window.announce(&msg, AccessibleAnnouncementPriority::High);
+            if let Some(cb) = on_complete {
+                cb();
+            }
+            return;
+        }
+    }
+
     // Checking for a clash touches the destination, which may be on a slow
     // mount, so it happens off the main thread.
     let source = source.clone();
@@ -444,6 +461,21 @@ fn transfer_with_progress(
                         ConflictChoice::Skip => {
                             parent_for_choice
                                 .announce("Skipped", AccessibleAnnouncementPriority::Medium);
+                            if let Some(cb) = on_complete {
+                                cb();
+                            }
+                        }
+                        ConflictChoice::Replace
+                            if source.path().zip(dest.path()).is_some_and(|(s, d)| {
+                                placement(&s, &d) != Placement::Elsewhere
+                            }) =>
+                        {
+                            // Replacing would delete the source itself (or
+                            // the folder holding it) before copying it.
+                            parent_for_choice.announce(
+                                &format!("Cannot replace {display_name} with itself"),
+                                AccessibleAnnouncementPriority::High,
+                            );
                             if let Some(cb) = on_complete {
                                 cb();
                             }
@@ -495,6 +527,31 @@ fn transfer_with_progress(
         },
         || {},
     );
+}
+
+/// Where a copy or move would put something, relative to itself.
+#[derive(Debug, PartialEq)]
+pub enum Placement {
+    /// Onto itself (pasted into the folder it's in).
+    Same,
+    /// Inside itself: a folder into one of its own subfolders.
+    IntoItself,
+    /// Onto a folder that holds it, which replacing would delete.
+    OverItsParent,
+    Elsewhere,
+}
+
+/// Where `dest` is relative to `source` (by path; no filesystem access).
+pub fn placement(source: &std::path::Path, dest: &std::path::Path) -> Placement {
+    if dest == source {
+        Placement::Same
+    } else if dest.starts_with(source) {
+        Placement::IntoItself
+    } else if source.starts_with(dest) {
+        Placement::OverItsParent
+    } else {
+        Placement::Elsewhere
+    }
 }
 
 /// Recursively delete a directory using a cancellable (for cross-device move fallback).
@@ -942,4 +999,52 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
     }
 
     dest.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{placement, Placement};
+    use std::path::Path;
+
+    #[test]
+    fn pasting_into_its_own_folder_is_onto_itself() {
+        assert_eq!(
+            placement(Path::new("/x/Photos"), Path::new("/x/Photos")),
+            Placement::Same
+        );
+    }
+
+    #[test]
+    fn a_folder_into_its_subfolder_is_into_itself() {
+        assert_eq!(
+            placement(Path::new("/u/a"), Path::new("/u/a/a")),
+            Placement::IntoItself
+        );
+        assert_eq!(
+            placement(Path::new("/u/a"), Path::new("/u/a/b/a")),
+            Placement::IntoItself
+        );
+    }
+
+    /// Cutting /x/a/a into /x clashes with /x/a, which holds the source.
+    #[test]
+    fn replacing_the_folder_that_holds_it() {
+        assert_eq!(
+            placement(Path::new("/x/a/a"), Path::new("/x/a")),
+            Placement::OverItsParent
+        );
+    }
+
+    /// Path components, not text: /u/ab isn't inside /u/a.
+    #[test]
+    fn similar_names_are_elsewhere() {
+        assert_eq!(
+            placement(Path::new("/u/a"), Path::new("/u/ab/a")),
+            Placement::Elsewhere
+        );
+        assert_eq!(
+            placement(Path::new("/u/a"), Path::new("/v/a")),
+            Placement::Elsewhere
+        );
+    }
 }
