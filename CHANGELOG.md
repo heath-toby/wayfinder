@@ -11,7 +11,7 @@
 - **Suspend during an offline refresh** — a download stopped for sleep is fetched again after resume, and the rest of the pinned folder carries on, instead of the refresh stopping there or falling back to copying through the mount. A download that had already finished is kept.
 - **Waiting messages** — opening the Bin or Recent Files slowly now says "Waiting for the Bin to open" rather than "trash:"; other locations (such as a folder in the Bin, or `network:`) are named properly too.
 - **Permanent delete in a local folder** — focus now lands on the file above the deleted one, rather than on the deleted file itself just before it vanished from the list.
-- **Deleted files reappearing** — files moved to the Bin or deleted on a mount while you'd gone to another folder no longer show up again, from the recently-seen list, when you go back.
+- **Deleted files reappearing** — files moved to the Bin or deleted on a mount while you'd gone to another folder no longer show up again, from the recently-seen list, when you go back. The same goes for files pasted, moved, renamed or created there: you see them as they are now, not under their old names.
 - **Status bar after a failed refresh** — the item count is brought up to date again, as before 2.5.0.
 - **`~` with an unusual home setting** — Tab completion of `~/…` works when `$HOME` ends in `/`.
 

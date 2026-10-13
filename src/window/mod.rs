@@ -385,6 +385,21 @@ impl WayfinderWindow {
         self.imp().model.refresh(move |_| w.update_status());
     }
 
+    /// After files changed in `folders` (pasted into, moved out of, renamed
+    /// in): reload the current folder, and drop the cached listing of any
+    /// other one, so the user isn't shown it out of date if they went
+    /// elsewhere while a slow mount answered.
+    pub fn reload_after_change(&self, folders: &[String]) {
+        let model = &self.imp().model;
+        let current = model.current_path();
+        for folder in folders {
+            if *folder != current {
+                model.forget_cached(folder);
+            }
+        }
+        self.reload_current();
+    }
+
     /// Run filesystem `work` that may touch a slow mount (`path` says
     /// which) off the main thread, then `done` with the result. If it takes
     /// a moment, says what it's waiting for — in the status bar and aloud.
@@ -934,6 +949,19 @@ impl WayfinderWindow {
             && wayfinder::rclone_ops::rclone_available()
             && !source_paths.is_empty();
 
+        // The folders this paste changes: the destination, and for a move
+        // the folders the files leave.
+        let mut changed = vec![dest_dir_str.clone()];
+        if state.operation == ClipboardOperation::Cut {
+            for p in &source_paths {
+                if let Some(parent) = parent_dir(p) {
+                    if !changed.contains(&parent) {
+                        changed.push(parent);
+                    }
+                }
+            }
+        }
+
         // Guard is set immediately and cleared via Drop, so it survives
         // panics in the progress callback or worker.
         let guard = PastingGuard::new(self.clone());
@@ -943,7 +971,7 @@ impl WayfinderWindow {
             let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
                 // Move guard into the closure so it drops here on success.
                 let _g = guard;
-                w.reload_current();
+                w.reload_after_change(&changed);
             }));
             match state.operation {
                 ClipboardOperation::Copy => {
@@ -971,9 +999,10 @@ impl WayfinderWindow {
             for source in &state.files {
                 let w = self.clone();
                 let guard_held = shared_guard.clone();
+                let changed = changed.clone();
                 let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
                     let _g = guard_held;
-                    w.reload_current();
+                    w.reload_after_change(&changed);
                 }));
                 match state.operation {
                     ClipboardOperation::Copy => {
@@ -1472,8 +1501,9 @@ impl WayfinderWindow {
                     .map(|p| p.join(&new_name).to_string_lossy().to_string())
                     .unwrap_or_else(|| new_name.clone());
                 let w_done = w.clone();
+                let changed: Vec<String> = parent_dir(&file_path).into_iter().collect();
                 let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                    w_done.reload_current();
+                    w_done.reload_after_change(&changed);
                 }));
                 wayfinder::rclone_ops::rename_with_progress(
                     file_path.clone(),
@@ -1487,6 +1517,7 @@ impl WayfinderWindow {
 
             d.close();
             let path = file_path.clone();
+            let changed: Vec<String> = parent_dir(&file_path).into_iter().collect();
             w.run_blocking(
                 &file_path,
                 move || {
@@ -1494,14 +1525,14 @@ impl WayfinderWindow {
                         .map(|_| new_name)
                         .map_err(|e| e.to_string())
                 },
-                |w, result| match result {
+                move |w, result| match result {
                     Ok(new_name) => {
                         w.announce(
                             &format!("Renamed to {new_name}"),
                             AccessibleAnnouncementPriority::Medium,
                         );
                         // Reload directory as fallback in case file monitor doesn't catch the rename
-                        w.reload_current();
+                        w.reload_after_change(&changed);
                     }
                     Err(e) => {
                         w.announce(
@@ -1741,8 +1772,9 @@ impl WayfinderWindow {
                 let parent: gtk::Window = w.clone().upcast();
                 let w_done = w.clone();
                 let pair_count = pairs.len();
+                let changed = vec![w.imp().model.current_path()];
                 let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                    w_done.reload_current();
+                    w_done.reload_after_change(&changed);
                     w_done.announce(
                         &format!("Renamed {pair_count} files"),
                         AccessibleAnnouncementPriority::Medium,
@@ -1755,6 +1787,7 @@ impl WayfinderWindow {
 
             d.close();
             let current = w.imp().model.current_path();
+            let changed = vec![current.clone()];
             w.run_blocking(
                 &current,
                 move || {
@@ -1776,7 +1809,7 @@ impl WayfinderWindow {
                     }
                     (renamed, errors)
                 },
-                |w, (renamed, errors)| {
+                move |w, (renamed, errors)| {
                     let msg = if errors > 0 {
                         format!("Renamed {renamed} files, {errors} errors")
                     } else {
@@ -1785,7 +1818,7 @@ impl WayfinderWindow {
                     w.announce(&msg, AccessibleAnnouncementPriority::Medium);
 
                     // Reload directory
-                    w.reload_current();
+                    w.reload_after_change(&changed);
                 },
             );
         });
@@ -1835,9 +1868,10 @@ impl WayfinderWindow {
         let dest_dir_str = imp.model.current_path();
         let parent_window: gtk::Window = self.clone().upcast();
         let w = self.clone();
+        let changed = vec![dest_dir_str.clone()];
         let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
             let _g = guard;
-            w.reload_current();
+            w.reload_after_change(&changed);
         }));
 
         let src_rclone = wayfinder::rclone_ops::rclone_for_path(&path).is_some();
@@ -1912,6 +1946,7 @@ impl WayfinderWindow {
             d.close();
             let current = w.imp().model.current_path();
             let parent = current.clone();
+            let changed = vec![current.clone()];
             w.run_blocking(
                 &current,
                 move || {
@@ -1919,14 +1954,14 @@ impl WayfinderWindow {
                         .map(|_| name)
                         .map_err(|e| e.to_string())
                 },
-                |w, result| match result {
+                move |w, result| match result {
                     Ok(name) => {
                         w.announce(
                             &format!("Created folder {name}"),
                             AccessibleAnnouncementPriority::Medium,
                         );
                         // Reload directory as fallback in case file monitor doesn't catch the new folder
-                        w.reload_current();
+                        w.reload_after_change(&changed);
                     }
                     Err(e) => {
                         w.announce(
@@ -2495,6 +2530,13 @@ fn run_rclone_direct_delete(
         // the user cancelled.
     }));
     wayfinder::rclone_ops::delete_with_progress(rclone_items, &parent, on_complete);
+}
+
+/// The folder holding `path`.
+fn parent_dir(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// Where to put the selection after removing the item at `old_pos`, with
