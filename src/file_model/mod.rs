@@ -363,13 +363,13 @@ impl DirectoryModel {
             Apply::Diff => self.apply_diff(&listing),
         }
 
-        if listing.path.starts_with('/') {
+        if listing.path.starts_with('/') && !listing.is_fuse {
+            // FUSE folders get neither: a monitor's path lookup would touch
+            // the mount on this thread (the window refreshes them when it
+            // regains focus instead), and sizes would mean walking the
+            // remote, so they keep showing a dash.
             self.setup_monitor(&gio::File::for_path(&listing.path));
-            if !listing.is_fuse {
-                // Folder sizes for local folders; FUSE ones would mean
-                // walking the remote, so they keep showing a dash.
-                self.calculate_folder_sizes();
-            }
+            self.calculate_folder_sizes();
         }
         on_done(Ok(self.store.n_items()));
     }
@@ -516,47 +516,7 @@ impl DirectoryModel {
         });
     }
 
-    /// Spawn a background thread that runs `query_info` with a 5-second
-    /// timeout, extracts plain data, then posts the result back via a
-    /// channel.  A short main-thread timer polls the channel and calls
-    /// `on_result` when data arrives.
-    fn query_info_async(
-        file_path_str: String,
-        on_result: impl FnOnce(crate::file_object::FileInfoData) + 'static,
-    ) {
-        use crate::file_object::FileInfoData;
-        let (tx, rx) = std::sync::mpsc::channel::<Option<FileInfoData>>();
-        std::thread::spawn(move || {
-            let f = gio::File::for_path(&file_path_str);
-            let cancel = gio::Cancellable::new();
-            let cancel_timer = cancel.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                cancel_timer.cancel();
-            });
-            let result = f.query_info(
-                loader::attrs_for(true),
-                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                Some(&cancel),
-            );
-            let _ = tx.send(result.ok().map(|info| FileInfoData::from_file_info(&info)));
-        });
-        let on_result = std::cell::RefCell::new(Some(on_result));
-        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-            match rx.try_recv() {
-                Ok(Some(data)) => {
-                    if let Some(cb) = on_result.borrow_mut().take() {
-                        cb(data);
-                    }
-                    glib::ControlFlow::Break
-                }
-                Ok(None) => glib::ControlFlow::Break,
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(_) => glib::ControlFlow::Break,
-            }
-        });
-    }
-
+    /// Watch a local directory for changes. (Not used on FUSE mounts.)
     fn setup_monitor(&self, dir: &gio::File) {
         // Drop old monitor
         *self.monitor.borrow_mut() = None;
@@ -566,7 +526,6 @@ impl DirectoryModel {
                 let store = self.store.clone();
                 let current_path = self.current_path.clone();
                 let sorter = self.sorter.clone();
-                let on_fuse = self.is_fuse.get();
 
                 mon.connect_changed(move |_mon, file, _other, event| {
                     let path = current_path.borrow().clone();
@@ -594,20 +553,7 @@ impl DirectoryModel {
                         gio::FileMonitorEvent::Created
                             if find_index(&store, &changed_name).is_none() =>
                         {
-                            if on_fuse {
-                                let file_path_str = file
-                                    .path()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                let path = path.clone();
-                                let store = store.clone();
-                                let sorter = sorter.clone();
-                                Self::query_info_async(file_path_str, move |data| {
-                                    let file_obj = FileObject::from_data(&path, &data);
-                                    store.append(&file_obj);
-                                    sorter.changed(gtk::SorterChange::Different);
-                                });
-                            } else if let Ok(info) = file.query_info(
+                            if let Ok(info) = file.query_info(
                                 "standard::*,time::modified",
                                 gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
                                 gio::Cancellable::NONE,
@@ -624,44 +570,17 @@ impl DirectoryModel {
                         }
                         gio::FileMonitorEvent::AttributeChanged
                         | gio::FileMonitorEvent::ChangesDoneHint => {
-                            if on_fuse {
-                                if find_index(&store, &changed_name).is_some() {
-                                    let file_path_str = file
-                                        .path()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    let changed_name = changed_name.clone();
-                                    let path = path.clone();
-                                    let store = store.clone();
-                                    let sorter = sorter.clone();
-                                    Self::query_info_async(file_path_str, move |data| {
-                                        let new_obj = FileObject::from_data(&path, &data);
-                                        let idx = (0..store.n_items()).find(|&i| {
-                                            store
-                                                .item(i)
-                                                .and_then(|item| {
-                                                    item.downcast_ref::<FileObject>()
-                                                        .map(|fo| fo.name() == changed_name)
-                                                })
-                                                .unwrap_or(false)
-                                        });
-                                        if let Some(idx) = idx {
-                                            store.remove(idx);
-                                            store.append(&new_obj);
-                                            sorter.changed(gtk::SorterChange::Different);
-                                        }
-                                    });
-                                }
-                            } else if let Some(idx) = find_index(&store, &changed_name) {
+                            if let Some(idx) = find_index(&store, &changed_name) {
                                 if let Ok(info) = file.query_info(
                                     "standard::*,time::modified",
                                     gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
                                     gio::Cancellable::NONE,
                                 ) {
+                                    // Update in place, keeping the selection on it.
                                     let new_obj = FileObject::from_file_info(&path, &info);
-                                    store.remove(idx);
-                                    store.append(&new_obj);
-                                    sorter.changed(gtk::SorterChange::Different);
+                                    if let Some(fo) = store.item(idx).and_downcast::<FileObject>() {
+                                        fo.update_from(&new_obj);
+                                    }
                                 }
                             }
                         }

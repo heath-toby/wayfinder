@@ -27,6 +27,11 @@ impl WayfinderListView {
     }
 
     pub fn grab_focus_at_selected(&self, selected_pos: u32) {
+        // scroll_to(FOCUS) only moves focus to a row widget that already
+        // exists; straight after a load, or before the window is laid out,
+        // it doesn't, and focus would stay wherever it was (e.g. the
+        // sidebar). Focusing the list first makes sure it ends up here.
+        self.imp().column_view.grab_focus();
         self.imp().column_view.scroll_to(
             selected_pos,
             None::<&gtk::ColumnViewColumn>,

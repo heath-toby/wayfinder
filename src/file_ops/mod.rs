@@ -363,16 +363,23 @@ fn show_conflict_dialog(
 
     let dest = dest.clone();
     dialog.choose(Some(parent_window), gio::Cancellable::NONE, move |result| {
-        let choice = match result {
-            Ok(2) => ConflictChoice::Replace,
-            Ok(1) => ConflictChoice::Rename(get_unique_dest(&dest)),
-            _ => ConflictChoice::Skip,
-        };
-        callback(choice);
+        match result {
+            Ok(2) => callback(ConflictChoice::Replace),
+            Ok(1) => {
+                // Finding a free name probes the destination, which may be
+                // on a slow mount.
+                crate::background::run(
+                    move || get_unique_dest(&dest),
+                    move |renamed| callback(ConflictChoice::Rename(renamed)),
+                    || {},
+                );
+            }
+            _ => callback(ConflictChoice::Skip),
+        }
     });
 }
 
-/// Copy or move with a progress dialog.
+/// Copy with a progress dialog.
 /// `on_complete` is called on the main thread after a successful operation.
 pub fn copy_with_progress(
     source: &gio::File,
@@ -380,89 +387,26 @@ pub fn copy_with_progress(
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce() + 'static>>,
 ) {
-    let Some(name) = source.basename() else {
-        if let Some(cb) = on_complete {
-            cb();
-        }
-        return;
-    };
-    let dest = dest_dir.child(&name);
-    let Some(dest_path_buf) = dest_dir.path() else {
-        if let Some(cb) = on_complete {
-            cb();
-        }
-        return;
-    };
-    let dest_path = dest_path_buf.to_string_lossy().to_string();
-    let display_name = name.to_string_lossy().to_string();
-
-    if dest.query_exists(gio::Cancellable::NONE) {
-        let source = source.clone();
-        let parent = parent_window.clone();
-        let dialog_name = display_name.clone();
-        let dialog_dest = dest.clone();
-        show_conflict_dialog(
-            &dialog_name,
-            &dialog_dest,
-            parent_window,
-            move |choice| match choice {
-                ConflictChoice::Skip => {
-                    parent.announce("Skipped", AccessibleAnnouncementPriority::Medium);
-                    if let Some(cb) = on_complete {
-                        cb();
-                    }
-                }
-                ConflictChoice::Replace => {
-                    run_with_progress(
-                        ProgressOp {
-                            source,
-                            dest,
-                            display_name,
-                            dest_path,
-                            is_move: false,
-                            replace: true,
-                        },
-                        &parent,
-                        on_complete,
-                    );
-                }
-                ConflictChoice::Rename(renamed) => {
-                    run_with_progress(
-                        ProgressOp {
-                            source,
-                            dest: renamed,
-                            display_name,
-                            dest_path,
-                            is_move: false,
-                            replace: false,
-                        },
-                        &parent,
-                        on_complete,
-                    );
-                }
-            },
-        );
-    } else {
-        run_with_progress(
-            ProgressOp {
-                source: source.clone(),
-                dest,
-                display_name,
-                dest_path,
-                is_move: false,
-                replace: false,
-            },
-            parent_window,
-            on_complete,
-        );
-    }
+    transfer_with_progress(source, dest_dir, parent_window, on_complete, false);
 }
 
+/// Move with a progress dialog.
+/// `on_complete` is called on the main thread after a successful operation.
 pub fn move_with_progress(
     source: &gio::File,
     dest_dir: &gio::File,
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce() + 'static>>,
+) {
+    transfer_with_progress(source, dest_dir, parent_window, on_complete, true);
+}
+
+fn transfer_with_progress(
+    source: &gio::File,
+    dest_dir: &gio::File,
+    parent_window: &gtk::Window,
+    on_complete: Option<Box<dyn FnOnce() + 'static>>,
+    is_move: bool,
 ) {
     let Some(name) = source.basename() else {
         if let Some(cb) = on_complete {
@@ -480,66 +424,77 @@ pub fn move_with_progress(
     let dest_path = dest_path_buf.to_string_lossy().to_string();
     let display_name = name.to_string_lossy().to_string();
 
-    if dest.query_exists(gio::Cancellable::NONE) {
-        let source = source.clone();
-        let parent = parent_window.clone();
-        let dialog_name = display_name.clone();
-        let dialog_dest = dest.clone();
-        show_conflict_dialog(
-            &dialog_name,
-            &dialog_dest,
-            parent_window,
-            move |choice| match choice {
-                ConflictChoice::Skip => {
-                    parent.announce("Skipped", AccessibleAnnouncementPriority::Medium);
-                    if let Some(cb) = on_complete {
-                        cb();
-                    }
-                }
-                ConflictChoice::Replace => {
-                    run_with_progress(
-                        ProgressOp {
-                            source,
-                            dest,
-                            display_name,
-                            dest_path,
-                            is_move: true,
-                            replace: true,
-                        },
-                        &parent,
-                        on_complete,
-                    );
-                }
-                ConflictChoice::Rename(renamed) => {
-                    run_with_progress(
-                        ProgressOp {
-                            source,
-                            dest: renamed,
-                            display_name,
-                            dest_path,
-                            is_move: true,
-                            replace: false,
-                        },
-                        &parent,
-                        on_complete,
-                    );
-                }
-            },
-        );
-    } else {
-        run_with_progress(
-            ProgressOp {
-                source: source.clone(),
-                dest,
-                display_name,
-                dest_path,
-                is_move: true,
-                replace: false,
-            },
-            parent_window,
-            on_complete,
-        );
-    }
+    // Checking for a clash touches the destination, which may be on a slow
+    // mount, so it happens off the main thread.
+    let source = source.clone();
+    let parent = parent_window.clone();
+    let dest_for_check = dest.clone();
+    crate::background::run(
+        move || dest_for_check.query_exists(gio::Cancellable::NONE),
+        move |exists| {
+            if exists {
+                let dialog_name = display_name.clone();
+                let dialog_dest = dest.clone();
+                let parent_for_choice = parent.clone();
+                show_conflict_dialog(
+                    &dialog_name,
+                    &dialog_dest,
+                    &parent,
+                    move |choice| match choice {
+                        ConflictChoice::Skip => {
+                            parent_for_choice
+                                .announce("Skipped", AccessibleAnnouncementPriority::Medium);
+                            if let Some(cb) = on_complete {
+                                cb();
+                            }
+                        }
+                        ConflictChoice::Replace => {
+                            run_with_progress(
+                                ProgressOp {
+                                    source,
+                                    dest,
+                                    display_name,
+                                    dest_path,
+                                    is_move,
+                                    replace: true,
+                                },
+                                &parent_for_choice,
+                                on_complete,
+                            );
+                        }
+                        ConflictChoice::Rename(renamed) => {
+                            run_with_progress(
+                                ProgressOp {
+                                    source,
+                                    dest: renamed,
+                                    display_name,
+                                    dest_path,
+                                    is_move,
+                                    replace: false,
+                                },
+                                &parent_for_choice,
+                                on_complete,
+                            );
+                        }
+                    },
+                );
+            } else {
+                run_with_progress(
+                    ProgressOp {
+                        source,
+                        dest,
+                        display_name,
+                        dest_path,
+                        is_move,
+                        replace: false,
+                    },
+                    &parent,
+                    on_complete,
+                );
+            }
+        },
+        || {},
+    );
 }
 
 /// Recursively delete a directory using a cancellable (for cross-device move fallback).

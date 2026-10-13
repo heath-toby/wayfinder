@@ -283,16 +283,22 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         let w_done = w.clone();
                         let on_complete: Option<Box<dyn FnOnce() + 'static>> =
                             Some(Box::new(move || {
-                                match wayfinder::offline::record_pin(&pin_path_str) {
-                                    Ok(()) => w_done.announce(
-                                        "Available offline",
-                                        gtk::AccessibleAnnouncementPriority::Medium,
-                                    ),
-                                    Err(e) => w_done.announce(
-                                        &format!("Pin recorded with warning: {e}"),
-                                        gtk::AccessibleAnnouncementPriority::High,
-                                    ),
-                                }
+                                // Recording the pin stats the original on the mount.
+                                let path = pin_path_str.clone();
+                                w_done.run_blocking(
+                                    &pin_path_str,
+                                    move || wayfinder::offline::record_pin(&path),
+                                    |w, result| match result {
+                                        Ok(()) => w.announce(
+                                            "Available offline",
+                                            gtk::AccessibleAnnouncementPriority::Medium,
+                                        ),
+                                        Err(e) => w.announce(
+                                            &format!("Pin recorded with warning: {e}"),
+                                            gtk::AccessibleAnnouncementPriority::High,
+                                        ),
+                                    },
+                                );
                             }));
 
                         // Prefer rclone-direct copy when the source lives on

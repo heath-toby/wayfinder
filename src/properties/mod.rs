@@ -7,24 +7,66 @@ use gtk::AccessibleAnnouncementPriority;
 
 use wayfinder::file_object::FileObject;
 
-pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
-    let gio_file = gio::File::for_path(file.path());
+/// What the dialog shows from the filesystem, gathered off the main thread
+/// (the file may be on a slow mount).
+struct Details {
+    modified: String,
+    created: Option<std::time::SystemTime>,
+    accessed: Option<std::time::SystemTime>,
+    /// `None` if the file's metadata couldn't be read; the permissions
+    /// section is left out then.
+    mode: Option<u32>,
+}
 
-    let info = match gio_file.query_info(
-        "standard::*,time::modified",
-        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-        gio::Cancellable::NONE,
-    ) {
-        Ok(info) => info,
-        Err(e) => {
-            parent.announce(
+fn gather_details(path: &str) -> Result<Details, String> {
+    let info = gio::File::for_path(path)
+        .query_info(
+            "time::modified",
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
+        .map_err(|e| e.to_string())?;
+    let modified = info
+        .modification_date_time()
+        .map(|dt: glib::DateTime| {
+            dt.format("%Y-%m-%d %H:%M:%S")
+                .unwrap_or_else(|_| glib::GString::from(""))
+                .to_string()
+        })
+        .unwrap_or_else(|| "Unknown".to_string());
+    let metadata = std::fs::metadata(path).ok();
+    Ok(Details {
+        modified,
+        created: metadata.as_ref().and_then(|m| m.created().ok()),
+        accessed: metadata.as_ref().and_then(|m| m.accessed().ok()),
+        mode: metadata.map(|m| m.permissions().mode()),
+    })
+}
+
+pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
+    let path = file.path();
+    let file = file.clone();
+    let parent = parent.clone();
+    let parent_slow = parent.clone();
+    let waiting = wayfinder::background::waiting_message(&path);
+    wayfinder::background::run(
+        move || gather_details(&path),
+        move |details| match details {
+            Ok(details) => build_dialog(&file, &parent, details),
+            Err(e) => parent.announce(
                 &format!("Could not get properties: {e}"),
                 AccessibleAnnouncementPriority::High,
-            );
-            return;
-        }
-    };
+            ),
+        },
+        move || {
+            if let Some(msg) = waiting {
+                parent_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+            }
+        },
+    );
+}
 
+fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
     let dlg = gtk::Window::builder()
         .title(format!("{} — Properties", file.name()))
         .modal(true)
@@ -77,20 +119,12 @@ pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
     row += 1;
 
     // Modified from GIO
-    let modified = info
-        .modification_date_time()
-        .map(|dt: glib::DateTime| {
-            dt.format("%Y-%m-%d %H:%M:%S")
-                .unwrap_or_else(|_| glib::GString::from(""))
-                .to_string()
-        })
-        .unwrap_or_else(|| "Unknown".to_string());
-    add_info_row(&grid, row, "Modified", &modified);
+    add_info_row(&grid, row, "Modified", &details.modified);
     row += 1;
 
     // Created and Accessed from std::fs metadata
-    if let Ok(metadata) = std::fs::metadata(file.path()) {
-        if let Ok(created) = metadata.created() {
+    if let Some(mode) = details.mode {
+        if let Some(created) = details.created {
             let dt: chrono::DateTime<chrono::Local> = created.into();
             add_info_row(
                 &grid,
@@ -101,7 +135,7 @@ pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
             row += 1;
         }
 
-        if let Ok(accessed) = metadata.accessed() {
+        if let Some(accessed) = details.accessed {
             let dt: chrono::DateTime<chrono::Local> = accessed.into();
             add_info_row(
                 &grid,
@@ -112,7 +146,6 @@ pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
             row += 1;
         }
 
-        let mode = metadata.permissions().mode();
         let original_mode = mode;
 
         // --- Permissions section ---
@@ -265,22 +298,34 @@ pub fn show_properties_dialog(file: &FileObject, parent: &gtk::Window) {
             // Preserve file type bits, only change permission bits
             let new_mode = (original_mode & !0o7777) | (new_perm_bits & 0o7777);
             let perms = std::fs::Permissions::from_mode(new_mode);
-            match std::fs::set_permissions(&fp, perms) {
-                Ok(()) => {
-                    parent_ref.announce(
-                        &format!("Permissions changed to {new_perm_bits:o}"),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                }
-                Err(e) => {
-                    let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        "Permission denied. You must be the file owner or root to change permissions.".to_string()
-                    } else {
-                        format!("Failed to change permissions: {e}")
-                    };
-                    parent_ref.announce(&msg, AccessibleAnnouncementPriority::High);
-                }
-            }
+            let path = fp.clone();
+            let parent_done = parent_ref.clone();
+            let parent_slow = parent_ref.clone();
+            let waiting = wayfinder::background::waiting_message(&fp);
+            wayfinder::background::run(
+                move || std::fs::set_permissions(&path, perms),
+                move |result| match result {
+                    Ok(()) => {
+                        parent_done.announce(
+                            &format!("Permissions changed to {new_perm_bits:o}"),
+                            AccessibleAnnouncementPriority::Medium,
+                        );
+                    }
+                    Err(e) => {
+                        let msg = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            "Permission denied. You must be the file owner or root to change permissions.".to_string()
+                        } else {
+                            format!("Failed to change permissions: {e}")
+                        };
+                        parent_done.announce(&msg, AccessibleAnnouncementPriority::High);
+                    }
+                },
+                move || {
+                    if let Some(msg) = waiting {
+                        parent_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                    }
+                },
+            );
         });
         grid.attach(&apply_btn, 0, row, 2, 1);
         row += 1;

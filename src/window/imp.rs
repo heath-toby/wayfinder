@@ -404,6 +404,15 @@ impl ObjectImpl for WayfinderWindowInner {
         let w = window.clone();
         window.connect_is_active_notify(move |win| {
             if win.is_active() {
+                // FUSE folders have no file monitor (setting one up would
+                // touch the mount on this thread, and remote changes never
+                // reach it anyway): check for changes whenever the user
+                // comes back to the window instead.
+                let model = &w.imp().model;
+                if model.is_fuse() && !model.is_loading() {
+                    let w = w.clone();
+                    model.refresh(move || w.update_status());
+                }
                 let win2 = w.clone();
                 glib::idle_add_local_once(move || {
                     win2.restore_focus_to_selected();
@@ -899,17 +908,40 @@ impl WayfinderWindowInner {
                         return glib::Propagation::Proceed;
                     }
 
-                    if let Some(completed) = complete_path(&text) {
-                        let added = &completed[text.len()..];
-                        entry_for_tab.set_text(&completed);
-                        entry_for_tab.set_position(-1);
-                        if !added.is_empty() {
-                            dlg_for_tab.announce(added, AccessibleAnnouncementPriority::Medium);
-                        }
-                    } else if text.contains('/') {
-                        dlg_for_tab
-                            .announce("No completions", AccessibleAnnouncementPriority::Medium);
-                    }
+                    // Completing lists a directory, which may be on a slow
+                    // mount; apply the result only if the text is unchanged.
+                    let entry = entry_for_tab.clone();
+                    let dlg = dlg_for_tab.clone();
+                    let dlg_slow = dlg_for_tab.clone();
+                    let expanded = match (text.strip_prefix('~'), dirs::home_dir()) {
+                        (Some(rest), Some(home)) => format!("{}{rest}", home.to_string_lossy()),
+                        _ => text.clone(),
+                    };
+                    let waiting = wayfinder::background::waiting_message(&expanded);
+                    let typed = text.clone();
+                    wayfinder::background::run(
+                        move || complete_path(&typed),
+                        move |completed| {
+                            if entry.text() != text.as_str() {
+                                return;
+                            }
+                            if let Some(completed) = completed {
+                                let added = &completed[text.len()..];
+                                entry.set_text(&completed);
+                                entry.set_position(-1);
+                                if !added.is_empty() {
+                                    dlg.announce(added, AccessibleAnnouncementPriority::Medium);
+                                }
+                            } else if text.contains('/') {
+                                dlg.announce("No completions", AccessibleAnnouncementPriority::Medium);
+                            }
+                        },
+                        move || {
+                            if let Some(msg) = waiting {
+                                dlg_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                            }
+                        },
+                    );
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed

@@ -414,6 +414,33 @@ impl WayfinderWindow {
         });
     }
 
+    /// Run filesystem `work` that may touch a slow mount (`path` says
+    /// which) off the main thread, then `done` with the result. If it takes
+    /// a moment, says what it's waiting for — in the status bar and aloud.
+    pub fn run_blocking<T: Send + 'static>(
+        &self,
+        path: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+        done: impl FnOnce(&Self, T) + 'static,
+    ) {
+        let w = self.clone();
+        let w_slow = self.clone();
+        let waiting = wayfinder::background::waiting_message(path);
+        wayfinder::background::run(
+            work,
+            move |result| {
+                done(&w, result);
+                w.update_status();
+            },
+            move || {
+                if let Some(msg) = waiting {
+                    w_slow.imp().status_label.set_text(&msg);
+                    w_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                }
+            },
+        );
+    }
+
     pub fn update_status(&self) {
         let imp = self.imp();
         let count = imp.model.item_count();
@@ -1027,18 +1054,39 @@ impl WayfinderWindow {
             return;
         }
         // Remember position before deletion
-        let imp = self.imp();
-        let old_pos = imp.selection.selected();
+        let old_pos = self.imp().selection.selected();
 
+        let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
+        self.run_blocking(
+            &paths[0].clone(),
+            move || {
+                paths
+                    .iter()
+                    .map(|p| {
+                        wayfinder::file_ops::trash_or_delete(&gio::File::for_path(p))
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect::<Vec<_>>()
+            },
+            move |w, results| w.finish_trash(files, old_pos, results),
+        );
+    }
+
+    fn finish_trash(
+        &self,
+        files: Vec<FileObject>,
+        old_pos: u32,
+        results: Vec<Result<wayfinder::file_ops::TrashResult, String>>,
+    ) {
+        let imp = self.imp();
         let mut success = 0;
         let mut failed = 0;
         let mut last_error = String::new();
         let mut needs_perm_delete: Vec<FileObject> = Vec::new();
         let mut trashed_paths: Vec<String> = Vec::new();
 
-        for file in &files {
-            let gio_file = gio::File::for_path(file.path());
-            match wayfinder::file_ops::trash_or_delete(&gio_file) {
+        for (file, result) in files.iter().zip(results) {
+            match result {
                 Ok(wayfinder::file_ops::TrashResult::Trashed) => {
                     success += 1;
                     trashed_paths.push(file.path());
@@ -1143,36 +1191,41 @@ impl WayfinderWindow {
         imp.file_selection.borrow_mut().clear();
         self.update_status();
 
-        // Focus the item above the deleted one (or the new last item)
-        let n_items = imp.selection.n_items();
-        if n_items > 0 {
-            let new_pos = if old_pos > 0 && old_pos >= n_items {
-                n_items - 1
-            } else if old_pos > 0 {
-                old_pos - 1
-            } else {
-                0
-            };
-            imp.selection.set_selected(new_pos);
-            self.restore_focus_to_selected();
-        }
-
-        if failed == 0 {
-            let now_empty = imp.selection.n_items() == 0;
-            let msg = if success == 1 {
-                if now_empty {
-                    format!("Moved {} to Bin, folder is now empty", files[0].name())
+        // Refresh, then focus the item above the deleted one (or the new
+        // last item) and confirm.
+        let first_name = files[0].name();
+        self.reload_current(move |w| {
+            let imp = w.imp();
+            let n_items = imp.selection.n_items();
+            if n_items > 0 {
+                let new_pos = if old_pos > 0 && old_pos >= n_items {
+                    n_items - 1
+                } else if old_pos > 0 {
+                    old_pos - 1
                 } else {
-                    format!("Moved {} to Bin", files[0].name())
-                }
-            } else if now_empty {
-                format!("Moved {success} files to Bin, folder is now empty")
-            } else {
-                format!("Moved {success} files to Bin")
-            };
+                    0
+                };
+                imp.selection.set_selected(new_pos);
+                w.restore_focus_to_selected();
+            }
 
-            self.announce(&msg, AccessibleAnnouncementPriority::Medium);
-        }
+            if failed == 0 && success > 0 {
+                let now_empty = imp.selection.n_items() == 0;
+                let msg = if success == 1 {
+                    if now_empty {
+                        format!("Moved {first_name} to Bin, folder is now empty")
+                    } else {
+                        format!("Moved {first_name} to Bin")
+                    }
+                } else if now_empty {
+                    format!("Moved {success} files to Bin, folder is now empty")
+                } else {
+                    format!("Moved {success} files to Bin")
+                };
+
+                w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+            }
+        });
     }
 
     pub fn delete_selected(&self) {
@@ -1395,24 +1448,32 @@ impl WayfinderWindow {
                 return;
             }
 
-            let gio_file = gio::File::for_path(&file_path);
-            match wayfinder::file_ops::rename_file(&gio_file, &new_name) {
-                Ok(_) => {
-                    w.announce(
-                        &format!("Renamed to {new_name}"),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                    // Reload directory as fallback in case file monitor doesn't catch the rename
-                    w.reload_current(|_| {});
-                }
-                Err(e) => {
-                    w.announce(
-                        &format!("Rename failed: {e}"),
-                        AccessibleAnnouncementPriority::High,
-                    );
-                }
-            }
             d.close();
+            let path = file_path.clone();
+            w.run_blocking(
+                &file_path,
+                move || {
+                    wayfinder::file_ops::rename_file(&gio::File::for_path(&path), &new_name)
+                        .map(|_| new_name)
+                        .map_err(|e| e.to_string())
+                },
+                |w, result| match result {
+                    Ok(new_name) => {
+                        w.announce(
+                            &format!("Renamed to {new_name}"),
+                            AccessibleAnnouncementPriority::Medium,
+                        );
+                        // Reload directory as fallback in case file monitor doesn't catch the rename
+                        w.reload_current(|_| {});
+                    }
+                    Err(e) => {
+                        w.announce(
+                            &format!("Rename failed: {e}"),
+                            AccessibleAnnouncementPriority::High,
+                        );
+                    }
+                },
+            );
         };
 
         let do_rename_clone = do_rename.clone();
@@ -1660,33 +1721,41 @@ impl WayfinderWindow {
                 return;
             }
 
-            let mut renamed = 0u32;
-            let mut errors = 0u32;
-            for (old_path, new_path) in &pairs {
-                let new_name = std::path::Path::new(new_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| new_path.clone());
-                let gio_file = gio::File::for_path(old_path);
-                match wayfinder::file_ops::rename_file(&gio_file, &new_name) {
-                    Ok(_) => renamed += 1,
-                    Err(e) => {
-                        log::error!("Batch rename error: {e}");
-                        errors += 1;
-                    }
-                }
-            }
-            let msg = if errors > 0 {
-                format!("Renamed {renamed} files, {errors} errors")
-            } else {
-                format!("Renamed {renamed} files")
-            };
-            w.announce(&msg, AccessibleAnnouncementPriority::Medium);
-
-            // Reload directory
-            w.reload_current(|_| {});
-
             d.close();
+            let current = w.imp().model.current_path();
+            w.run_blocking(
+                &current,
+                move || {
+                    let mut renamed = 0u32;
+                    let mut errors = 0u32;
+                    for (old_path, new_path) in &pairs {
+                        let new_name = std::path::Path::new(new_path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| new_path.clone());
+                        let gio_file = gio::File::for_path(old_path);
+                        match wayfinder::file_ops::rename_file(&gio_file, &new_name) {
+                            Ok(_) => renamed += 1,
+                            Err(e) => {
+                                log::error!("Batch rename error: {e}");
+                                errors += 1;
+                            }
+                        }
+                    }
+                    (renamed, errors)
+                },
+                |w, (renamed, errors)| {
+                    let msg = if errors > 0 {
+                        format!("Renamed {renamed} files, {errors} errors")
+                    } else {
+                        format!("Renamed {renamed} files")
+                    };
+                    w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+
+                    // Reload directory
+                    w.reload_current(|_| {});
+                },
+            );
         });
 
         let key_ctrl = gtk::EventControllerKey::new();
@@ -1808,24 +1877,33 @@ impl WayfinderWindow {
                 d.close();
                 return;
             }
-            let parent = gio::File::for_path(w.imp().model.current_path());
-            match wayfinder::file_ops::create_folder(&parent, &name) {
-                Ok(_) => {
-                    w.announce(
-                        &format!("Created folder {name}"),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                    // Reload directory as fallback in case file monitor doesn't catch the new folder
-                    w.reload_current(|_| {});
-                }
-                Err(e) => {
-                    w.announce(
-                        &format!("Failed to create folder: {e}"),
-                        AccessibleAnnouncementPriority::High,
-                    );
-                }
-            }
             d.close();
+            let current = w.imp().model.current_path();
+            let parent = current.clone();
+            w.run_blocking(
+                &current,
+                move || {
+                    wayfinder::file_ops::create_folder(&gio::File::for_path(&parent), &name)
+                        .map(|_| name)
+                        .map_err(|e| e.to_string())
+                },
+                |w, result| match result {
+                    Ok(name) => {
+                        w.announce(
+                            &format!("Created folder {name}"),
+                            AccessibleAnnouncementPriority::Medium,
+                        );
+                        // Reload directory as fallback in case file monitor doesn't catch the new folder
+                        w.reload_current(|_| {});
+                    }
+                    Err(e) => {
+                        w.announce(
+                            &format!("Failed to create folder: {e}"),
+                            AccessibleAnnouncementPriority::High,
+                        );
+                    }
+                },
+            );
         };
 
         let do_create_clone = do_create.clone();
