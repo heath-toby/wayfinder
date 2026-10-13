@@ -9,7 +9,11 @@
 - **Selection after Move to Bin or Delete on a slow mount** — if you have gone to another folder by the time the mount answers, your selection there is left alone instead of jumping. "Folder is now empty" is only said when it's true, and "Moved to Bin" is still announced (after the new folder's "Opened" message rather than over it).
 - **Permanent delete after Move to Bin fails** — when a file on a mount can't go to the Bin and you delete it permanently, the selection lands near it instead of at the top of the list, and the selection no longer moves while the "Delete permanently?" question is open.
 - **Suspend during an offline refresh** — a download stopped for sleep is fetched again after resume, and the rest of the pinned folder carries on, instead of the refresh stopping there or falling back to copying through the mount. A download that had already finished is kept.
-- **Waiting messages** — opening the Bin or Recent Files slowly now says "Waiting for the Bin to open" rather than "trash:".
+- **Waiting messages** — opening the Bin or Recent Files slowly now says "Waiting for the Bin to open" rather than "trash:"; other locations (such as a folder in the Bin, or `network:`) are named properly too.
+- **Permanent delete in a local folder** — focus now lands on the file above the deleted one, rather than on the deleted file itself just before it vanished from the list.
+- **Deleted files reappearing** — files moved to the Bin or deleted on a mount while you'd gone to another folder no longer show up again, from the recently-seen list, when you go back.
+- **Status bar after a failed refresh** — the item count is brought up to date again, as before 2.5.0.
+- **`~` with an unusual home setting** — Tab completion of `~/…` works when `$HOME` ends in `/`.
 
 ### Development
 

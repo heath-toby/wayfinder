@@ -28,10 +28,19 @@ pub fn added_text<'a>(typed: &str, completed: &'a str) -> &'a str {
     &completed[start..]
 }
 
+/// The home folder as text, without a trailing `/` (`$HOME` may have one).
+fn home_text(home: &Path) -> String {
+    let home = home.to_string_lossy();
+    match home.trim_end_matches('/') {
+        "" => "/".to_string(),
+        trimmed => trimmed.to_string(),
+    }
+}
+
 fn expand_with(text: &str, home: Option<&Path>) -> String {
     match (text.strip_prefix('~'), home) {
         (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-            format!("{}{rest}", home.to_string_lossy())
+            format!("{}{rest}", home_text(home))
         }
         _ => text.to_string(),
     }
@@ -39,8 +48,8 @@ fn expand_with(text: &str, home: Option<&Path>) -> String {
 
 /// Write `path` with `~` for the home folder, if it's in it.
 fn contract_with(path: &str, home: &Path) -> String {
-    let home = home.to_string_lossy();
-    match path.strip_prefix(home.as_ref()) {
+    let home = home_text(home);
+    match path.strip_prefix(home.as_str()) {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
         _ => path.to_string(),
     }
@@ -166,6 +175,19 @@ mod tests {
         assert_eq!(expand_with("~bob/Music", Some(home)), "~bob/Music");
         assert_eq!(expand_with("/etc", Some(home)), "/etc");
         assert_eq!(expand_with("~/x", None), "~/x");
+    }
+
+    /// `$HOME` with a trailing slash mustn't double it, or a `~/…`
+    /// completion would come back as an absolute path.
+    #[test]
+    fn home_with_trailing_slash() {
+        let home = Path::new("/home/toby/");
+        assert_eq!(expand_with("~/Music", Some(home)), "/home/toby/Music");
+        assert_eq!(contract_with("/home/toby/Music/", home), "~/Music/");
+        let f = Fixture::new("slash", &["Development"], &[]);
+        let home = format!("{}/", f.home().display());
+        let completed = complete_with("~/Dev", Some(Path::new(&home))).unwrap();
+        assert_eq!(completed, "~/Development/");
     }
 
     #[test]

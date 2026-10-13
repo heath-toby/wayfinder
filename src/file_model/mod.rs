@@ -239,11 +239,7 @@ impl DirectoryModel {
             .load(std::sync::atomic::Ordering::SeqCst)
             == 0
         {
-            self.refresh(move |listed| {
-                if listed {
-                    on_done();
-                }
-            });
+            self.refresh(move |_| on_done());
         }
     }
 
@@ -312,6 +308,12 @@ impl DirectoryModel {
                 None => format!("Waiting for {name} to open. Press Alt+Left to go back."),
             });
         });
+    }
+
+    /// Drop the cached listing of `path` (e.g. files were removed from it
+    /// while the user was elsewhere), so it isn't shown out of date.
+    pub fn forget_cached(&self, path: &str) {
+        loader::forget(path);
     }
 
     /// Changes with every navigation; lets callers tell whether the load
@@ -866,11 +868,24 @@ fn unless_superseded(on_done: impl FnOnce(Result<u32, String>) + 'static) -> Loa
 pub fn display_name(location: &str) -> String {
     match location {
         "recent:///" => "Recent Files".to_string(),
-        l if l.starts_with("trash:") => "the Bin".to_string(),
-        l => std::path::Path::new(l)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| l.to_string()),
+        "trash:///" => "the Bin".to_string(),
+        l => match l.split_once("://") {
+            // Another GIO location: its last name, or else its scheme.
+            Some((scheme, rest)) => rest
+                .trim_end_matches('/')
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .map(|name| {
+                    glib::Uri::unescape_string(name, None::<&str>)
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| name.to_string())
+                })
+                .unwrap_or_else(|| scheme.to_string()),
+            None => std::path::Path::new(l)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| l.to_string()),
+        },
     }
 }
 
@@ -889,5 +904,13 @@ mod tests {
     fn special_locations_get_their_names() {
         assert_eq!(display_name("trash:///"), "the Bin");
         assert_eq!(display_name("recent:///"), "Recent Files");
+    }
+
+    #[test]
+    fn other_uris_are_named_by_their_last_part() {
+        assert_eq!(display_name("trash:///Old%20Folder"), "Old Folder");
+        assert_eq!(display_name("smb://server/share/Reports/"), "Reports");
+        assert_eq!(display_name("sftp://server/"), "server");
+        assert_eq!(display_name("network:///"), "network");
     }
 }

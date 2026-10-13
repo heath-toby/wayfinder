@@ -382,11 +382,7 @@ impl WayfinderWindow {
     /// mount the list catches up when rclone answers.
     pub fn reload_current(&self) {
         let w = self.clone();
-        self.imp().model.refresh(move |listed| {
-            if listed {
-                w.update_status();
-            }
-        });
+        self.imp().model.refresh(move |_| w.update_status());
     }
 
     /// Run filesystem `work` that may touch a slow mount (`path` says
@@ -1231,6 +1227,9 @@ impl WayfinderWindow {
     fn reload_after_removal(&self, from: RemovedFrom, after: impl FnOnce(&Self, bool) + 'static) {
         let model = &self.imp().model;
         if model.current_path() != from.folder {
+            // Its cached listing still holds the removed items; don't show
+            // them when the user goes back.
+            model.forget_cached(&from.folder);
             after(self, false);
             return;
         }
@@ -1371,19 +1370,24 @@ impl WayfinderWindow {
                         }
 
                         if success > 0 {
-                            window.imp().file_selection.borrow_mut().clear();
-                            window.update_status();
-
-                            window.select_near_removed(from.old_pos);
-
-                            if failed == 0 {
+                            // Select once the list no longer holds the
+                            // deleted rows, so focus can't land on one.
+                            let first_name = file_paths[0].0.clone();
+                            window.reload_after_removal(from, move |w, relisted| {
+                                if failed > 0 {
+                                    return;
+                                }
                                 let msg = if success == 1 {
-                                    format!("Deleted {}", file_paths[0].0)
+                                    format!("Deleted {first_name}")
                                 } else {
                                     format!("Deleted {success} files")
                                 };
-                                window.announce(&msg, AccessibleAnnouncementPriority::Medium);
-                            }
+                                if relisted {
+                                    w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                                } else {
+                                    w.announce_after_navigation(msg);
+                                }
+                            });
                         }
                     }
                 }
