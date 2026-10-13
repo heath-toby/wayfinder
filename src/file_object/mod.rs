@@ -14,6 +14,9 @@ pub struct FileInfoData {
     /// The name to show. In the Bin, an item trashed from another drive is
     /// named by its encoded trash path; this is its real name.
     pub display_name: String,
+    /// Hidden as GIO sees it: a dot name, a backup (`name~`), or listed in
+    /// the folder's `.hidden` file.
+    pub is_hidden: bool,
     pub is_directory: bool,
     pub size: u64,
     pub modified: i64,
@@ -56,9 +59,12 @@ impl FileInfoData {
         .unwrap_or_default();
 
         let display_name = info.display_name().to_string();
+        let is_hidden = name.starts_with('.')
+            || (info.has_attribute(gio::FILE_ATTRIBUTE_STANDARD_IS_HIDDEN) && info.is_hidden());
         Self {
             name,
             display_name,
+            is_hidden,
             is_directory,
             size,
             modified,
@@ -84,7 +90,7 @@ impl FileObject {
         } else {
             format!("{parent_path}/{}", data.name)
         };
-        let hidden = data.name.starts_with('.');
+        let hidden = data.is_hidden || data.name.starts_with('.');
         // Shown, sorted, searched and read out: the Bin's real names, not
         // its encoded ones. (The path keeps the name GIO knows it by.)
         let name = if parent_path.starts_with("trash:") && !data.display_name.is_empty() {
@@ -163,7 +169,8 @@ impl FileObject {
 
         let file_type = info.file_type();
         let is_directory = file_type == gio::FileType::Directory;
-        let hidden = name.starts_with('.');
+        let hidden = name.starts_with('.')
+            || (info.has_attribute(gio::FILE_ATTRIBUTE_STANDARD_IS_HIDDEN) && info.is_hidden());
 
         let size = if is_directory { 0 } else { info.size() as u64 };
         let size_display = if is_directory {

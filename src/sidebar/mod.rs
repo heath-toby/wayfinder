@@ -1186,7 +1186,9 @@ impl WayfinderSidebar {
                     list_for_keys.select_row(Some(&list_row));
                     // Restore the real label after Orca has read the announcement
                     let row_ref = list_row.clone();
-                    let real_name = row_label(id, *vis);
+                    // Read when it runs: the box may be ticked meanwhile.
+                    let check_now = check.clone();
+                    let id_now = id.clone();
                     let row_to_focus = list_row.clone();
                     glib::idle_add_local_once(move || {
                         row_to_focus.grab_focus();
@@ -1195,7 +1197,7 @@ impl WayfinderSidebar {
                         std::time::Duration::from_millis(500),
                         move || {
                             row_ref.update_property(&[gtk::accessible::Property::Label(
-                                real_name.as_str(),
+                                &row_label(&id_now, check_now.is_active()),
                             )]);
                         },
                     );

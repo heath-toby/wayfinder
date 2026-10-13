@@ -495,11 +495,42 @@ pub fn show_chooser(
         let d = dlg.clone();
         location_entry.connect_activate(move |entry| {
             let path = wayfinder::path_complete::expand_tilde(entry.text().trim());
-            if path.is_empty() {
+            if !path.starts_with('/') {
+                d.announce(
+                    "Type a full path, starting with / or ~",
+                    AccessibleAnnouncementPriority::Medium,
+                );
                 return;
             }
-            nav.borrow_mut().navigate_to(PathBuf::from(&path));
-            load_dir(&model, &path, entry, &sl, &nav, &bb, &fb, &ub, &sel, &d);
+            // Only a folder can be gone to (or saved in); checking may
+            // touch a slow mount, so not on the main thread.
+            let check = path.clone();
+            let (nav, model, entry, sl, bb, fb, ub, sel, d) = (
+                nav.clone(),
+                model.clone(),
+                entry.clone(),
+                sl.clone(),
+                bb.clone(),
+                fb.clone(),
+                ub.clone(),
+                sel.clone(),
+                d.clone(),
+            );
+            wayfinder::background::run(
+                move || std::path::Path::new(&check).is_dir(),
+                move |is_dir| {
+                    if !is_dir {
+                        d.announce(
+                            &format!("Not a folder: {path}"),
+                            AccessibleAnnouncementPriority::High,
+                        );
+                        return;
+                    }
+                    nav.borrow_mut().navigate_to(PathBuf::from(&path));
+                    load_dir(&model, &path, &entry, &sl, &nav, &bb, &fb, &ub, &sel, &d);
+                },
+                || {},
+            );
         });
     }
 

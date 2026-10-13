@@ -65,6 +65,13 @@ impl WayfinderWindow {
     /// Navigate to a path, updating history. If the path doesn't exist,
     /// the nearest existing parent directory is opened instead.
     pub fn navigate_to_path(&self, path: &str) {
+        // `/a/b/` (as Tab completion leaves it) is `/a/b`: otherwise every
+        // item's path would read `/a/b//name`, and remembered places miss.
+        let path = match path.trim_end_matches('/') {
+            "" if path.starts_with('/') => "/",
+            trimmed if !path.contains("://") => trimmed,
+            _ => path,
+        };
         // A folder in the Bin can't be opened (as a path it isn't one).
         if path.starts_with("trash:") && path.trim_end_matches('/') != "trash:" {
             let name = wayfinder::file_model::display_name(path);
@@ -818,6 +825,10 @@ impl WayfinderWindow {
         // Restoring the same items again while they're on their way would
         // only report false failures.
         if self.imp().restoring.replace(true) {
+            self.announce(
+                "Still restoring the items chosen before",
+                AccessibleAnnouncementPriority::Medium,
+            );
             return;
         }
         let items: Vec<(String, String)> = files.iter().map(|f| (f.name(), f.path())).collect();
@@ -870,11 +881,14 @@ impl WayfinderWindow {
                     .iter()
                     .any(|(_, uri, _)| Some(uri.as_str()) == focused.as_deref());
                 w.imp().file_selection.borrow_mut().clear();
-                if w.is_in_trash() && w.imp().model.generation() == generation {
+                // Showing the Bin (again, perhaps): list it afresh — it has
+                // no monitor. Move focus only if it's the same view.
+                if w.is_in_trash() {
+                    let same_view = w.imp().model.generation() == generation;
                     let win = w.clone();
                     w.imp().model.refresh(move |listed| {
                         win.update_status();
-                        if listed && focused_went {
+                        if listed && focused_went && same_view {
                             win.select_near_removed(old_pos.saturating_add(1));
                         }
                     });
@@ -1970,11 +1984,17 @@ impl WayfinderWindow {
                 &file_path,
                 move || {
                     wayfinder::file_ops::rename_file(&gio::File::for_path(&path), &new_name)
-                        .map(|_| new_name)
+                        .map(|renamed| (new_name, renamed.path()))
                         .map_err(|e| e.to_string())
                 },
                 move |w, result| match result {
-                    Ok(new_name) => {
+                    Ok((new_name, new_path)) => {
+                        if let Some(new_path) = new_path {
+                            note_renames(&[(
+                                moved[0].clone(),
+                                new_path.to_string_lossy().to_string(),
+                            )]);
+                        }
                         w.announce(
                             &format!("Renamed to {new_name}"),
                             AccessibleAnnouncementPriority::Medium,
@@ -2299,7 +2319,7 @@ impl WayfinderWindow {
             w.run_blocking(
                 &current,
                 move || {
-                    let mut renamed = 0u32;
+                    let mut done: Vec<(String, String)> = Vec::new();
                     let mut errors = 0u32;
                     for (old_path, new_path) in &pairs {
                         let new_name = std::path::Path::new(new_path)
@@ -2308,16 +2328,18 @@ impl WayfinderWindow {
                             .unwrap_or_else(|| new_path.clone());
                         let gio_file = gio::File::for_path(old_path);
                         match wayfinder::file_ops::rename_file(&gio_file, &new_name) {
-                            Ok(_) => renamed += 1,
+                            Ok(_) => done.push((old_path.clone(), new_path.clone())),
                             Err(e) => {
                                 log::error!("Batch rename error: {e}");
                                 errors += 1;
                             }
                         }
                     }
-                    (renamed, errors)
+                    (done, errors)
                 },
-                move |w, (renamed, errors)| {
+                move |w, (done, errors)| {
+                    note_renames(&done);
+                    let renamed = done.len();
                     let msg = if errors > 0 {
                         format!("Renamed {renamed} files, {errors} errors")
                     } else {
@@ -3158,6 +3180,7 @@ fn link_target(real: &std::path::Path) -> FileObject {
         &wayfinder::file_object::FileInfoData {
             name: name.clone(),
             display_name: name,
+            is_hidden: false,
             is_directory: false,
             size: 0,
             modified: 0,
@@ -3186,6 +3209,21 @@ fn dropped_paths(text: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Tell the recently-used list about renamed files (`(old, new)` paths),
+/// so they stay in Recent Files under their new names.
+fn note_renames(pairs: &[(String, String)]) {
+    let recent = gtk::RecentManager::default();
+    for (old, new) in pairs {
+        let old_uri = gio::File::for_path(old).uri();
+        if recent.has_item(&old_uri) {
+            let new_uri = gio::File::for_path(new).uri();
+            if let Err(e) = recent.move_item(&old_uri, Some(new_uri.as_str())) {
+                log::warn!("Couldn't update Recent Files for {old}: {e}");
+            }
+        }
+    }
 }
 
 /// Whether `name` is a plain file name: not empty, `.` or `..`, and

@@ -931,6 +931,9 @@ impl WayfinderWindowInner {
             let entry_for_tab = entry.clone();
             let dlg_for_tab = dlg.clone();
             let dlg_for_esc = dlg.clone();
+            // A relative path is taken from the folder being shown.
+            let here = window.imp().model.current_path();
+            let here_for_go = here.clone();
             tab_ctrl.connect_key_pressed(move |_ctrl, key, _code, mods| {
                 use gtk::gdk;
                 if key == gdk::Key::Escape {
@@ -951,7 +954,7 @@ impl WayfinderWindowInner {
                     let waiting = wayfinder::background::waiting_message(
                         &wayfinder::path_complete::expand_tilde(&text),
                     );
-                    let typed = text.clone();
+                    let typed = wayfinder::path_complete::absolute(&text, &here);
                     wayfinder::background::run(
                         move || wayfinder::path_complete::complete(&typed),
                         move |completed| {
@@ -1002,7 +1005,9 @@ impl WayfinderWindowInner {
             let entry_clone = entry.clone();
             let w = window.clone();
             let do_go = move || {
-                let path = wayfinder::path_complete::expand_tilde(&entry_clone.text());
+                let path = wayfinder::path_complete::expand_tilde(
+                    &wayfinder::path_complete::absolute(&entry_clone.text(), &here_for_go),
+                );
                 w.navigate_to_path(&path);
                 d.close();
             };

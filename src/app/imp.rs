@@ -77,7 +77,14 @@ impl ApplicationImpl for WayfinderApplicationInner {
                 let probe = path_str.clone();
                 window.run_blocking(
                     &path_str,
-                    move || wayfinder::file_model::query_file(&probe),
+                    move || {
+                        // Following any link: a link to a folder was opened by
+                        // navigating already.
+                        let is_folder = std::fs::metadata(&probe).is_ok_and(|m| m.is_dir());
+                        (!is_folder)
+                            .then(|| wayfinder::file_model::query_file(&probe))
+                            .flatten()
+                    },
                     |w, found| {
                         if let Some((parent, data)) = found {
                             if !data.is_directory {

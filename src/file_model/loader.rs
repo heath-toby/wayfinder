@@ -125,6 +125,34 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
     let mut entries = Vec::new();
     for path in paths {
         let is_fuse = crate::rclone_ops::is_fuse_path(&path);
+        if is_fuse {
+            // Not asked of the mount: one recent file on a mount that has
+            // stopped answering would hold up the whole list. Its name
+            // gives its type; size and date stay unknown.
+            let p = std::path::Path::new(&path);
+            let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+                continue;
+            };
+            let name = name.to_string_lossy().to_string();
+            let (content_type, _) = gio::content_type_guess(Some(p), None);
+            entries.push((
+                parent.to_string_lossy().to_string(),
+                FileInfoData {
+                    display_name: name.clone(),
+                    name,
+                    is_hidden: false,
+                    is_directory: false,
+                    size: 0,
+                    modified: 0,
+                    modified_display: String::new(),
+                    content_type: content_type.to_string(),
+                },
+            ));
+            if entries.len() >= limit {
+                break;
+            }
+            continue;
+        }
         let Ok(info) = gio::File::for_path(&path).query_info(
             attrs_for(is_fuse),
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
@@ -316,6 +344,7 @@ mod tests {
                 FileInfoData {
                     name: "report.txt".to_string(),
                     display_name: "report.txt".to_string(),
+                    is_hidden: false,
                     is_directory: false,
                     size: 1,
                     modified: 0,

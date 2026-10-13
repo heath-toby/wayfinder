@@ -101,6 +101,9 @@ pub fn resolve_links_outside_mounts(path: &Path) -> std::path::PathBuf {
         .filter(|c| !matches!(c, Component::RootDir | Component::Prefix(_)))
         .map(|c| c.as_os_str().to_os_string())
         .collect();
+    // The mount table, read once.
+    let mounts = fuse_mountpoints();
+    let on_fuse = |p: &Path| mounts.iter().any(|m| p.starts_with(m));
     let mut hops = 0;
     while let Some(part) = parts.pop_front() {
         match part.to_str() {
@@ -112,7 +115,7 @@ pub fn resolve_links_outside_mounts(path: &Path) -> std::path::PathBuf {
             _ => {}
         }
         out.push(&part);
-        if is_fuse_path(&out.to_string_lossy()) {
+        if on_fuse(&out) {
             out.extend(parts);
             break;
         }

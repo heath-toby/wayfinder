@@ -67,8 +67,7 @@ pub fn show_dialog(
         crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(local_path))
             .to_string_lossy()
             .to_string();
-    let is_on_rclone_mount = crate::rclone_ops::is_rclone_fuse_path(local_path)
-        || crate::rclone_ops::is_rclone_fuse_path(&real_path);
+    let is_on_rclone_mount = crate::rclone_ops::is_rclone_fuse_path(&real_path);
     let sync_local_path = if is_on_rclone_mount {
         crate::offline::cache_path_for(local_path)
             .to_string_lossy()
@@ -301,9 +300,7 @@ pub fn show_dialog(
             let sync_local_real = crate::rclone_ops::resolve_links_outside_mounts(
                 std::path::Path::new(&sync_local),
             );
-            if crate::rclone_ops::is_rclone_fuse_path(&sync_local)
-                || crate::rclone_ops::is_rclone_fuse_path(&sync_local_real.to_string_lossy())
-            {
+            if crate::rclone_ops::is_rclone_fuse_path(&sync_local_real.to_string_lossy()) {
                 parent.announce(
                     "Refusing to sync: the local path is on an rclone FUSE mount. This would sync the remote with itself, risking data loss. Close this dialog and try again — Wayfinder will redirect to the offline cache path.",
                     AccessibleAnnouncementPriority::High,

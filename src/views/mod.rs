@@ -48,3 +48,19 @@ pub(crate) fn select_on_right_click(child: &impl IsA<gtk::Widget>, item: &gtk::L
     });
     child.add_controller(gesture);
 }
+
+/// What dragging the item at `path` offers: its URI, escaped (a `#` or `%`
+/// in a name stays part of it), as a URI list for other apps and as text
+/// for Wayfinder's own drop targets. Items in the Bin are URIs already.
+pub(crate) fn drag_content(path: &str) -> gtk::gdk::ContentProvider {
+    let uri = if path.contains("://") {
+        path.to_string()
+    } else {
+        gtk::gio::File::for_path(path).uri().to_string()
+    };
+    let list = gtk::glib::Bytes::from_owned(format!("{uri}\r\n").into_bytes());
+    gtk::gdk::ContentProvider::new_union(&[
+        gtk::gdk::ContentProvider::for_bytes("text/uri-list", &list),
+        gtk::gdk::ContentProvider::for_value(&uri.to_value()),
+    ])
+}

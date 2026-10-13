@@ -56,7 +56,13 @@
 - **Right-clicking among marked files** — right-clicking a file that isn't marked acts on that file and clears the marks, instead of acting on the marked files. Right-clicking empty space in the list opens the folder's menu (Paste, New Folder) rather than one for whichever file had focus.
 - **Bin names** — files moved to the Bin from another drive are shown and read out by their own names, not a long encoded path.
 - **Sorting** — sorting by Size puts folders in order once their sizes are worked out; folders stay above files in a descending sort; and sorting by clicking a column's own header keeps the sort buttons (and what Orca reads) and the saved sort in step.
+- **Folder sizes inside network shares and system folders** — sizes are no longer worked out by walking an NFS or SMB share over the network, or into another filesystem mounted inside a folder: `/proc` showed as about 134 million GB.
 - **Folder sizes** — a folder created while you're looking at its parent gets its size worked out (it said "Calculating..." for good), and the last folder's size can no longer go missing.
+- **Dragging files** — a file whose name has `#`, `%` or spaces is dragged correctly, and other apps now accept files dragged from Wayfinder.
+- **Hidden files** — backup files (`name~`) and names listed in a folder's `.hidden` file are hidden along with dot files, as in other file managers.
+- **Recent Files** — a recent file on a mount that has stopped answering no longer holds up the whole list; renamed files stay in Recent Files under their new names.
+- **Go to Location** — a relative path (`Projects`) is taken from the folder you're in; a trailing `/` no longer leaves paths doubled (`Documents//file`) or loses your place when you come back.
+- **Grid view focus** — focus returns to the selected item after opening a folder or switching back to the window.
 - **Row labels** — what Orca reads for a file follows changes to it, such as a download growing, instead of keeping its details from when it was first shown.
 - **Renaming on case-sensitive drives** — renaming `Report.txt` to `report.txt` where a separate `report.txt` exists is refused, instead of replacing it.
 - **Undo move to Bin** — restores the copy just moved there, not an older one from the same place; restoring a file from the Bin whose name has `#` or `%` in it restores that file.
@@ -72,6 +78,8 @@
 - **Encrypted rclone config** — rclone is never left waiting for a config password, which could freeze the window (opening Set Up Two-Way Sync, for one) or hang an operation.
 - **Saving several files from an app** — the file chooser now lets you pick a folder and saves each file there under its own name (numbered if the name is taken), instead of returning a single file for all of them.
 - **Sidebar** — Delete does nothing when no place is selected (it could reach the file list); after moving a bookmark with Ctrl+arrow, its row is read with its own name, not its neighbour's; removing the only bookmark leaves focus on a place. In Edit Sidebar, Ctrl+arrow reordering works (the list took the keys), and rows keep saying shown or hidden after a reorder.
+- **Keep Available Offline with other offline copies** — pinning a folder that's already kept offline as part of another, or that holds items kept offline separately, is refused with the reason (a fresh download could lose their copies). Removing an offline copy no longer freezes the window while it's deleted.
+- **File chooser: typing a location** — Enter on a path that isn't a folder says so, instead of going nowhere and then saving into a folder that doesn't exist.
 - **File chooser keyboard** — Tab from the file list goes on to the file name (or the Open button), Shift+Tab back to the location; Enter in the location goes there; Recent Files and the Bin in its sidebar say they can't be opened there. "Save As" on an existing file starts in its folder, with its name.
 - **Opening files from the command line** — `wayfinder some/file` uses the app chosen for that file, and never waits on a mount (reached through a link, say) while starting.
 - **Bookmarks** — folders with spaces or accented letters are bookmarked correctly (they were written so that GTK apps, and Wayfinder, opened the wrong folder), and such bookmarks made by other apps open properly.

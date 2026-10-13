@@ -52,8 +52,7 @@ fn setup_factory(factory: &SignalListItemFactory) {
             if let Some(child) = item.child() {
                 let drag_source = gtk::DragSource::new();
                 drag_source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
-                let uri = format!("file://{}", file.path());
-                let content = gdk::ContentProvider::for_value(&uri.to_value());
+                let content = crate::views::drag_content(&file.path());
                 drag_source.set_content(Some(&content));
                 child.add_controller(drag_source);
             }

@@ -27,6 +27,9 @@ impl WayfinderGridView {
     }
 
     pub fn grab_focus_at_selected(&self, selected_pos: u32) {
+        // As in the list view: scroll_to(FOCUS) only moves focus to an item
+        // widget that already exists, so focus the grid first.
+        self.imp().grid_view.grab_focus();
         self.imp()
             .grid_view
             .scroll_to(selected_pos, ListScrollFlags::FOCUS, None);

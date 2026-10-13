@@ -21,6 +21,16 @@ pub enum Completion {
     NoMatch,
 }
 
+/// `text` as a path from `base` (the folder being shown) if it's relative;
+/// as it is if it starts with `/` or `~`.
+pub fn absolute(text: &str, base: &str) -> String {
+    if text.starts_with('/') || text.starts_with('~') || base.contains("://") {
+        text.to_string()
+    } else {
+        format!("{}/{text}", base.trim_end_matches('/'))
+    }
+}
+
 /// Complete `partial`. Lists a directory, so may block on a slow mount:
 /// call it off the main thread.
 pub fn complete(partial: &str) -> Completion {
@@ -197,6 +207,14 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn relative_paths_are_from_the_folder_shown() {
+        assert_eq!(absolute("wa", "/home/u/Projects"), "/home/u/Projects/wa");
+        assert_eq!(absolute("~/x", "/home/u"), "~/x");
+        assert_eq!(absolute("/etc", "/home/u"), "/etc");
+        assert_eq!(absolute("x", "/"), "/x");
     }
 
     #[test]

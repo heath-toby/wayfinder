@@ -272,28 +272,41 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                 let was_pinned = pinned;
                 move || {
                     if was_pinned {
-                        match wayfinder::offline::unpin_path(&p) {
-                            Ok(wayfinder::offline::Unpinned::Removed) => w.announce(
-                                "Offline copy removed",
-                                gtk::AccessibleAnnouncementPriority::Medium,
-                            ),
-                            Ok(wayfinder::offline::Unpinned::KeptForSync) => w.announce(
-                                "No longer kept offline. The copy stays: it's part of a two-way sync folder",
-                                gtk::AccessibleAnnouncementPriority::Medium,
-                            ),
-                            Ok(wayfinder::offline::Unpinned::KeptForPin) => w.announce(
-                                "No longer kept offline by itself. The copy stays: the folder it's in is kept offline",
-                                gtk::AccessibleAnnouncementPriority::Medium,
-                            ),
-                            Err(e) => w.announce(
-                                &format!("Failed to remove offline copy: {e}"),
-                                gtk::AccessibleAnnouncementPriority::High,
-                            ),
-                        }
+                        // Deleting a big copy takes a while: not on the main
+                        // thread.
+                        let path = p.clone();
+                        w.run_blocking(
+                            "/",
+                            move || wayfinder::offline::unpin_path(&path),
+                            |w, result| match result {
+                                    Ok(wayfinder::offline::Unpinned::Removed) => w.announce(
+                                        "Offline copy removed",
+                                        gtk::AccessibleAnnouncementPriority::Medium,
+                                    ),
+                                    Ok(wayfinder::offline::Unpinned::KeptForSync) => w.announce(
+                                        "No longer kept offline. The copy stays: it's part of a two-way sync folder",
+                                        gtk::AccessibleAnnouncementPriority::Medium,
+                                    ),
+                                    Ok(wayfinder::offline::Unpinned::KeptForPin) => w.announce(
+                                        "No longer kept offline by itself. The copy stays: the folder it's in is kept offline",
+                                        gtk::AccessibleAnnouncementPriority::Medium,
+                                    ),
+                                    Err(e) => w.announce(
+                                        &format!("Failed to remove offline copy: {e}"),
+                                        gtk::AccessibleAnnouncementPriority::High,
+                                    ),
+                                }
+                        );
                     } else {
                         // Inside a two-way sync folder, the copy is already
                         // kept (both ways); downloading over it would undo
                         // local changes not yet synced.
+                        // Other pins' copies overlap this one's: don't download
+                        // over (or clear) them.
+                        if let Some(msg) = wayfinder::offline::pin_overlap(&p) {
+                            w.announce(&msg, gtk::AccessibleAnnouncementPriority::Medium);
+                            return;
+                        }
                         let cached = wayfinder::offline::cache_path_for(&p);
                         if wayfinder::offline::in_sync_folder(&cached) {
                             let msg = if wayfinder::offline::inside_sync_folder(&cached) {

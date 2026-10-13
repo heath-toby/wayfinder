@@ -422,8 +422,7 @@ fn setup_name_factory(factory: &SignalListItemFactory) {
                 // Add DragSource for drag & drop
                 let drag_source = gtk::DragSource::new();
                 drag_source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
-                let uri = format!("file://{}", file.path());
-                let content = gdk::ContentProvider::for_value(&uri.to_value());
+                let content = crate::views::drag_content(&file.path());
                 drag_source.set_content(Some(&content));
                 child.add_controller(drag_source);
             }
@@ -499,6 +498,7 @@ mod tests {
             &FileInfoData {
                 name: name.to_string(),
                 display_name: name.to_string(),
+                is_hidden: false,
                 is_directory,
                 size: 0,
                 modified: 0,

@@ -307,6 +307,32 @@ pub fn inside_sync_folder(cached: &Path) -> bool {
         .any(|pair| cached.starts_with(&pair.sync_local_path))
 }
 
+/// Why `original_path` can't be pinned for other pins' sake, if it can't:
+/// a pinned folder already holds it, or it holds pinned items (a fresh
+/// download over their copies could lose them).
+pub fn pin_overlap(original_path: &str) -> Option<String> {
+    let manifest = load_manifest();
+    let path = Path::new(original_path);
+    if let Some(holder) = manifest
+        .keys()
+        .find(|other| *other != original_path && path.starts_with(other))
+    {
+        let name = Path::new(holder)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| holder.clone());
+        return Some(format!("Already available offline: {name} is kept offline"));
+    }
+    manifest
+        .keys()
+        .any(|other| other != original_path && Path::new(other).starts_with(path))
+        .then(|| {
+            "Can't keep this folder offline while items inside it are kept offline \
+             separately: remove their offline copies first"
+                .to_string()
+        })
+}
+
 /// Whether one of `a` and `b` is, or is inside, the other.
 fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)

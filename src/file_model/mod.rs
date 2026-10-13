@@ -616,6 +616,13 @@ impl DirectoryModel {
                 mon.connect_changed(move |_mon, file, _other, event| {
                     let path = current_path.borrow().clone();
 
+                    // Only the folder's entries: an event about the folder
+                    // itself would hit a child of the same name.
+                    if file.parent().and_then(|p| p.path()) != Some(std::path::PathBuf::from(&path))
+                    {
+                        return;
+                    }
+
                     // Get the basename of the changed file for matching
                     let changed_name = file
                         .basename()
@@ -739,15 +746,23 @@ fn spawn_size_job(
     std::thread::spawn(move || {
         // Resolve symlinks here, off the main thread, so mountpoints
         // match by path.
+        use std::os::unix::fs::MetadataExt;
         let base = std::fs::canonicalize(&base).unwrap_or_else(|_| base.into());
+        // Inside a network mount (NFS, CIFS…), every walk would go over the
+        // network: don't (the same reason FUSE folders aren't walked).
+        let on_network = skip.iter().any(|m| base.starts_with(m));
+        let base_dev = std::fs::metadata(&base).map(|m| m.dev()).ok();
         for (key, name) in &dirs {
             let real = base.join(name);
             // A link to a folder isn't walked: it may lead anywhere — onto
-            // a mount, or round in a loop.
-            let is_link = real
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink());
-            let size = (!is_link && !skip.contains(&real)).then(|| walk_dir_size(&real, &skip));
+            // a mount, or round in a loop. Nor another filesystem mounted
+            // here (/proc, /sys, a disk): its size isn't this folder's.
+            let walkable = !on_network
+                && !skip.contains(&real)
+                && real
+                    .symlink_metadata()
+                    .is_ok_and(|m| !m.file_type().is_symlink() && Some(m.dev()) == base_dev);
+            let size = walkable.then(|| walk_dir_size(&real, &skip));
             let _ = tx.send((key.clone(), size));
         }
     });
@@ -873,14 +888,21 @@ fn walk_dir_size(
     dir: &std::path::Path,
     skip: &std::collections::HashSet<std::path::PathBuf>,
 ) -> u64 {
-    walk_dir_size_impl(dir, skip, 0)
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dev) = dir.symlink_metadata().map(|m| m.dev()) else {
+        return 0;
+    };
+    walk_dir_size_impl(dir, skip, dev, 0)
 }
 
+/// Never leaves the filesystem `dev` (a mount inside isn't this folder's).
 fn walk_dir_size_impl(
     dir: &std::path::Path,
     skip: &std::collections::HashSet<std::path::PathBuf>,
+    dev: u64,
     depth: u32,
 ) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     if depth > 100 {
         return 0;
     }
@@ -896,10 +918,13 @@ fn walk_dir_size_impl(
         let Ok(meta) = path.symlink_metadata() else {
             continue;
         };
+        if meta.dev() != dev {
+            continue;
+        }
         if meta.file_type().is_symlink() || meta.is_file() {
             total += meta.len();
         } else if meta.is_dir() {
-            total += walk_dir_size_impl(&path, skip, depth + 1);
+            total += walk_dir_size_impl(&path, skip, dev, depth + 1);
         }
     }
     total
