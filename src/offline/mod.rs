@@ -182,6 +182,9 @@ pub fn record_pin(original_path: &str) -> Result<(), String> {
     let src = Path::new(original_path);
     let meta = std::fs::metadata(src).map_err(|e| format!("Cannot read source: {e}"))?;
     let is_directory = meta.is_dir();
+    // Only pin what really arrived: the download may have failed, been
+    // cancelled or skipped.
+    check_downloaded(&meta, &cache_path_for(original_path))?;
     let mtime = mtime_secs(&meta);
     let size = if is_directory { 0 } else { meta.len() };
 
@@ -196,6 +199,21 @@ pub fn record_pin(original_path: &str) -> Result<(), String> {
         },
     );
     save_manifest(&manifest)?;
+    Ok(())
+}
+
+/// Whether the offline copy at `cached` is complete for a source with
+/// metadata `src_meta`: there, of the same kind, and for a file the same
+/// size.
+fn check_downloaded(src_meta: &std::fs::Metadata, cached: &Path) -> Result<(), String> {
+    let Ok(cached_meta) = std::fs::metadata(cached) else {
+        return Err("the download didn't complete".to_string());
+    };
+    if cached_meta.is_dir() != src_meta.is_dir()
+        || (src_meta.is_file() && cached_meta.len() != src_meta.len())
+    {
+        return Err("the downloaded copy is incomplete".to_string());
+    }
     Ok(())
 }
 
@@ -429,5 +447,39 @@ fn remote_child(remote: &str, name: &str) -> String {
         format!("{remote}{name}")
     } else {
         format!("{remote}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_downloaded;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wayfinder-pin-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn missing_or_partial_copies_are_not_pinned() {
+        let d = dir("check");
+        let src = d.join("src.bin");
+        std::fs::write(&src, b"0123456789").unwrap();
+        let meta = std::fs::metadata(&src).unwrap();
+
+        assert!(check_downloaded(&meta, &d.join("missing")).is_err());
+        let partial = d.join("partial.bin");
+        std::fs::write(&partial, b"01234").unwrap();
+        assert!(check_downloaded(&meta, &partial).is_err());
+        // rclone `copy` put the file in a folder of its name.
+        let nested = d.join("nested.bin");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(check_downloaded(&meta, &nested).is_err());
+
+        let full = d.join("full.bin");
+        std::fs::write(&full, b"0123456789").unwrap();
+        assert!(check_downloaded(&meta, &full).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

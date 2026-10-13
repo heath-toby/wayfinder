@@ -630,7 +630,10 @@ pub fn pin_with_progress(
         return;
     }
 
-    let args = copy_args(&target.full_remote_spec, &cache_path);
+    // `copyto`, not `copy`: for a single file, `copy` would treat the
+    // destination as a folder and put the file inside it. For a folder
+    // the two behave the same.
+    let args = copyto_args(&target.full_remote_spec, &cache_path.to_string_lossy());
     let labels = progress::ProgressLabels {
         title: "Downloading for offline use",
         target_description: format!(

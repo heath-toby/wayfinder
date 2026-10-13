@@ -27,9 +27,15 @@
 - **Bin and Recent Files** — if opening one fails after a wait, the "Waiting for…" message is cleared.
 - **`~` with an unusual home setting** — Tab completion of `~/…` works when `$HOME` ends in `/`, or is `/` itself.
 
+- **Permissions** — Apply in Properties no longer removes the setuid, setgid and sticky bits (a shared folder at 2775 stayed 2775, not 775); they can also be set by typing a four-digit mode.
+- **Keep Available Offline** — only says "Available offline" when the copy really arrived; a failed, cancelled or skipped download is reported and not marked as pinned. Pinning a single file through rclone now stores it where Wayfinder looks for it (it was put inside a folder of the same name).
+- **Custom actions** — with several files selected, an action that takes one file (such as Extract Here or Checksum) now runs on each of them, not just the first; actions are only offered when they suit every selected file; file names containing `%c`, `%i` or `%k`, and URIs with spaces or `#`, are passed correctly; the progress window can be put away with "Continue in background" or Escape (it used to stay up, blocking the window, for as long as the program ran — a terminal, say).
+- **Compress** — file names beginning with `-` are no longer mistaken for options, and an existing archive of the same name is reported instead of being added to or replaced.
+- **Open With** — pressing Enter on "Open With" moves focus into the submenu.
+
 ### Development
 
-- **Unit tests** — `cargo test` now covers path completion, location naming, selection after removing files, and restarting an offline download after suspend.
+- **Unit tests** — `cargo test` now covers path completion, location naming, selection after removing files, the folder cache, dropped files, custom action commands, offline pins, and restarting an offline download after suspend.
 
 ## 2.5.0
 

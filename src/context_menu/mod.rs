@@ -178,6 +178,11 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
             let s = stack.clone();
             submenu_btn.connect_clicked(move |_| {
                 s.set_visible_child_name("open-with");
+                // Move focus into the submenu, as the Right arrow does, or
+                // it's left on this now hidden button.
+                if let Some(sub) = s.child_by_name("open-with").and_downcast::<gtk::Box>() {
+                    focus_button(&get_buttons(&sub), 0);
+                }
             });
             main_box.append(&submenu_btn);
         }
@@ -294,7 +299,7 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                                             gtk::AccessibleAnnouncementPriority::Medium,
                                         ),
                                         Err(e) => w.announce(
-                                            &format!("Pin recorded with warning: {e}"),
+                                            &format!("Not available offline: {e}"),
                                             gtk::AccessibleAnnouncementPriority::High,
                                         ),
                                     },
@@ -315,8 +320,7 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         } else {
                             // Fallback: GIO copy through the filesystem.
                             let cache_path = wayfinder::offline::cache_path_for(&p);
-                            let Some(cache_parent) =
-                                cache_path.parent().map(|p| p.to_path_buf())
+                            let Some(cache_parent) = cache_path.parent().map(|p| p.to_path_buf())
                             else {
                                 w.announce(
                                     "Pin failed: cannot determine cache location",
@@ -366,14 +370,10 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         let win = w.clone();
                         let p_clone = p.clone();
                         glib::idle_add_local_once(move || {
-                            wayfinder::rclone_sync::dialog::show_dialog(
-                                &win,
-                                &p_clone,
-                                {
-                                    let w = win.clone();
-                                    move || w.restore_focus_to_selected()
-                                },
-                            );
+                            wayfinder::rclone_sync::dialog::show_dialog(&win, &p_clone, {
+                                let w = win.clone();
+                                move || w.restore_focus_to_selected()
+                            });
                         });
                     }
                 });
@@ -385,14 +385,10 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         let win = w.clone();
                         let p_clone = p.clone();
                         glib::idle_add_local_once(move || {
-                            wayfinder::rclone_sync::dialog::show_dialog(
-                                &win,
-                                &p_clone,
-                                {
-                                    let w = win.clone();
-                                    move || w.restore_focus_to_selected()
-                                },
-                            );
+                            wayfinder::rclone_sync::dialog::show_dialog(&win, &p_clone, {
+                                let w = win.clone();
+                                move || w.restore_focus_to_selected()
+                            });
                         });
                     }
                 });
@@ -400,10 +396,22 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
         }
 
         // Custom actions from .desktop files and Nautilus scripts
+        // An action runs on every selected file, so it must suit them all,
+        // not just the one under the cursor.
         let custom_actions = wayfinder::actions::load_actions();
+        let selected_types: Vec<String> = window
+            .get_selected_files()
+            .iter()
+            .map(|f| f.mime_type())
+            .collect();
         let matching_actions: Vec<_> = custom_actions
             .into_iter()
-            .filter(|a| wayfinder::actions::matches_mime(a, &content_type))
+            .filter(|a| {
+                wayfinder::actions::matches_mime(a, &content_type)
+                    && selected_types
+                        .iter()
+                        .all(|t| wayfinder::actions::matches_mime(a, t))
+            })
             .collect();
 
         if !matching_actions.is_empty() {

@@ -18,6 +18,9 @@ struct Details {
     mode: Option<u32>,
 }
 
+/// setuid, setgid and sticky.
+const SPECIAL_BITS: u32 = 0o7000;
+
 fn gather_details(path: &str) -> Result<Details, String> {
     let info = gio::File::for_path(path)
         .query_info(
@@ -180,6 +183,9 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
 
         // Guard flag to prevent infinite signal loops between checkboxes and octal entry
         let updating = std::rc::Rc::new(std::cell::RefCell::new(false));
+        // setuid, setgid and sticky: no checkboxes, but kept (and settable
+        // in the octal entry), never silently dropped.
+        let special = std::rc::Rc::new(std::cell::Cell::new(mode & SPECIAL_BITS));
 
         // Permission bits: (bit, row_label, perm_name)
         let bit_layout: [(u32, &str, &str); 9] = [
@@ -243,18 +249,19 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
             let cbs = checkboxes.clone();
             let entry = octal_entry.clone();
             let guard = updating.clone();
+            let special = special.clone();
             let _bit = *bit; // not used in closure but keeping for clarity
             cb.connect_toggled(move |_| {
                 if *guard.borrow() {
                     return;
                 }
                 *guard.borrow_mut() = true;
-                let new_mode: u32 = cbs
+                let bits: u32 = cbs
                     .iter()
                     .filter(|(_, c)| c.is_active())
                     .map(|(b, _)| b)
                     .sum();
-                entry.set_text(&format!("{new_mode:o}"));
+                entry.set_text(&format!("{:o}", special.get() | bits));
                 *guard.borrow_mut() = false;
             });
         }
@@ -263,6 +270,7 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
         {
             let cbs = checkboxes.clone();
             let guard = updating.clone();
+            let special = special.clone();
             octal_entry.connect_changed(move |entry| {
                 if *guard.borrow() {
                     return;
@@ -270,6 +278,7 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
                 let text = entry.text().to_string();
                 if let Ok(new_mode) = u32::from_str_radix(&text, 8) {
                     if new_mode <= 0o7777 {
+                        special.set(new_mode & SPECIAL_BITS);
                         *guard.borrow_mut() = true;
                         for (bit, cb) in cbs.iter() {
                             cb.set_active(new_mode & bit != 0);
@@ -290,11 +299,13 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
         let fp = file.path();
         let parent_ref = parent.clone();
         let cbs_apply = checkboxes.clone();
+        let special_apply = special.clone();
         apply_btn.connect_clicked(move |_| {
-            let new_perm_bits: u32 = cbs_apply.iter()
+            let bits: u32 = cbs_apply.iter()
                 .filter(|(_, c)| c.is_active())
                 .map(|(b, _)| b)
                 .sum();
+            let new_perm_bits = special_apply.get() | bits;
             // Preserve file type bits, only change permission bits
             let new_mode = (original_mode & !0o7777) | (new_perm_bits & 0o7777);
             let perms = std::fs::Permissions::from_mode(new_mode);

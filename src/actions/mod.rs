@@ -311,10 +311,30 @@ fn show_action_progress(
     progress_bar.set_text(Some("Working..."));
     progress_bar.update_property(&[gtk::accessible::Property::Label("Progress")]);
 
+    // The action may run for as long as the program it starts (a terminal,
+    // an editor): let the user put this window away and carry on — the
+    // result is still announced when it's done.
+    let hide_btn = gtk::Button::with_label("Continue in background");
+    hide_btn.set_halign(gtk::Align::End);
+    let d = dlg.clone();
+    hide_btn.connect_clicked(move |_| d.close());
+    let keys = gtk::EventControllerKey::new();
+    let d = dlg.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            d.close();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    dlg.add_controller(keys);
+
     vbox.append(&label);
     vbox.append(&progress_bar);
+    vbox.append(&hide_btn);
     dlg.set_child(Some(&vbox));
     dlg.present();
+    hide_btn.grab_focus();
 
     let p = parent.clone();
     let name = action_name.to_string();
@@ -472,7 +492,14 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
         let cmd = build_compress_command(&ext, &archive_name, &basenames);
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let archive_path = Path::new(&dir).join(&archive_name);
+        let existing_name = archive_name.clone();
         std::thread::spawn(move || {
+            // zip would add to an existing archive, tar replace it.
+            if archive_path.exists() {
+                let _ = tx.send(Err(format!("{existing_name} already exists")));
+                return;
+            }
             let result = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)
@@ -498,16 +525,13 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
 }
 
 fn build_compress_command(ext: &str, archive_name: &str, basenames: &[String]) -> String {
+    // `./` first, so a name starting with `-` isn't taken for an option.
     let quoted_files: String = basenames
         .iter()
-        .map(|f| {
-            let escaped = f.replace('\'', "'\\''");
-            format!("'{escaped}'")
-        })
+        .map(|f| shell_quote(&format!("./{f}")))
         .collect::<Vec<_>>()
         .join(" ");
-    let escaped_archive = archive_name.replace('\'', "'\\''");
-    let quoted_archive = format!("'{escaped_archive}'");
+    let quoted_archive = shell_quote(&format!("./{archive_name}"));
 
     match ext {
         "zip" => format!("zip -r {quoted_archive} {quoted_files}"),
@@ -525,64 +549,77 @@ fn execute_desktop_action(
     files: &[String],
     tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
-    let mut cmd_str = action.exec.clone();
-
-    // Substitute %F (multiple files) or %f (single file)
-    if cmd_str.contains("%F") {
-        let file_args: String = files
-            .iter()
-            .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        cmd_str = cmd_str.replace("%F", &file_args);
-    } else if cmd_str.contains("%f") {
-        let file_arg = files
-            .first()
-            .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
-            .unwrap_or_default();
-        cmd_str = cmd_str.replace("%f", &file_arg);
-    } else if cmd_str.contains("%U") {
-        let uri_args: String = files
-            .iter()
-            .map(|f| format!("'file://{}'", f.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        cmd_str = cmd_str.replace("%U", &uri_args);
-    } else if cmd_str.contains("%u") {
-        let uri_arg = files
-            .first()
-            .map(|f| format!("'file://{}'", f.replace('\'', "'\\''")))
-            .unwrap_or_default();
-        cmd_str = cmd_str.replace("%u", &uri_arg);
-    } else {
-        // No substitution placeholder -- append files
-        for f in files {
-            cmd_str.push(' ');
-            cmd_str.push_str(&format!("'{}'", f.replace('\'', "'\\''")));
-        }
-    }
-
-    // Remove other desktop entry field codes
-    cmd_str = cmd_str
-        .replace("%i", "")
-        .replace("%c", "")
-        .replace("%k", "");
-
+    let commands = desktop_commands(&action.exec, files);
     std::thread::spawn(move || {
-        let result = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd_str)
-            .output();
-        let msg = match result {
-            Ok(output) if output.status.success() => Ok(()),
-            Ok(output) => {
-                let err = String::from_utf8_lossy(&output.stderr);
-                Err(err.lines().next().unwrap_or("unknown error").to_string())
+        // One command per file for %f/%u; stop at the first failure.
+        let mut msg = Ok(());
+        for cmd_str in &commands {
+            let result = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd_str)
+                .output();
+            msg = match result {
+                Ok(output) if output.status.success() => Ok(()),
+                Ok(output) => {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    Err(err.lines().next().unwrap_or("unknown error").to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            if msg.is_err() {
+                break;
             }
-            Err(e) => Err(e.to_string()),
-        };
+        }
         let _ = tx.send(msg);
     });
+}
+
+/// Single-quote `s` for `sh`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The `file://` URI of a local path, percent-encoded.
+fn file_uri(path: &str) -> String {
+    gtk::gio::File::for_path(path).uri().to_string()
+}
+
+/// The shell commands to run a desktop entry's `Exec=` on `files`, per the
+/// desktop-entry spec: `%F`/`%U` take every file at once, `%f`/`%u` one,
+/// so the command runs once per file. Other field codes are dropped
+/// before files go in, so a `%c` in a file name stays.
+fn desktop_commands(exec: &str, files: &[String]) -> Vec<String> {
+    let exec = exec.replace("%i", "").replace("%c", "").replace("%k", "");
+    let quoted_paths = || files.iter().map(|f| shell_quote(f)).collect::<Vec<_>>();
+    let quoted_uris = || {
+        files
+            .iter()
+            .map(|f| shell_quote(&file_uri(f)))
+            .collect::<Vec<_>>()
+    };
+    if exec.contains("%F") {
+        vec![exec.replace("%F", &quoted_paths().join(" "))]
+    } else if exec.contains("%U") {
+        vec![exec.replace("%U", &quoted_uris().join(" "))]
+    } else if exec.contains("%f") {
+        quoted_paths()
+            .iter()
+            .map(|f| exec.replace("%f", f))
+            .collect()
+    } else if exec.contains("%u") {
+        quoted_uris()
+            .iter()
+            .map(|u| exec.replace("%u", u))
+            .collect()
+    } else {
+        // No placeholder: append the files.
+        let mut cmd = exec;
+        for f in quoted_paths() {
+            cmd.push(' ');
+            cmd.push_str(&f);
+        }
+        vec![cmd]
+    }
 }
 
 fn execute_nautilus_script(
@@ -594,10 +631,10 @@ fn execute_nautilus_script(
     let paths = files.join("\n");
     let uris: String = files
         .iter()
-        .map(|f| format!("file://{f}"))
+        .map(|f| file_uri(f))
         .collect::<Vec<_>>()
         .join("\n");
-    let current_uri = format!("file://{current_dir}");
+    let current_uri = file_uri(current_dir);
 
     let exec = action.exec.clone();
     let current_dir = current_dir.to_string();
@@ -618,4 +655,51 @@ fn execute_nautilus_script(
         };
         let _ = tx.send(msg);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_compress_command, desktop_commands};
+
+    fn files(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn single_file_codes_run_once_per_file() {
+        let cmds = desktop_commands("sha256sum %f", &files(&["/a/x", "/a/y"]));
+        assert_eq!(cmds, vec!["sha256sum '/a/x'", "sha256sum '/a/y'"]);
+    }
+
+    #[test]
+    fn multi_file_codes_take_every_file() {
+        let cmds = desktop_commands("tool %F", &files(&["/a/x", "/a/y z"]));
+        assert_eq!(cmds, vec!["tool '/a/x' '/a/y z'"]);
+    }
+
+    /// `%c` in a file name is part of the name, not a field code.
+    #[test]
+    fn field_codes_in_file_names_are_kept() {
+        let cmds = desktop_commands("open %i %c %f", &files(&["/d/caf%c3%a9.pdf"]));
+        assert_eq!(cmds, vec!["open   '/d/caf%c3%a9.pdf'"]);
+    }
+
+    #[test]
+    fn quotes_in_names_are_escaped() {
+        let cmds = desktop_commands("cat %f", &files(&["/d/it's.txt"]));
+        assert_eq!(cmds, vec!["cat '/d/it'\\''s.txt'"]);
+    }
+
+    #[test]
+    fn uris_are_percent_encoded() {
+        let cmds = desktop_commands("app %u", &files(&["/d/My File #1.txt"]));
+        assert_eq!(cmds, vec!["app 'file:///d/My%20File%20%231.txt'"]);
+    }
+
+    /// A name starting with `-` mustn't be read as an option.
+    #[test]
+    fn compress_names_cant_be_options() {
+        let cmd = build_compress_command("zip", "out.zip", &files(&["-T", "a b"]));
+        assert_eq!(cmd, "zip -r './out.zip' './-T' './a b'");
+    }
 }
