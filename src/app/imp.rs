@@ -69,8 +69,31 @@ impl ApplicationImpl for WayfinderApplicationInner {
                 let path_str = path.to_string_lossy().to_string();
                 if wayfinder::rclone_ops::is_fuse_path(&path_str) {
                     // Don't stat a FUSE path here: a slow mount would hold
-                    // up startup. Navigating resolves a file to its folder.
+                    // up startup. Navigating resolves a file to its folder;
+                    // whether to open it is checked in the background.
                     window.navigate_to_path(&path_str);
+                    let ctx = gtk::prelude::WidgetExt::display(&window).app_launch_context();
+                    let uri = file.uri().to_string();
+                    let probe = path.clone();
+                    wayfinder::background::run(
+                        move || probe.is_file(),
+                        move |is_file| {
+                            if is_file {
+                                // The async variant picks the app off this thread too.
+                                gio::AppInfo::launch_default_for_uri_async(
+                                    &uri,
+                                    Some(&ctx),
+                                    gio::Cancellable::NONE,
+                                    move |result| {
+                                        if let Err(e) = result {
+                                            log::error!("Failed to open {path_str}: {e}");
+                                        }
+                                    },
+                                );
+                            }
+                        },
+                        || {},
+                    );
                 } else if path.is_dir() {
                     // It's a directory — navigate to it
                     window.navigate_to_path(&path_str);

@@ -38,6 +38,7 @@ enum Apply {
 
 type LoadDone = Box<dyn FnOnce(Result<u32, String>)>;
 type Callback = Box<dyn Fn()>;
+type ErrorCallback = Box<dyn Fn(String, String)>;
 
 /// Cheap to clone: every clone shares the same store and state.
 #[derive(Clone)]
@@ -63,6 +64,11 @@ pub struct DirectoryModel {
     loading: Rc<Cell<bool>>,
     /// Called when a background refresh changed the store on its own.
     on_background_update: Rc<RefCell<Option<Callback>>>,
+    /// Called with (location, error) when a background refresh found the
+    /// location can no longer be listed; the store has been emptied.
+    on_background_error: Rc<RefCell<Option<ErrorCallback>>>,
+    /// Background refreshes still waiting for their listing.
+    refreshes_in_flight: Rc<Cell<u32>>,
 }
 
 impl Default for DirectoryModel {
@@ -136,6 +142,8 @@ impl DirectoryModel {
             applied_seq: Rc::new(Cell::new(0)),
             loading: Rc::new(Cell::new(false)),
             on_background_update: Rc::new(RefCell::new(None)),
+            on_background_error: Rc::new(RefCell::new(None)),
+            refreshes_in_flight: Rc::new(Cell::new(0)),
         }
     }
 
@@ -210,9 +218,18 @@ impl DirectoryModel {
         self.run(gen, job, Apply::Replace, Box::new(on_done));
     }
 
+    /// Like `refresh`, but does nothing while another refresh is still
+    /// waiting — so checking for changes each time the window is focused
+    /// can't pile up threads on a mount that has stopped answering.
+    pub fn refresh_if_idle(&self, on_done: impl FnOnce() + 'static) {
+        if self.refreshes_in_flight.get() == 0 {
+            self.refresh(on_done);
+        }
+    }
+
     /// List the current location again and update the store in place,
-    /// keeping the selection. `on_done` runs afterwards (not at all if a
-    /// navigation happens meanwhile).
+    /// keeping the selection. `on_done` runs afterwards — not at all if a
+    /// navigation is under way or happens meanwhile.
     pub fn refresh(&self, on_done: impl FnOnce() + 'static) {
         if self.loading.get() {
             // A navigation is still on its way; its listing will be fresh.
@@ -262,6 +279,13 @@ impl DirectoryModel {
         *self.on_background_update.borrow_mut() = Some(Box::new(callback));
     }
 
+    /// Called with (location, error) when a background check found the
+    /// location can't be listed any more (deleted, mount gone). The store
+    /// has been emptied by then.
+    pub fn set_on_background_error(&self, callback: impl Fn(String, String) + 'static) {
+        *self.on_background_error.borrow_mut() = Some(Box::new(callback));
+    }
+
     /// Warm the cache for a folder inside the current FUSE folder, so
     /// opening it is instant.
     pub fn prefetch(&self, path: &str) {
@@ -282,8 +306,9 @@ impl DirectoryModel {
         gen
     }
 
-    /// Run a listing job, waiting up to `SYNC_WAIT` before finishing it in
-    /// the background.
+    /// Run a listing job. A navigation (`Apply::Replace`) waits up to
+    /// `SYNC_WAIT` before finishing in the background; a refresh never
+    /// waits, since the folder is already on screen.
     fn run(
         &self,
         gen: u64,
@@ -294,35 +319,42 @@ impl DirectoryModel {
         let seq = self.next_seq.get() + 1;
         self.next_seq.set(seq);
         let rx = loader::spawn(job);
-        match rx.recv_timeout(SYNC_WAIT) {
-            Ok(result) => self.finish(gen, seq, result, apply, on_done),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.finish(gen, seq, Err("listing failed".into()), apply, on_done)
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if apply == Apply::Replace {
-                    self.loading.set(true);
+        if apply == Apply::Replace {
+            match rx.recv_timeout(SYNC_WAIT) {
+                Ok(result) => return self.finish(gen, seq, result, apply, on_done),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return self.finish(gen, seq, Err("listing failed".into()), apply, on_done)
                 }
-                let model = self.clone();
-                let mut on_done = Some(on_done);
-                glib::timeout_add_local(Duration::from_millis(30), move || {
-                    if model.generation.get() != gen {
-                        // Superseded. The thread may still be waiting on the
-                        // mount; its result will be dropped with `rx`.
-                        return glib::ControlFlow::Break;
-                    }
-                    let result = match rx.try_recv() {
-                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                        Ok(result) => result,
-                        Err(mpsc::TryRecvError::Disconnected) => Err("listing failed".into()),
-                    };
-                    if let Some(on_done) = on_done.take() {
-                        model.finish(gen, seq, result, apply, on_done);
-                    }
-                    glib::ControlFlow::Break
-                });
+                Err(mpsc::RecvTimeoutError::Timeout) => self.loading.set(true),
             }
+        } else {
+            self.refreshes_in_flight.set(self.refreshes_in_flight.get() + 1);
         }
+
+        let model = self.clone();
+        let mut on_done = Some(on_done);
+        glib::timeout_add_local(Duration::from_millis(30), move || {
+            let result = if model.generation.get() != gen {
+                // Superseded. The thread may still be waiting on the mount;
+                // its result will be dropped with `rx`.
+                None
+            } else {
+                match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Disconnected) => Some(Err("listing failed".into())),
+                }
+            };
+            if apply == Apply::Diff {
+                model
+                    .refreshes_in_flight
+                    .set(model.refreshes_in_flight.get().saturating_sub(1));
+            }
+            if let (Some(result), Some(on_done)) = (result, on_done.take()) {
+                model.finish(gen, seq, result, apply, on_done);
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     fn finish(
@@ -333,8 +365,15 @@ impl DirectoryModel {
         apply: Apply,
         on_done: LoadDone,
     ) {
-        if gen != self.generation.get() || seq < self.applied_seq.get() {
-            log::debug!("dropping stale listing (generation {gen}, sequence {seq})");
+        if gen != self.generation.get() {
+            log::debug!("dropping listing for a location left behind (generation {gen})");
+            return;
+        }
+        if seq < self.applied_seq.get() {
+            // A newer listing of this location is already applied, so the
+            // store is at least as fresh as this one would make it.
+            log::debug!("skipping listing overtaken by a newer one (sequence {seq})");
+            on_done(Ok(self.store.n_items()));
             return;
         }
         self.applied_seq.set(seq);
@@ -344,6 +383,16 @@ impl DirectoryModel {
         let listing = match result {
             Ok(listing) => listing,
             Err(e) => {
+                if apply == Apply::Diff {
+                    // The location can't be listed any more (deleted, mount
+                    // gone): stop showing what it held.
+                    let location = self.current_path();
+                    self.store.remove_all();
+                    loader::forget(&location);
+                    if let Some(cb) = self.on_background_error.borrow().as_ref() {
+                        cb(location, e.clone());
+                    }
+                }
                 on_done(Err(e));
                 return;
             }
@@ -399,6 +448,7 @@ impl DirectoryModel {
                 (fo.path(), fo)
             })
             .collect();
+        let mut updated = false;
         for i in (0..self.store.n_items()).rev() {
             let Some(fo) = self.store.item(i).and_downcast::<FileObject>() else {
                 continue;
@@ -413,12 +463,24 @@ impl DirectoryModel {
                         || new.mime_type() != fo.mime_type()
                     {
                         fo.update_from(&new);
+                        updated = true;
                     }
                 }
             }
         }
         let added: Vec<glib::Object> = fresh.into_values().map(|fo| fo.upcast()).collect();
         self.store.splice(self.store.n_items(), 0, &added);
+        if updated {
+            self.resort();
+        }
+    }
+
+    /// Re-apply the active sort after items changed in place (new items
+    /// are placed by the sort model on insertion, changed ones aren't).
+    fn resort(&self) {
+        if let Some(sorter) = self.sort_model.sorter() {
+            sorter.changed(gtk::SorterChange::Different);
+        }
     }
 
     fn calculate_folder_sizes(&self) {
@@ -526,6 +588,7 @@ impl DirectoryModel {
                 let store = self.store.clone();
                 let current_path = self.current_path.clone();
                 let sorter = self.sorter.clone();
+                let sort_model = self.sort_model.clone();
 
                 mon.connect_changed(move |_mon, file, _other, event| {
                     let path = current_path.borrow().clone();
@@ -580,6 +643,9 @@ impl DirectoryModel {
                                     let new_obj = FileObject::from_file_info(&path, &info);
                                     if let Some(fo) = store.item(idx).and_downcast::<FileObject>() {
                                         fo.update_from(&new_obj);
+                                        if let Some(sorter) = sort_model.sorter() {
+                                            sorter.changed(gtk::SorterChange::Different);
+                                        }
                                     }
                                 }
                             }

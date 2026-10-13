@@ -585,7 +585,8 @@ impl WayfinderWindow {
         // the name: checking the permissions or sniffing the contents would
         // wait on the mount with the window frozen. (rclone doesn't mark
         // files executable anyway.)
-        if is_fuse_mount(&path) {
+        // (The model's flag also catches a folder reached through a symlink.)
+        if is_fuse_mount(&path) || self.imp().model.is_fuse() {
             let ctx = WidgetExt::display(self).app_launch_context();
             let gio_file = gio::File::for_path(&path);
             let app = gio::AppInfo::default_for_type(&file.mime_type(), false);
@@ -1053,6 +1054,12 @@ impl WayfinderWindow {
         if files.is_empty() {
             return;
         }
+        // Pressing Delete again while a slow mount is still answering would
+        // trash (or offer to permanently delete) the same files twice.
+        if self.imp().trash_in_progress.replace(true) {
+            return;
+        }
+
         // Remember position before deletion
         let old_pos = self.imp().selection.selected();
 
@@ -1068,7 +1075,10 @@ impl WayfinderWindow {
                     })
                     .collect::<Vec<_>>()
             },
-            move |w, results| w.finish_trash(files, old_pos, results),
+            move |w, results| {
+                w.imp().trash_in_progress.set(false);
+                w.finish_trash(files, old_pos, results)
+            },
         );
     }
 

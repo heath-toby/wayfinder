@@ -80,6 +80,8 @@ pub struct WayfinderWindowInner {
     pub type_ahead_buffer: Rc<RefCell<String>>,
     pub type_ahead_generation: Rc<Cell<u32>>,
     pub last_trashed: RefCell<Vec<String>>,
+    /// A move to Bin is still waiting on the filesystem.
+    pub trash_in_progress: Cell<bool>,
     /// Remembers the last-selected filename per directory so that
     /// navigating back into a folder restores the previous selection.
     pub last_position: RefCell<std::collections::HashMap<String, String>>,
@@ -211,6 +213,7 @@ impl Default for WayfinderWindowInner {
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),
             type_ahead_generation: Rc::new(Cell::new(0)),
             last_trashed: RefCell::new(Vec::new()),
+            trash_in_progress: Cell::new(false),
             last_position: RefCell::new(std::collections::HashMap::new()),
             zoom_level: Cell::new(100),
             zoom_css: gtk::CssProvider::new(),
@@ -411,7 +414,7 @@ impl ObjectImpl for WayfinderWindowInner {
                 let model = &w.imp().model;
                 if model.is_fuse() && !model.is_loading() {
                     let w = w.clone();
-                    model.refresh(move || w.update_status());
+                    model.refresh_if_idle(move || w.update_status());
                 }
                 let win2 = w.clone();
                 glib::idle_add_local_once(move || {
@@ -482,6 +485,16 @@ impl ObjectImpl for WayfinderWindowInner {
         let w = window.clone();
         self.model
             .set_on_background_update(move || w.update_status());
+
+        // A background check found the folder can't be listed any more
+        // (deleted, mount gone): report it as a failed load, which also
+        // falls back to the offline copy where there is one.
+        let w = window.clone();
+        self.model.set_on_background_error(move |location, e| {
+            if location.starts_with('/') {
+                w.finish_open_directory(&location, Err(e));
+            }
+        });
     }
 }
 

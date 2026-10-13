@@ -60,7 +60,8 @@ This pattern appears in: directory loading, folder size calculation, FUSE async 
 - Listings are cached (`loader.rs`, 128 folders); a cached folder is shown at once and revalidated in the background. Resting the selection on a folder for 400 ms prefetches its listing
 - Opening a file picks the app from the name-based MIME type, without a permissions check or content sniffing
 - Folder size calculation is **skipped** (shows "—"), and the local size walker never enters FUSE/network mountpoints (matched by path before any stat)
-- File monitor uses `query_info_async()` with 5-second cancellable timeout instead of sync calls
+- No file monitor (its path lookup would run on the main thread, and remote changes never reach it); the window calls `refresh_if_idle()` whenever it becomes active instead
+- One-off actions (rename, new folder, trash, properties, pinning, paste clash check, Tab completion) go through `wayfinder::background::run` / `WayfinderWindow::run_blocking`, which also announce "Waiting for rclone." when slow
 - `trash_or_delete()` returns `NeedsPermanentDelete` when trash isn't supported, triggering a confirmation dialog
 
 ### Action Registration Pattern

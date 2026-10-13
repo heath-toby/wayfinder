@@ -10,11 +10,16 @@
 - **Faster startup** — the last folder is listed once instead of twice, and checking that it still exists no longer holds up the window.
 - **Refresh in place** — after copying, moving, renaming or deleting, the list updates without resetting, so the selection stays where it was.
 - **Opening files on a mount** — the app is chosen from the file type without waiting on the mount.
+- **Everything else stays responsive too** — Rename, batch rename, New Folder, Move to Bin, Properties (and applying permissions), Keep Available Offline, the check for an existing file when pasting, and Tab completion in Go to Location all wait on the mount in the background, saying "Waiting for rclone." if it takes a moment. Pressing Delete again while a move to Bin is still waiting does nothing, rather than trashing the same files twice.
+- **Changes are picked up when you come back** — a folder on a mount is checked for changes whenever the Wayfinder window becomes active again, instead of relying on a file monitor (which never sees changes made elsewhere, and set up its watch on the main thread).
+- **Folders that disappear** — if a recently seen folder can no longer be opened (deleted, or the mount has gone), Wayfinder says so and falls back to the offline copy where there is one, instead of showing what it held last time.
 - **Safe to suspend** — the "Keep Available Offline" refresh pauses before the computer sleeps, and folder-size calculation never walks into a FUSE or network mount. Previously either could leave Wayfinder stuck waiting on rclone, which made suspend fail.
-- **Offline copies are refreshed, not re-downloaded** — at startup only changed files are fetched, into a temporary file that replaces the old copy once complete, so an interrupted refresh no longer loses the offline copy.
+- **Offline copies are refreshed, not re-downloaded** — at startup only changed files are fetched, into a temporary file that replaces the old copy once complete, so an interrupted refresh no longer loses the offline copy. Pins are left alone while their mount is down.
 
 ### Fixed
 
+- **Focus starts in the file list** — at startup, and after Go to Location, focus is on the selected file instead of the sidebar's first place.
+- **Sorting after changes** — a file whose date or size changes moves to its place when the list is sorted by that column.
 - **Opening a file from the command line** — `wayfinder some/file` now opens that file, rather than whichever item happened to be selected in its folder.
 - **Recent Files with spaces in their names** — no longer silently left out.
 - **File chooser (portal)** — Alt+Left, Alt+Right and Alt+Up now go back, forward and up.

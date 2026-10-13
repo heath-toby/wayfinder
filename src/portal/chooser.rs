@@ -89,7 +89,9 @@ pub fn show_chooser(
     // Alt+Left / Alt+Right / Alt+Up, as in the main window.
     {
         let nav_keys = gtk::ShortcutController::new();
-        nav_keys.set_scope(gtk::ShortcutScope::Managed);
+        // Local: the controller sits on the dialog itself, which has no
+        // ancestor to manage a Managed/Global one.
+        nav_keys.set_scope(gtk::ShortcutScope::Local);
         for (accel, button) in [
             ("<Alt>Left", &back_btn),
             ("<Alt>Right", &forward_btn),

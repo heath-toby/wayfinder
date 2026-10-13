@@ -186,9 +186,18 @@ pub(super) fn store(path: &str, entries: Vec<FileInfoData>) {
     });
 }
 
+/// Drop a location's cached listing (it can't be listed any more).
+pub(super) fn forget(path: &str) {
+    CACHE.with(|c| {
+        c.borrow_mut().remove(path);
+    });
+}
+
 /// Fetch a FUSE folder's listing into the cache in the background, so
-/// opening it is instant. One prefetch at a time; folders listed in the
-/// last 30 seconds are skipped.
+/// opening it is instant. One prefetch at a time — until its thread really
+/// returns, so a mount that has stopped answering doesn't collect a stuck
+/// thread per folder — and folders listed in the last 30 seconds are
+/// skipped.
 pub(super) fn prefetch(path: &str) {
     let fresh = CACHE.with(|c| {
         c.borrow()
@@ -204,14 +213,9 @@ pub(super) fn prefetch(path: &str) {
         let path = path.clone();
         spawn(move || list_dir(&path, false))
     };
-    let started = Instant::now();
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         match rx.try_recv() {
-            // Give up on a mount that doesn't answer, so later folders can
-            // still be prefetched.
-            Err(mpsc::TryRecvError::Empty) if started.elapsed().as_secs() < 30 => {
-                return gtk::glib::ControlFlow::Continue;
-            }
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
             Ok(Ok(listing)) if listing.is_fuse => {
                 store(&path, listing.entries.into_iter().map(|(_, e)| e).collect());
             }

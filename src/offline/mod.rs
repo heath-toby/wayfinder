@@ -223,6 +223,12 @@ pub fn unpin_path(original_path: &str) -> Result<(), String> {
 /// temporary file first, so an interrupted refresh never loses the
 /// existing offline copy.
 pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
+    // Pins live on rclone mounts. If the mount isn't up, the path may still
+    // exist as an empty mountpoint directory, and syncing from it would
+    // delete the offline copy just when it's needed.
+    if !crate::rclone_ops::is_fuse_path(&entry.original_path) {
+        return Ok(false);
+    }
     let src = Path::new(&entry.original_path);
     let meta = {
         let _io = sleep::io_step();
