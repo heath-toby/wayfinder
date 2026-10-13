@@ -225,7 +225,7 @@ pub enum Unpinned {
     Removed,
     /// Kept: it's part of a two-way sync folder.
     KeptForSync,
-    /// Kept: another pinned item is inside it, or holds it.
+    /// Kept: a pinned folder holds it.
     KeptForPin,
 }
 
@@ -241,12 +241,22 @@ pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
         // make the next sync delete the files on the remote too.
         return Ok(Unpinned::KeptForSync);
     }
+    // A pinned folder holding this one still wants its copy.
     if manifest
         .keys()
-        .any(|other| paths_overlap(Path::new(other), Path::new(original_path)))
+        .any(|other| Path::new(original_path).starts_with(other))
     {
-        // Another pin's copy is in this one (or holds it): keep it.
         return Ok(Unpinned::KeptForPin);
+    }
+    // Pinned items inside it keep their copies; the rest goes.
+    let inside: Vec<std::path::PathBuf> = manifest
+        .keys()
+        .filter(|other| Path::new(other).starts_with(original_path))
+        .map(|other| cache_path_for(other))
+        .collect();
+    if !inside.is_empty() {
+        remove_except(&cached, &inside);
+        return Ok(Unpinned::Removed);
     }
     if cached.is_dir() {
         let _ = std::fs::remove_dir_all(&cached);
@@ -254,6 +264,29 @@ pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
         let _ = std::fs::remove_file(&cached);
     }
     Ok(Unpinned::Removed)
+}
+
+/// Delete everything in the folder `dir` except `keep` (paths inside it)
+/// and the folders leading to them.
+fn remove_except(dir: &Path, keep: &[std::path::PathBuf]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep.contains(&path) {
+            continue;
+        }
+        if keep.iter().any(|k| k.starts_with(&path)) {
+            remove_except(&path, keep);
+            continue;
+        }
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Whether the offline copy at `cached` overlaps a two-way sync folder's
@@ -525,6 +558,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn unpinning_keeps_only_whats_still_pinned_inside() {
+        let d = dir("except");
+        std::fs::create_dir_all(d.join("Docs/Taxes/2024")).unwrap();
+        std::fs::create_dir_all(d.join("Docs/Old")).unwrap();
+        std::fs::write(d.join("Docs/a.txt"), b"a").unwrap();
+        std::fs::write(d.join("Docs/Taxes/2024/r.pdf"), b"r").unwrap();
+        std::fs::write(d.join("Docs/Taxes/notes.txt"), b"n").unwrap();
+        super::remove_except(&d.join("Docs"), &[d.join("Docs/Taxes/2024")]);
+        assert!(d.join("Docs/Taxes/2024/r.pdf").exists());
+        assert!(!d.join("Docs/Taxes/notes.txt").exists());
+        assert!(!d.join("Docs/a.txt").exists());
+        assert!(!d.join("Docs/Old").exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

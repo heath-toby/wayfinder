@@ -78,6 +78,8 @@ pub struct WayfinderWindowInner {
     /// Showing a folder's offline copy because its mount is unreachable:
     /// what's listed lives in the cache, not on the drive.
     pub offline_view: Cell<bool>,
+    /// A restore from the Bin is under way.
+    pub restoring: Cell<bool>,
     pub current_view: Cell<ViewMode>,
     pub file_selection: RefCell<SelectionState>,
     pub type_ahead_buffer: Rc<RefCell<String>>,
@@ -210,6 +212,7 @@ impl Default for WayfinderWindowInner {
             clipboard: RefCell::new(None),
             pasting: Cell::new(false),
             offline_view: Cell::new(false),
+            restoring: Cell::new(false),
             current_view: Cell::new(ViewMode::List),
             file_selection: RefCell::new(SelectionState::new()),
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),

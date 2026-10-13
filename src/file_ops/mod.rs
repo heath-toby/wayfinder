@@ -39,12 +39,22 @@ pub fn delete_file_recursive(file: &gio::File) -> Result<(), glib::Error> {
     delete_tree(file)
 }
 
+/// `path` with every link resolved but its last part: a link is judged as
+/// itself (deleting or copying it touches only the link), not as the
+/// folder it leads to.
+fn real_location(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => Some(std::fs::canonicalize(parent).ok()?.join(name)),
+        _ => std::fs::canonicalize(path).ok(),
+    }
+}
+
 /// An error if a filesystem is mounted inside `file` (a folder).
 fn refuse_mounts_inside(file: &gio::File) -> Result<(), glib::Error> {
     let Some(path) = file.path() else {
         return Ok(());
     };
-    let real = std::fs::canonicalize(&path).unwrap_or(path);
+    let real = real_location(&path).unwrap_or(path);
     match crate::rclone_ops::mountpoints_inside(&real.to_string_lossy()).first() {
         Some(mount) => Err(glib::Error::new(
             gio::IOErrorEnum::Busy,
@@ -618,15 +628,8 @@ pub fn placement(source: &std::path::Path, dest: &std::path::Path) -> Placement 
 /// real paths (links resolved): into itself, or replacing itself or the
 /// folder that holds it (which would delete it first).
 fn real_placement_refusal(src: &str, dst: &str, is_move: bool, replace: bool) -> Option<String> {
-    let real_src = std::fs::canonicalize(src).ok()?;
-    let dst = std::path::Path::new(dst);
-    let real_dst = std::fs::canonicalize(dst).ok().or_else(|| {
-        Some(
-            std::fs::canonicalize(dst.parent()?)
-                .ok()?
-                .join(dst.file_name()?),
-        )
-    })?;
+    let real_src = real_location(std::path::Path::new(src))?;
+    let real_dst = real_location(std::path::Path::new(dst))?;
     match placement(&real_src, &real_dst) {
         Placement::IntoItself => Some(format!(
             "it can't be {} into itself",
@@ -973,7 +976,18 @@ fn run_with_progress(
                         gio::Cancellable::NONE,
                     );
                     if file_type == gio::FileType::Directory {
-                        copy_directory_recursive(&src, &dst, &cancellable_clone, &ps, replace)
+                        // Before copying: a drive mounted inside would be
+                        // copied whole, only for deleting it to be refused.
+                        refuse_mounts_inside(&src)
+                            .and_then(|()| {
+                                copy_directory_recursive(
+                                    &src,
+                                    &dst,
+                                    &cancellable_clone,
+                                    &ps,
+                                    replace,
+                                )
+                            })
                             .and_then(|()| delete_recursive_gio(&src, &cancellable_clone))
                     } else {
                         copy_keeping_links(&src, &dst, flags, &cancellable_clone, &ps)
@@ -1203,6 +1217,22 @@ mod tests {
         assert!(super::real_placement_refusal(&src, &dst, false, false).is_none());
         let into = d.join("Docs/Photos/Photos").to_string_lossy().to_string();
         assert!(super::real_placement_refusal(&src, &into, false, false).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A link is itself: copying it into the folder it leads to is fine.
+    #[test]
+    fn a_link_is_judged_as_itself() {
+        let d = std::env::temp_dir().join(format!("wayfinder-linkself-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("data/Docs/Archive")).unwrap();
+        std::os::unix::fs::symlink(d.join("data/Docs"), d.join("Docs")).unwrap();
+        let src = d.join("Docs").to_string_lossy().to_string();
+        let dst = d
+            .join("data/Docs/Archive/Docs")
+            .to_string_lossy()
+            .to_string();
+        assert!(super::real_placement_refusal(&src, &dst, false, false).is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 

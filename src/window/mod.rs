@@ -815,32 +815,39 @@ impl WayfinderWindow {
         if files.is_empty() {
             return;
         }
-        let uris: Vec<(String, String)> = files.iter().map(|f| (f.name(), f.path())).collect();
+        // Restoring the same items again while they're on their way would
+        // only report false failures.
+        if self.imp().restoring.replace(true) {
+            return;
+        }
+        let items: Vec<(String, String)> = files.iter().map(|f| (f.name(), f.path())).collect();
         let old_pos = self.imp().selection.selected();
+        let focused = self.get_selected_file().map(|f| f.path());
+        let generation = self.imp().model.generation();
         // Restoring moves files back, maybe onto a slow drive: not on the
         // main thread.
         self.run_blocking(
             "trash:///",
             move || {
-                uris.into_iter()
+                items
+                    .into_iter()
                     .map(|(name, uri)| {
                         let result =
                             wayfinder::file_ops::restore_from_trash(&gio::File::for_uri(&uri))
                                 .map_err(|e| e.to_string());
-                        (name, result)
+                        (name, uri, result)
                     })
                     .collect::<Vec<_>>()
             },
             move |w, results| {
-                let restored: Vec<(String, String)> = results
+                w.imp().restoring.set(false);
+                let failed: Vec<(&String, &String)> = results
                     .iter()
-                    .filter_map(|(name, r)| {
-                        r.as_ref().ok().map(|dest| (name.clone(), dest.clone()))
-                    })
+                    .filter_map(|(name, _, r)| r.as_ref().err().map(|e| (name, e)))
                     .collect();
-                let failed: Vec<(String, String)> = results
+                let restored: Vec<(&String, &String, &String)> = results
                     .iter()
-                    .filter_map(|(name, r)| r.as_ref().err().map(|e| (name.clone(), e.clone())))
+                    .filter_map(|(name, uri, r)| r.as_ref().ok().map(|dest| (name, uri, dest)))
                     .collect();
                 if let Some((name, e)) = failed.first() {
                     let msg = if failed.len() == 1 {
@@ -853,22 +860,25 @@ impl WayfinderWindow {
                 if restored.is_empty() {
                     return;
                 }
+                let msg = match restored.as_slice() {
+                    [(name, _, dest)] => format!("Restored {name} to {dest}"),
+                    _ => format!("Restored {} items", restored.len()),
+                };
+                // Move focus only if the focused item went, and the Bin is
+                // still what's shown.
+                let focused_went = restored
+                    .iter()
+                    .any(|(_, uri, _)| Some(uri.as_str()) == focused.as_deref());
                 w.imp().file_selection.borrow_mut().clear();
-                // Reload the trash listing so the restored items disappear
-                if w.is_in_trash() {
-                    // Then focus the item now where the (first) restored one was.
+                if w.is_in_trash() && w.imp().model.generation() == generation {
                     let win = w.clone();
                     w.imp().model.refresh(move |listed| {
                         win.update_status();
-                        if listed {
+                        if listed && focused_went {
                             win.select_near_removed(old_pos.saturating_add(1));
                         }
                     });
                 }
-                let msg = match restored.as_slice() {
-                    [(name, dest)] => format!("Restored {name} to {dest}"),
-                    _ => format!("Restored {} items", restored.len()),
-                };
                 w.announce(&msg, AccessibleAnnouncementPriority::Medium);
             },
         );
@@ -2015,7 +2025,15 @@ impl WayfinderWindow {
     }
 
     pub fn batch_rename(&self) {
-        if self.refuse_in_offline_view() || self.refuse_in_special_location("renamed") {
+        if self.refuse_in_offline_view() {
+            return;
+        }
+        // Recent Files' items are real files; the Bin's aren't.
+        if self.is_in_trash() {
+            self.announce(
+                "Items in the Bin can't be renamed. Restore them first.",
+                AccessibleAnnouncementPriority::Medium,
+            );
             return;
         }
         let files = self.get_selected_files();
@@ -2507,14 +2525,7 @@ impl WayfinderWindow {
         let work_paths = paths.clone();
         self.run_blocking(
             "trash:///",
-            move || {
-                let trash = gio::File::for_uri("trash:///");
-                work_paths
-                    .iter()
-                    .filter(|path| restore_newest(&trash, path))
-                    .cloned()
-                    .collect::<Vec<String>>()
-            },
+            move || restore_newest(&work_paths),
             move |w, restored| {
                 if restored.is_empty() {
                     w.announce(
@@ -3079,23 +3090,28 @@ fn apply_zoom_css(level: i32) {
     });
 }
 
-/// Restore the most recently trashed item that came from `path` (an older
-/// one from the same place may be in the Bin too). Whether it was.
-fn restore_newest(trash: &gio::File, path: &str) -> bool {
+/// Restore, for each of `paths`, the most recently trashed item that came
+/// from it (an older one from the same place may be in the Bin too).
+/// Returns the paths restored. Goes through the Bin once.
+fn restore_newest(paths: &[String]) -> Vec<String> {
+    let trash = gio::File::for_uri("trash:///");
     let Ok(enumerator) = trash.enumerate_children(
         "standard::name,trash::orig-path,trash::deletion-date",
         gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
         gio::Cancellable::NONE,
     ) else {
-        return false;
+        return Vec::new();
     };
-    let mut newest: Option<(String, std::path::PathBuf)> = None;
+    let wanted: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+    // orig-path → (deletion date, name in the Bin) of the newest.
+    let mut newest: std::collections::HashMap<String, (String, std::path::PathBuf)> =
+        std::collections::HashMap::new();
     while let Ok(Some(info)) = enumerator.next_file(gio::Cancellable::NONE) {
         let orig = info
             .attribute_byte_string("trash::orig-path")
             .map(|p| p.to_string())
             .unwrap_or_default();
-        if orig != path {
+        if !wanted.contains(orig.as_str()) {
             continue;
         }
         // ISO 8601 local time: later sorts after.
@@ -3103,20 +3119,26 @@ fn restore_newest(trash: &gio::File, path: &str) -> bool {
             .attribute_string("trash::deletion-date")
             .map(|d| d.to_string())
             .unwrap_or_default();
-        if newest.as_ref().is_none_or(|(d, _)| date > *d) {
-            newest = Some((date, info.name()));
+        if newest.get(&orig).is_none_or(|(d, _)| date > *d) {
+            newest.insert(orig, (date, info.name()));
         }
     }
-    let Some((_, name)) = newest else {
-        return false;
-    };
-    match wayfinder::file_ops::restore_from_trash(&trash.child(name)) {
-        Ok(_) => true,
-        Err(e) => {
-            log::error!("Failed to restore {path}: {e}");
-            false
-        }
-    }
+    paths
+        .iter()
+        .filter(|path| {
+            let Some((_, name)) = newest.get(path.as_str()) else {
+                return false;
+            };
+            match wayfinder::file_ops::restore_from_trash(&trash.child(name)) {
+                Ok(_) => true,
+                Err(e) => {
+                    log::error!("Failed to restore {path}: {e}");
+                    false
+                }
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 /// A file object for the file at `real` (a link's target), its type
@@ -3178,19 +3200,48 @@ fn has_duplicate(paths: &[String]) -> bool {
     paths.iter().any(|p| !seen.insert(p))
 }
 
-/// Whether `path` is a link, or a folder with one somewhere inside.
+/// Whether `path` is a link, or a folder with one somewhere inside — or
+/// might be: past a few thousand entries, or a drive mounted inside (not
+/// looked into), it says yes, so the paste takes the careful way.
 /// (Not following links; local paths only.)
 fn holds_link(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
     let Ok(meta) = path.symlink_metadata() else {
         return false;
     };
-    if meta.file_type().is_symlink() {
+    let mut budget = 5000;
+    holds_link_within(path, &meta, meta.dev(), &mut budget)
+}
+
+fn holds_link_within(
+    path: &std::path::Path,
+    meta: &std::fs::Metadata,
+    dev: u64,
+    budget: &mut u32,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if meta.file_type().is_symlink() || meta.dev() != dev {
         return true;
     }
-    meta.is_dir()
-        && std::fs::read_dir(path)
-            .map(|entries| entries.flatten().any(|e| holds_link(&e.path())))
-            .unwrap_or(false)
+    if !meta.is_dir() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        let child = entry.path();
+        if let Ok(child_meta) = child.symlink_metadata() {
+            if holds_link_within(&child, &child_meta, dev, budget) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Where `sources` land when copied or moved into `dest_dir`.

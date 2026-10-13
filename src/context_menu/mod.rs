@@ -282,7 +282,7 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                                 gtk::AccessibleAnnouncementPriority::Medium,
                             ),
                             Ok(wayfinder::offline::Unpinned::KeptForPin) => w.announce(
-                                "No longer kept offline. The copy stays, for another item kept offline inside it or around it",
+                                "No longer kept offline by itself. The copy stays: the folder it's in is kept offline",
                                 gtk::AccessibleAnnouncementPriority::Medium,
                             ),
                             Err(e) => w.announce(
@@ -361,16 +361,33 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                                 );
                                 return;
                             }
-                            let source = gio::File::for_path(&p);
-                            let dest_dir = gio::File::for_path(&cache_parent);
-                            wayfinder::file_ops::copy_with_outcome(
-                                &source,
-                                &dest_dir,
-                                &parent_window,
-                                move |downloaded| {
-                                    if let Some(cb) = on_complete {
-                                        cb(downloaded);
+                            // An old copy there (from an earlier pin, or kept for
+                            // one inside) would raise "already exists": this is a
+                            // fresh download, so clear it first (off the main
+                            // thread: it may be big).
+                            let source_path = p.clone();
+                            let old_copy = cache_path.clone();
+                            w.run_blocking(
+                                &p,
+                                move || {
+                                    if old_copy.is_dir() {
+                                        let _ = std::fs::remove_dir_all(&old_copy);
+                                    } else if old_copy.exists() {
+                                        let _ = std::fs::remove_file(&old_copy);
                                     }
+                                },
+                                move |w, ()| {
+                                    let parent_window: gtk::Window = w.clone().upcast();
+                                    wayfinder::file_ops::copy_with_outcome(
+                                        &gio::File::for_path(&source_path),
+                                        &gio::File::for_path(&cache_parent),
+                                        &parent_window,
+                                        move |downloaded| {
+                                            if let Some(cb) = on_complete {
+                                                cb(downloaded);
+                                            }
+                                        },
+                                    );
                                 },
                             );
                         }
