@@ -73,6 +73,9 @@ impl ApplicationImpl for WayfinderApplicationInner {
 
     fn open(&self, files: &[gio::File], _hint: &str) {
         let app = self.obj();
+        // Opened with something to show: this run's start, too — a later
+        // plain launch mustn't reopen the last session over it.
+        self.restored.set(true);
 
         for file in files {
             let window = WayfinderWindow::new(app.upcast_ref());

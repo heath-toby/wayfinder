@@ -168,10 +168,12 @@ pub fn decode_mount_path(field: &str) -> String {
     while i < bytes.len() {
         let octal = bytes
             .get(i + 1..i + 4)
-            .filter(|d| bytes[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
+            .filter(|d| bytes[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)))
+            .map(|d| d.iter().fold(0u32, |n, c| n * 8 + u32::from(c - b'0')))
+            .filter(|n| *n <= 0o377);
         match octal {
-            Some(d) => {
-                out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+            Some(n) => {
+                out.push(n as u8);
                 i += 4;
             }
             None => {

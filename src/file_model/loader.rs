@@ -122,34 +122,28 @@ pub(super) fn list_uri(uri: &str) -> ListResult {
 
 /// Look up recently used files, skipping ones that no longer exist.
 ///
-/// Files on FUSE mounts are asked about all at once, each in its own
-/// thread, and waited for only briefly (a mount that has stopped answering
-/// mustn't hold up the list): one that doesn't answer in time is listed by
-/// name (its type from that; size and date unknown). A mount still busy
-/// with an earlier such question isn't asked again, so stuck threads can't
-/// pile up.
+/// Files on FUSE or network mounts are asked about by one worker per
+/// mount, and waited for only briefly (a mount that has stopped answering
+/// mustn't hold up the list): one that hasn't answered in time is listed
+/// by name (its type from that; size and date unknown). A mount whose
+/// worker from an earlier listing has been stuck a while isn't asked
+/// again, so stuck threads can't pile up.
 pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
     // The mount table, read once for the whole list.
-    let mounts = crate::rclone_ops::fuse_mount_list();
+    let mounts = super::remote_mountpoints();
     let mount_of = |p: &str| {
         mounts
             .iter()
             .find(|m| std::path::Path::new(p).starts_with(m))
             .cloned()
     };
+    let stuck = stuck_mounts();
 
-    // Mounts an earlier listing's questions are still stuck on.
-    let stuck: Vec<String> = BUSY_MOUNTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .keys()
-        .cloned()
-        .collect();
     let mut slots: Vec<Option<(String, FileInfoData)>> = Vec::new();
-    let (tx, rx) = mpsc::channel::<(usize, Option<FileInfoData>)>();
-    let mut asked = 0;
+    // Per mount: the (slot, path) pairs to ask it about.
+    let mut to_ask: Vec<(std::path::PathBuf, Vec<(usize, String)>)> = Vec::new();
     for path in paths {
-        if slots.iter().filter(|s| s.is_some()).count() + asked >= limit {
+        if slots.len() >= limit {
             break;
         }
         let p = std::path::Path::new(&path);
@@ -162,21 +156,10 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
             let index = slots.len();
             slots.push(Some((parent, name_only(p))));
             if !stuck.contains(&mount) {
-                let probe = MountProbe::start(&mount);
-                asked += 1;
-                let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let found = gio::File::for_path(&path)
-                        .query_info(
-                            FUSE_ATTRS,
-                            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                            gio::Cancellable::NONE,
-                        )
-                        .ok()
-                        .map(|info| FileInfoData::from_file_info(&info));
-                    drop(probe);
-                    let _ = tx.send((index, found));
-                });
+                match to_ask.iter_mut().find(|(m, _)| *m == mount) {
+                    Some((_, list)) => list.push((index, path)),
+                    None => to_ask.push((mount, vec![(index, path)])),
+                }
             }
             continue;
         }
@@ -188,6 +171,30 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
             continue;
         };
         slots.push(Some((parent, FileInfoData::from_file_info(&info))));
+    }
+
+    let (tx, rx) = mpsc::channel::<(usize, Option<FileInfoData>)>();
+    let mut asked = 0;
+    for (mount, files) in to_ask {
+        asked += files.len();
+        let tx = tx.clone();
+        let worker = MountWorker::start(&mount);
+        std::thread::spawn(move || {
+            let _worker = worker;
+            for (index, path) in files {
+                let found = gio::File::for_path(&path)
+                    .query_info(
+                        FUSE_ATTRS,
+                        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                        gio::Cancellable::NONE,
+                    )
+                    .ok()
+                    .map(|info| FileInfoData::from_file_info(&info));
+                if tx.send((index, found)).is_err() {
+                    break; // the listing has moved on
+                }
+            }
+        });
     }
     drop(tx);
 
@@ -210,7 +217,7 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
         }
     }
 
-    let entries: Vec<(String, FileInfoData)> = slots.into_iter().flatten().take(limit).collect();
+    let entries: Vec<(String, FileInfoData)> = slots.into_iter().flatten().collect();
     Ok(Listing {
         path: "recent:///".to_string(),
         real_path: "recent:///".to_string(),
@@ -238,32 +245,40 @@ fn name_only(path: &std::path::Path) -> FileInfoData {
     }
 }
 
-/// Mounts with Recent Files questions unanswered, and how many.
-static BUSY_MOUNTS: std::sync::Mutex<std::collections::BTreeMap<String, u32>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// Mounts with a Recent Files worker still asking, and since when.
+static BUSY_MOUNTS: std::sync::Mutex<Vec<(std::path::PathBuf, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
 
-/// A question being asked of a mount, while alive.
-struct MountProbe(String);
+/// Mounts whose worker has been asking for over two seconds: stuck.
+fn stuck_mounts() -> Vec<std::path::PathBuf> {
+    BUSY_MOUNTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, since)| since.elapsed() > std::time::Duration::from_secs(2))
+        .map(|(mount, _)| mount.clone())
+        .collect()
+}
 
-impl MountProbe {
-    fn start(mount: &str) -> Self {
-        *BUSY_MOUNTS
+/// A worker asking a mount about recent files, while alive.
+struct MountWorker(std::path::PathBuf, Instant);
+
+impl MountWorker {
+    fn start(mount: &std::path::Path) -> Self {
+        let since = Instant::now();
+        BUSY_MOUNTS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(mount.to_string())
-            .or_default() += 1;
-        Self(mount.to_string())
+            .push((mount.to_path_buf(), since));
+        Self(mount.to_path_buf(), since)
     }
 }
 
-impl Drop for MountProbe {
+impl Drop for MountWorker {
     fn drop(&mut self) {
         let mut busy = BUSY_MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = busy.get_mut(&self.0) {
-            *count -= 1;
-            if *count == 0 {
-                busy.remove(&self.0);
-            }
+        if let Some(i) = busy.iter().position(|(m, t)| *m == self.0 && *t == self.1) {
+            busy.swap_remove(i);
         }
     }
 }

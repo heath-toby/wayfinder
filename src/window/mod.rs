@@ -2353,27 +2353,14 @@ impl WayfinderWindow {
                         let w_done = w.clone();
                         let renamed = pairs.clone();
                         let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
-                            Some(Box::new(move |_| {
-                                // Some may have gone through even if others
-                                // failed: see which (off the main thread, the
-                                // mount may be slow) and keep those in Recent.
-                                let probe_at = renamed
-                                    .first()
-                                    .map(|(old, _)| old.clone())
-                                    .unwrap_or_default();
-                                w_done.run_blocking(
-                                    &probe_at,
-                                    move || {
-                                        renamed
-                                            .into_iter()
-                                            .filter(|(old, new)| {
-                                                !std::path::Path::new(old).exists()
-                                                    && std::path::Path::new(new).exists()
-                                            })
-                                            .collect::<Vec<_>>()
-                                    },
-                                    |_, done| note_renames(&done),
-                                );
+                            Some(Box::new(move |succeeded| {
+                                // Before the reload: in Recent Files it lists
+                                // what the recent list then says. (rclone
+                                // renames on the remote, so the mount can't
+                                // be asked which renames went through.)
+                                if succeeded {
+                                    note_renames(&renamed);
+                                }
                                 w_done.forget_moved(&moved);
                                 w_done.reload_after_change(&changed);
                             }));
