@@ -114,11 +114,18 @@ fn remove_bookmark_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
         .unwrap_or_else(|| path.to_string());
     let idx = row.index();
     list.remove(row);
+    // A neighbour that can take focus (not a separator), or else the first
+    // row that can.
     let next = [idx, idx - 1]
         .into_iter()
         .filter(|i| *i >= 0)
         .filter_map(|i| list.row_at_index(i))
-        .find(|r| r.is_selectable());
+        .find(|r| r.is_selectable())
+        .or_else(|| {
+            (0..)
+                .map_while(|i| list.row_at_index(i))
+                .find(|r| r.is_selectable())
+        });
     if let Some(next) = next {
         list.select_row(Some(&next));
         next.grab_focus();
@@ -274,6 +281,11 @@ impl WayfinderSidebar {
             use gtk::gdk;
 
             let Some(row) = list.selected_row() else {
+                // Delete must never reach the window (it would bin the
+                // files selected in the unseen file list).
+                if key == gdk::Key::Delete {
+                    return glib::Propagation::Stop;
+                }
                 return glib::Propagation::Proceed;
             };
             let name = row.widget_name().to_string();
@@ -370,7 +382,8 @@ impl WayfinderSidebar {
                             r.grab_focus();
                             // Restore real label after Orca reads the announcement
                             let row_ref = r.clone();
-                            let current_display = bookmarks[ci].1.clone();
+                            // After the swap, the moved bookmark is at ti.
+                            let current_display = bookmarks[ti].1.clone();
                             glib::timeout_add_local_once(
                                 std::time::Duration::from_millis(500),
                                 move || {
@@ -998,6 +1011,8 @@ impl WayfinderSidebar {
 
         // Keyboard controller for reordering with announcements
         let key_ctrl = gtk::EventControllerKey::new();
+        // Capture: the ListBox's own Ctrl+arrow bindings would take the keys.
+        key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
         let list_for_keys = edit_list.clone();
         let data_for_keys = row_data.clone();
         let dlg_for_keys = dlg.clone();
@@ -1137,22 +1152,32 @@ impl WayfinderSidebar {
                 list_row.set_child(Some(&hbox));
                 list_row.set_widget_name(id);
 
+                // The row says whether it's shown, as when the dialog opened.
+                let row_label = |id: &str, shown: bool| {
+                    format!("{id}, {}", if shown { "shown" } else { "hidden" })
+                };
                 // For the moved row, set the announcement as the label
                 // so Orca reads it instead of the plain name
                 if i == new_idx as usize {
                     list_row.update_property(&[gtk::accessible::Property::Label(&announcement)]);
                 } else {
-                    list_row.update_property(&[gtk::accessible::Property::Label(id.as_str())]);
+                    list_row
+                        .update_property(&[gtk::accessible::Property::Label(&row_label(id, *vis))]);
                 }
 
                 // Sync checkbox
                 let data_ref = data_for_keys.clone();
                 let id_clone = id.clone();
+                let row_for_label = list_row.clone();
+                let dlg_for_toggle = dlg_for_keys.clone();
                 check.connect_toggled(move |cb| {
                     let mut d = data_ref.borrow_mut();
                     if let Some(entry) = d.iter_mut().find(|(name, _)| name == &id_clone) {
                         entry.1 = cb.is_active();
                     }
+                    let text = row_label(&id_clone, cb.is_active());
+                    row_for_label.update_property(&[gtk::accessible::Property::Label(&text)]);
+                    dlg_for_toggle.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
                 });
 
                 list_for_keys.append(&list_row);
@@ -1161,7 +1186,7 @@ impl WayfinderSidebar {
                     list_for_keys.select_row(Some(&list_row));
                     // Restore the real label after Orca has read the announcement
                     let row_ref = list_row.clone();
-                    let real_name = id.clone();
+                    let real_name = row_label(id, *vis);
                     let row_to_focus = list_row.clone();
                     glib::idle_add_local_once(move || {
                         row_to_focus.grab_focus();

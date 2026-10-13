@@ -12,6 +12,7 @@
 
 pub mod progress;
 
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::Sender;
 
@@ -87,6 +88,51 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     };
     *last = Some((std::time::Instant::now(), fuse_mounts, found.clone()));
     found
+}
+
+/// `path` with its links resolved, one part at a time, never touching a
+/// FUSE mount: once the path resolved so far is on one, the rest is taken
+/// as written. (So, unlike canonicalize, it's safe on the main thread.)
+pub fn resolve_links_outside_mounts(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::from("/");
+    let mut parts: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .filter(|c| !matches!(c, Component::RootDir | Component::Prefix(_)))
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let mut hops = 0;
+    while let Some(part) = parts.pop_front() {
+        match part.to_str() {
+            Some(".") => continue,
+            Some("..") => {
+                out.pop();
+                continue;
+            }
+            _ => {}
+        }
+        out.push(&part);
+        if is_fuse_path(&out.to_string_lossy()) {
+            out.extend(parts);
+            break;
+        }
+        if let Ok(target) = std::fs::read_link(&out) {
+            hops += 1;
+            if hops > 40 {
+                break; // a loop
+            }
+            out.pop();
+            if target.is_absolute() {
+                out = std::path::PathBuf::from("/");
+            }
+            for c in target.components().rev() {
+                if !matches!(c, Component::RootDir | Component::Prefix(_)) {
+                    parts.push_front(c.as_os_str().to_os_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Filesystems mounted inside `path` (not at it): deleting `path` would
@@ -1030,6 +1076,21 @@ mod fuse_type_tests {
 #[cfg(test)]
 mod mount_parse_tests {
     use super::{mountpoints_inside_of, parse_rclone_mount};
+
+    #[test]
+    fn links_are_resolved_by_reading_them() {
+        let d = std::env::temp_dir().join(format!("wayfinder-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("data/Work")).unwrap();
+        std::os::unix::fs::symlink(d.join("data"), d.join("Cloud")).unwrap();
+        std::os::unix::fs::symlink("../data/Work", d.join("data/w")).unwrap();
+        let resolved = super::resolve_links_outside_mounts(&d.join("Cloud/w/x.txt"));
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&d).unwrap().join("data/Work/x.txt")
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn mounts_inside_a_folder_are_found() {

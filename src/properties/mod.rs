@@ -22,7 +22,13 @@ struct Details {
 const SPECIAL_BITS: u32 = 0o7000;
 
 fn gather_details(path: &str) -> Result<Details, String> {
-    let info = gio::File::for_path(path)
+    // Items in the Bin are trash:/// URIs, not paths.
+    let file = if path.contains("://") {
+        gio::File::for_uri(path)
+    } else {
+        gio::File::for_path(path)
+    };
+    let info = file
         .query_info(
             "time::modified",
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,

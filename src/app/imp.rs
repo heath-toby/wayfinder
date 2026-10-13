@@ -68,42 +68,26 @@ impl ApplicationImpl for WayfinderApplicationInner {
 
             if let Some(path) = file.path() {
                 let path_str = path.to_string_lossy().to_string();
-                if wayfinder::rclone_ops::is_fuse_path(&path_str) {
-                    // Don't stat a FUSE path here: a slow mount would hold
-                    // up startup. Navigating resolves a file to its folder;
-                    // whether to open it is checked in the background.
-                    window.navigate_to_path(&path_str);
-                    let probe = path_str.clone();
-                    window.run_blocking(
-                        &path_str,
-                        move || wayfinder::file_model::query_file(&probe),
-                        |w, found| {
-                            if let Some((parent, data)) = found {
-                                if !data.is_directory {
-                                    // Same as opening it from the list: the
-                                    // per-file app, or one chosen by name.
-                                    w.open_file(&FileObject::from_data(&parent, &data));
-                                }
+                // Don't stat it here: on a slow mount (or through a link
+                // to one) that would hold up startup. Navigating resolves
+                // a file to its folder; whether to open it — with its
+                // per-file app, if one was chosen — is checked in the
+                // background.
+                window.navigate_to_path(&path_str);
+                let probe = path_str.clone();
+                window.run_blocking(
+                    &path_str,
+                    move || wayfinder::file_model::query_file(&probe),
+                    |w, found| {
+                        if let Some((parent, data)) = found {
+                            if !data.is_directory {
+                                // Same as opening it from the list: the
+                                // per-file app, or one chosen by name.
+                                w.open_file(&FileObject::from_data(&parent, &data));
                             }
-                        },
-                    );
-                } else if path.is_dir() {
-                    // It's a directory — navigate to it
-                    window.navigate_to_path(&path_str);
-                } else if path.is_file() {
-                    // It's a file — navigate to its parent and open it
-                    if let Some(parent) = path.parent() {
-                        window.navigate_to_path(&parent.to_string_lossy());
-                    }
-                    // Open the file with its associated app
-                    let ctx = gtk::prelude::WidgetExt::display(&window).app_launch_context();
-                    if let Err(e) = gio::AppInfo::launch_default_for_uri(&file.uri(), Some(&ctx)) {
-                        log::error!("Failed to open {path_str}: {e}");
-                    }
-                } else {
-                    // Path doesn't exist yet — try navigating (will walk up)
-                    window.navigate_to_path(&path_str);
-                }
+                        }
+                    },
+                );
             }
 
             window.present();

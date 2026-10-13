@@ -100,18 +100,31 @@ pub fn parse_options(
         .and_then(|v| <bool>::try_from(v.clone()).ok())
         .unwrap_or(false);
 
-    let current_folder = options.get("current_folder").and_then(|v| {
-        let bytes: Result<Vec<u8>, _> = v.clone().try_into();
-        bytes.ok().map(|b| {
-            // Remove null terminator if present
-            let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
-            String::from_utf8_lossy(&b[..end]).to_string()
+    let path_option = |key: &str| {
+        options.get(key).and_then(|v| {
+            let bytes: Result<Vec<u8>, _> = v.clone().try_into();
+            bytes.ok().map(|b| {
+                // Remove null terminator if present
+                let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
+                String::from_utf8_lossy(&b[..end]).to_string()
+            })
         })
-    });
-
-    let current_name = options
+    };
+    let mut current_folder = path_option("current_folder");
+    let mut current_name = options
         .get("current_name")
         .and_then(|v| <String>::try_from(v.clone()).ok());
+
+    // "Save As" on an existing file: start in its folder, with its name.
+    if let Some(file) = path_option("current_file").filter(|f| !f.is_empty()) {
+        let file = std::path::Path::new(&file);
+        if current_folder.is_none() {
+            current_folder = file.parent().map(|p| p.to_string_lossy().to_string());
+        }
+        if current_name.is_none() {
+            current_name = file.file_name().map(|n| n.to_string_lossy().to_string());
+        }
+    }
 
     (directory, current_folder, current_name)
 }

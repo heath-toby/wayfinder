@@ -246,10 +246,23 @@ pub fn show_chooser(
         let sel = selection.clone();
         let d = dlg.clone();
         let le = location_entry.clone();
+        let name_entry = filename_entry.clone();
+        let accept = accept_btn.clone();
         col_controller.connect_key_pressed(move |_ctrl, key, _code, mods| {
             use gtk::gdk;
-            if key == gdk::Key::Tab || key == gdk::Key::ISO_Left_Tab {
+            let back = key == gdk::Key::ISO_Left_Tab
+                || (key == gdk::Key::Tab && mods.contains(gdk::ModifierType::SHIFT_MASK));
+            if back {
+                // Back: the location.
                 le.grab_focus();
+                glib::Propagation::Stop
+            } else if key == gdk::Key::Tab {
+                // On: the file name to save as, or the button to open with —
+                // what comes next, rather than round to the top again.
+                match &name_entry {
+                    Some(entry) => entry.grab_focus(),
+                    None => accept.grab_focus(),
+                };
                 glib::Propagation::Stop
             } else if key == gdk::Key::Left && !mods.contains(gdk::ModifierType::ALT_MASK) {
                 let col = cc.get();
@@ -443,10 +456,19 @@ pub fn show_chooser(
         let sel = selection.clone();
         let d = dlg.clone();
         sidebar.connect_place_activated(move |path| {
-            if !path.starts_with("trash:") {
-                nav.borrow_mut().navigate_to(PathBuf::from(&path));
-                load_dir(&model, &path, &le, &sl, &nav, &bb, &fb, &ub, &sel, &d);
+            // The Bin and Recent Files aren't folders to choose from.
+            if path.starts_with("trash:") || path.starts_with("recent:") {
+                d.announce(
+                    &format!(
+                        "{} can't be opened in the file chooser",
+                        wayfinder::file_model::display_name(&path)
+                    ),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+                return;
             }
+            nav.borrow_mut().navigate_to(PathBuf::from(&path));
+            load_dir(&model, &path, &le, &sl, &nav, &bb, &fb, &ub, &sel, &d);
         });
     }
 
@@ -458,6 +480,26 @@ pub fn show_chooser(
             if sf.borrow_mut().take().is_some() {
                 label.set_text("No file selected");
             }
+        });
+    }
+
+    // -- Enter in the location: go there --
+    {
+        let nav = nav.clone();
+        let model = model.clone();
+        let sl = status_label.clone();
+        let bb = back_btn.clone();
+        let fb = forward_btn.clone();
+        let ub = up_btn.clone();
+        let sel = selection.clone();
+        let d = dlg.clone();
+        location_entry.connect_activate(move |entry| {
+            let path = wayfinder::path_complete::expand_tilde(entry.text().trim());
+            if path.is_empty() {
+                return;
+            }
+            nav.borrow_mut().navigate_to(PathBuf::from(&path));
+            load_dir(&model, &path, entry, &sl, &nav, &bb, &fb, &ub, &sel, &d);
         });
     }
 

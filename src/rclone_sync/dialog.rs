@@ -12,7 +12,11 @@ use super::{pair_for, remove_pair, set_pair};
 ///
 /// If a sync pair already exists, allows editing or removing it. Otherwise
 /// creates a new pair and offers to run the initial sync immediately.
-pub fn show_dialog(window: &impl IsA<gtk::Window>, local_path: &str, on_close: impl Fn() + 'static) {
+pub fn show_dialog(
+    window: &impl IsA<gtk::Window>,
+    local_path: &str,
+    on_close: impl Fn() + 'static,
+) {
     let parent: gtk::Window = window.clone().upcast();
 
     if !rclone_available() {
@@ -57,7 +61,14 @@ pub fn show_dialog(window: &impl IsA<gtk::Window>, local_path: &str, on_close: i
     // remote-spec lookup. If the kernel says "rclone FUSE" but the parser
     // can't extract the remote, we still redirect to a cache path — the
     // pair just can't pre-fill the remote text.
-    let is_on_rclone_mount = crate::rclone_ops::is_rclone_fuse_path(local_path);
+    // By where the folder really is: a link into the mount counts (that's
+    // the same disaster). Resolved without touching the mount.
+    let real_path =
+        crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(local_path))
+            .to_string_lossy()
+            .to_string();
+    let is_on_rclone_mount = crate::rclone_ops::is_rclone_fuse_path(local_path)
+        || crate::rclone_ops::is_rclone_fuse_path(&real_path);
     let sync_local_path = if is_on_rclone_mount {
         crate::offline::cache_path_for(local_path)
             .to_string_lossy()
@@ -86,7 +97,11 @@ pub fn show_dialog(window: &impl IsA<gtk::Window>, local_path: &str, on_close: i
         .label("Rclone remote and path (e.g. Proton:Work)")
         .xalign(0.0)
         .build();
-    let remote_entry = gtk::Entry::builder().hexpand(true).build();
+    // Enter in it presses the default button (Save and sync).
+    let remote_entry = gtk::Entry::builder()
+        .hexpand(true)
+        .activates_default(true)
+        .build();
     if let Some(ref existing) = existing {
         remote_entry.set_text(&existing.remote);
     } else {
@@ -261,7 +276,12 @@ pub fn show_dialog(window: &impl IsA<gtk::Window>, local_path: &str, on_close: i
             // the same remote it's mounted from. By the time we get here we
             // should already have redirected to the cache path, but check
             // again in case someone constructed a pathological pair manually.
-            if let Some(target) = crate::rclone_ops::rclone_for_path(&sync_local) {
+            let guard_path = crate::rclone_ops::resolve_links_outside_mounts(
+                std::path::Path::new(&sync_local),
+            );
+            if let Some(target) =
+                crate::rclone_ops::rclone_for_path(&guard_path.to_string_lossy())
+            {
                 if target.full_remote_spec.eq_ignore_ascii_case(remote) {
                     parent.announce(
                         "Refusing to sync a folder with itself: the local path is already mounted from this same remote. Pick a different remote path or use the offline-cache flow.",
@@ -278,7 +298,12 @@ pub fn show_dialog(window: &impl IsA<gtk::Window>, local_path: &str, on_close: i
             // dialog opened or some path manipulation happened. Either way,
             // running bisync against a FUSE-mounted path that backs onto the
             // same provider risks data loss.
-            if crate::rclone_ops::is_rclone_fuse_path(&sync_local) {
+            let sync_local_real = crate::rclone_ops::resolve_links_outside_mounts(
+                std::path::Path::new(&sync_local),
+            );
+            if crate::rclone_ops::is_rclone_fuse_path(&sync_local)
+                || crate::rclone_ops::is_rclone_fuse_path(&sync_local_real.to_string_lossy())
+            {
                 parent.announce(
                     "Refusing to sync: the local path is on an rclone FUSE mount. This would sync the remote with itself, risking data loss. Close this dialog and try again — Wayfinder will redirect to the offline cache path.",
                     AccessibleAnnouncementPriority::High,
@@ -342,7 +367,17 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
         );
         return;
     }
-    if let Err(e) = std::fs::create_dir_all(&pair.sync_local_path) {
+    // Creating it touches the filesystem: not on a FUSE mount from here
+    // (a slow one would freeze the window); bisync reports what's missing.
+    let on_mount = crate::rclone_ops::is_fuse_path(
+        &crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(
+            &pair.sync_local_path,
+        ))
+        .to_string_lossy(),
+    );
+    if on_mount {
+        // (nothing: see above)
+    } else if let Err(e) = std::fs::create_dir_all(&pair.sync_local_path) {
         parent_window.announce(
             &format!("Cannot create local sync dir: {e}"),
             AccessibleAnnouncementPriority::High,
@@ -443,6 +478,6 @@ fn format_duration(secs: i64) -> String {
 /// Delegates to `crate::rclone_ops::rclone_for_path` so this and offline
 /// pinning agree on what remote backs a given local path.
 fn suggest_remote_for_local(local_path: &str) -> Option<String> {
-    crate::rclone_ops::rclone_for_path(local_path).map(|t| t.full_remote_spec)
+    let real = crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(local_path));
+    crate::rclone_ops::rclone_for_path(&real.to_string_lossy()).map(|t| t.full_remote_spec)
 }
-
