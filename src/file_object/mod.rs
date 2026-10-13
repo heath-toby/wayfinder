@@ -17,6 +17,9 @@ pub struct FileInfoData {
     /// Hidden as GIO sees it: a dot name, a backup (`name~`), or listed in
     /// the folder's `.hidden` file.
     pub is_hidden: bool,
+    /// Size (and date) not known: listed by name only (a recent file on a
+    /// mount that didn't answer in time). Shown as unknown, not as 0.
+    pub size_unknown: bool,
     pub is_directory: bool,
     pub size: u64,
     pub modified: i64,
@@ -65,6 +68,7 @@ impl FileInfoData {
             name,
             display_name,
             is_hidden,
+            size_unknown: false,
             is_directory,
             size,
             modified,
@@ -98,7 +102,7 @@ impl FileObject {
         } else {
             &data.name
         };
-        let size_display = if data.is_directory {
+        let size_display = if data.is_directory || data.size_unknown {
             String::from("\u{2014}")
         } else {
             format_size(data.size)
@@ -120,6 +124,8 @@ impl FileObject {
         let search_string = name.to_lowercase();
         let a11y_name = if data.is_directory {
             format!("{name}, Folder")
+        } else if data.size_unknown {
+            format!("{name}, size unknown, {file_type_name}")
         } else {
             format!("{name}, {size_display}, {file_type_name}")
         };

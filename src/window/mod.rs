@@ -3361,6 +3361,7 @@ fn link_target(real: &std::path::Path) -> FileObject {
             name: name.clone(),
             display_name: name,
             is_hidden: false,
+            size_unknown: false,
             is_directory: false,
             size: 0,
             modified: 0,

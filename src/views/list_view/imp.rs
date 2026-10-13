@@ -499,6 +499,7 @@ mod tests {
                 name: name.to_string(),
                 display_name: name.to_string(),
                 is_hidden: false,
+                size_unknown: false,
                 is_directory,
                 size: 0,
                 modified: 0,

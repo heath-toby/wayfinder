@@ -1,6 +1,7 @@
 mod loader;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -77,7 +78,12 @@ pub struct DirectoryModel {
     /// Refresh threads still running — counted by the threads themselves,
     /// so one left waiting on a dead mount after the user moved on still
     /// counts.
-    refreshes_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Bumped by each listing's folder-size job: older ones see it and
+    /// stop (walking a big tree takes a while).
+    size_job: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// By location: a thread stuck on one dead mount mustn't stop
+    /// refreshes of the others.
+    refreshes_in_flight: std::sync::Arc<std::sync::Mutex<HashMap<String, u32>>>,
     /// A refresh was asked for while a navigation was loading.
     refresh_after_load: Rc<Cell<bool>>,
 }
@@ -155,6 +161,7 @@ impl DirectoryModel {
             on_background_update: Rc::new(RefCell::new(None)),
             on_background_error: Rc::new(RefCell::new(None)),
             refreshes_in_flight: Default::default(),
+            size_job: Default::default(),
             refresh_after_load: Default::default(),
         }
     }
@@ -244,11 +251,13 @@ impl DirectoryModel {
     /// waiting — so checking for changes each time the window is focused
     /// can't pile up threads on a mount that has stopped answering.
     pub fn refresh_if_idle(&self, on_done: impl FnOnce() + 'static) {
-        if self
+        let busy = self
             .refreshes_in_flight
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.current_path())
+            .is_some_and(|n| *n > 0);
+        if !busy {
             self.refresh(move |_| on_done());
         }
     }
@@ -399,10 +408,21 @@ impl DirectoryModel {
             loader::spawn(job)
         } else {
             let in_flight = self.refreshes_in_flight.clone();
-            in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let location = self.current_path();
+            *in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(location.clone())
+                .or_default() += 1;
             loader::spawn(move || {
                 let result = job();
-                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let mut counts = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(n) = counts.get_mut(&location) {
+                    *n -= 1;
+                    if *n == 0 {
+                        counts.remove(&location);
+                    }
+                }
                 result
             })
         };
@@ -464,16 +484,22 @@ impl DirectoryModel {
             on_done(Some(Ok(self.store.n_items())));
             return;
         }
-        self.applied_seq.set(seq);
         if apply == Apply::Replace {
             self.loading.set(false);
         }
+        if apply != Apply::Diff || result.is_ok() {
+            self.applied_seq.set(seq);
+        }
         let listing = match result {
             Ok(listing) => listing,
+            Err(e) if apply == Apply::Diff => {
+                // Nothing applied (it may be a passing error), so a listing
+                // still to come — a cached folder's check — isn't overtaken.
+                log::warn!("refreshing {} failed: {e}", self.current_path());
+                on_done(Some(Err(e)));
+                return;
+            }
             Err(e) => {
-                if apply == Apply::Diff {
-                    log::warn!("refreshing {} failed: {e}", self.current_path());
-                }
                 if apply == Apply::Revalidate {
                     // The cached listing on screen can't be confirmed
                     // (deleted, mount gone): stop showing what it held.
@@ -598,7 +624,12 @@ impl DirectoryModel {
             return;
         }
 
-        spawn_size_job(&self.store, &self.sort_model, base, dirs, skip);
+        let token = self
+            .size_job
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let job = SizeJob(self.size_job.clone(), token);
+        spawn_size_job(&self.store, &self.sort_model, base, dirs, skip, job);
     }
 
     /// Watch a local directory for changes. (Not used on FUSE mounts.)
@@ -612,6 +643,7 @@ impl DirectoryModel {
                 let current_path = self.current_path.clone();
                 let sorter = self.sorter.clone();
                 let sort_model = self.sort_model.clone();
+                let size_job = self.size_job.clone();
 
                 mon.connect_changed(move |_mon, file, _other, event| {
                     let path = current_path.borrow().clone();
@@ -656,12 +688,16 @@ impl DirectoryModel {
                                 sorter.changed(gtk::SorterChange::Different);
                                 // It says "Calculating...": do so.
                                 if file_obj.is_directory() {
+                                    // Part of the current listing's job:
+                                    // stopped by the next one.
+                                    let token = size_job.load(std::sync::atomic::Ordering::SeqCst);
                                     spawn_size_job(
                                         &store,
                                         &sort_model,
                                         path.clone(),
                                         vec![(file_obj.path(), file_obj.name())],
                                         remote_mountpoints(),
+                                        SizeJob(size_job.clone(), token),
                                     );
                                 }
                             }
@@ -733,12 +769,22 @@ impl DirectoryModel {
 
 /// Work out the sizes of the folders `dirs` ((key in the store, name in
 /// `base`)) on a worker thread, and show each as it comes in.
+/// A folder-size job's place in line: it stops once a newer one starts.
+struct SizeJob(std::sync::Arc<std::sync::atomic::AtomicU64>, u64);
+
+impl SizeJob {
+    fn superseded(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) != self.1
+    }
+}
+
 fn spawn_size_job(
     store: &gio::ListStore,
     sort_model: &SortListModel,
     base: String,
     dirs: Vec<(String, String)>,
     skip: std::collections::HashSet<std::path::PathBuf>,
+    job: SizeJob,
 ) {
     // Channel: thread sends (path, size) pairs, main thread polls and
     // updates store. No size means a folder that isn't walked.
@@ -755,6 +801,9 @@ fn spawn_size_job(
         // subvolumes and overlay layers have their own, but are the folder.
         let mounts = all_mountpoints();
         for (key, name) in &dirs {
+            if job.superseded() {
+                return;
+            }
             let real = base.join(name);
             // A link to a folder isn't walked: it may lead anywhere — onto
             // a mount, or round in a loop.
@@ -763,7 +812,10 @@ fn spawn_size_job(
                 && real
                     .symlink_metadata()
                     .is_ok_and(|m| !m.file_type().is_symlink());
-            let size = walkable.then(|| walk_dir_size(&real, &mounts));
+            let size = walkable.then(|| walk_dir_size(&real, &mounts, &job));
+            if job.superseded() {
+                return;
+            }
             let _ = tx.send((key.clone(), size));
         }
     });
@@ -857,8 +909,11 @@ pub fn query_file(path: &str) -> Option<(String, crate::file_object::FileInfoDat
 /// Paths of recently used local files. The RecentManager is main-thread
 /// only, so this runs there; it touches no files.
 fn recent_paths() -> Vec<String> {
-    gtk::RecentManager::default()
-        .items()
+    // Most recently used first: the list is cut to the newest ones, and
+    // the manager's own order is the file's, not by use.
+    let mut items = gtk::RecentManager::default().items();
+    items.sort_by_key(|item| std::cmp::Reverse(item.modified().to_unix()));
+    items
         .iter()
         .filter(|item| item.uri().starts_with("file://"))
         .filter_map(|item| gio::File::for_uri(&item.uri()).path())
@@ -889,8 +944,9 @@ fn remote_mountpoints() -> std::collections::HashSet<std::path::PathBuf> {
 fn walk_dir_size(
     dir: &std::path::Path,
     skip: &std::collections::HashSet<std::path::PathBuf>,
+    job: &SizeJob,
 ) -> u64 {
-    walk_dir_size_impl(dir, skip, 0)
+    walk_dir_size_impl(dir, skip, job, 0)
 }
 
 /// Every mountpoint, from /proc/mounts.
@@ -907,9 +963,10 @@ fn all_mountpoints() -> std::collections::HashSet<std::path::PathBuf> {
 fn walk_dir_size_impl(
     dir: &std::path::Path,
     skip: &std::collections::HashSet<std::path::PathBuf>,
+    job: &SizeJob,
     depth: u32,
 ) -> u64 {
-    if depth > 100 {
+    if depth > 100 || job.superseded() {
         return 0;
     }
     let mut total = 0u64;
@@ -927,7 +984,7 @@ fn walk_dir_size_impl(
         if meta.file_type().is_symlink() || meta.is_file() {
             total += meta.len();
         } else if meta.is_dir() {
-            total += walk_dir_size_impl(&path, skip, depth + 1);
+            total += walk_dir_size_impl(&path, skip, job, depth + 1);
         }
     }
     total

@@ -58,7 +58,19 @@ pub type ListResult = Result<Listing, String>;
 pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
     let mut dir = PathBuf::from(path);
     if resolve {
-        while !dir.is_dir() {
+        // Up only past what isn't there (or isn't a folder): a mount that
+        // has stopped answering, or a folder that can't be read, is an
+        // error to report — not a reason to open its parent instead (and
+        // miss the offline copy, or the "permission denied").
+        loop {
+            match std::fs::metadata(&dir) {
+                Ok(meta) if meta.is_dir() => break,
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(20) => {
+                } // ENOTDIR
+                Err(e) => return Err(e.to_string()),
+            }
             match dir.parent() {
                 Some(parent) => dir = parent.to_path_buf(),
                 None => {
@@ -224,6 +236,7 @@ fn name_only(path: &std::path::Path) -> FileInfoData {
     FileInfoData {
         display_name: name.clone(),
         is_hidden: name.starts_with('.'),
+        size_unknown: true,
         name,
         is_directory: false,
         size: 0,
@@ -440,6 +453,7 @@ mod tests {
                     name: "report.txt".to_string(),
                     display_name: "report.txt".to_string(),
                     is_hidden: false,
+                    size_unknown: false,
                     is_directory: false,
                     size: 1,
                     modified: 0,

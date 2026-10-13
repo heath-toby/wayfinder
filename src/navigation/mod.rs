@@ -31,6 +31,13 @@ impl NavigationState {
     /// Replace the current entry, e.g. when the folder asked for turned out
     /// not to exist and its nearest existing parent was opened instead.
     pub fn replace_current(&mut self, path: PathBuf) {
+        // The entry before may already be it (a missing folder opened its
+        // parent, where we came from): one entry, or Back goes nowhere.
+        if self.current_index > 0 && self.history[self.current_index - 1] == path {
+            self.history.remove(self.current_index);
+            self.current_index -= 1;
+            return;
+        }
         self.history[self.current_index] = path;
     }
 
@@ -74,6 +81,16 @@ impl NavigationState {
 mod tests {
     use super::NavigationState;
     use std::path::PathBuf;
+
+    /// /Docs → /Docs/gone, which opens /Docs: one entry, not two.
+    #[test]
+    fn a_missing_folder_opening_its_parent_isnt_a_step() {
+        let mut nav = NavigationState::new(PathBuf::from("/Docs"));
+        nav.navigate_to(PathBuf::from("/Docs/gone"));
+        nav.replace_current(PathBuf::from("/Docs"));
+        assert!(!nav.can_go_back());
+        assert_eq!(nav.current(), &PathBuf::from("/Docs"));
+    }
 
     /// Home → Documents → Bin, then Back: Documents.
     #[test]
