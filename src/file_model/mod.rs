@@ -510,7 +510,16 @@ impl DirectoryModel {
         }
         on_done(Some(Ok(self.store.n_items())));
         if apply == Apply::Replace && self.refresh_after_load.replace(false) {
-            self.refresh(|_| {});
+            // Its changes come in the background, like a cached folder's
+            // check: tell the window, so its item count follows.
+            let model = self.clone();
+            self.refresh(move |listed| {
+                if listed {
+                    if let Some(cb) = model.on_background_update.borrow().as_ref() {
+                        cb();
+                    }
+                }
+            });
         }
     }
 

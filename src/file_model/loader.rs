@@ -190,10 +190,19 @@ pub(super) fn changes() -> u64 {
 /// The cached listing of `path`, if its mount is still there. Once it has
 /// gone (cleanly unmounted, leaving an empty mountpoint), the listing would
 /// hide that — and the offline copy that should be shown instead.
+/// The cache key for `path`: without a trailing `/` (as Tab completion
+/// leaves it), so `/m/Docs/` and `/m/Docs` are one folder.
+fn key(path: &str) -> &str {
+    match path.trim_end_matches('/') {
+        "" => path,
+        trimmed => trimmed,
+    }
+}
+
 pub(super) fn cached(path: &str) -> Option<Vec<FileInfoData>> {
     CACHE.with(|c| {
         let cache = c.borrow();
-        let cached = cache.get(path)?;
+        let cached = cache.get(key(path))?;
         crate::rclone_ops::is_fuse_path(&cached.real_path).then(|| cached.entries.clone())
     })
 }
@@ -208,7 +217,7 @@ pub(super) fn store(listing: &Listing, since: u64) {
     CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         cache.insert(
-            listing.path.clone(),
+            key(&listing.path).to_string(),
             Cached {
                 at: Instant::now(),
                 real_path: listing.real_path.clone(),
@@ -239,6 +248,7 @@ pub(super) fn forget_under(path: &str) {
 }
 
 fn forget_matching(path: &str, with_inside: bool) {
+    let path = key(path);
     CHANGES.with(|c| c.set(c.get() + 1));
     CACHE.with(|c| {
         let mut cache = c.borrow_mut();
@@ -246,14 +256,15 @@ fn forget_matching(path: &str, with_inside: bool) {
         // through a symlink): match where it really is, too.
         let mut targets = vec![path.to_string()];
         if let Some(cached) = cache.get(path) {
-            if cached.real_path != path {
-                targets.push(cached.real_path.clone());
+            if key(&cached.real_path) != path {
+                targets.push(key(&cached.real_path).to_string());
             }
         }
         let matches = |p: &str| {
-            targets.iter().any(|t| {
-                p == t || (with_inside && p.starts_with(&format!("{}/", t.trim_end_matches('/'))))
-            })
+            let p = key(p);
+            targets
+                .iter()
+                .any(|t| p == t || (with_inside && p.starts_with(&format!("{t}/"))))
         };
         cache.retain(|location, cached| !matches(location) && !matches(&cached.real_path));
     });
@@ -267,7 +278,7 @@ fn forget_matching(path: &str, with_inside: bool) {
 pub(super) fn prefetch(path: &str) {
     let fresh = CACHE.with(|c| {
         c.borrow()
-            .get(path)
+            .get(key(path))
             .is_some_and(|cached| cached.at.elapsed().as_secs() < 30)
     });
     if fresh || PREFETCHING.with(Cell::get) {
@@ -367,6 +378,20 @@ mod tests {
         assert!(CACHE.with(|c| !c.borrow().contains_key(path)));
         store(&listing(path, path), changes());
         assert!(CACHE.with(|c| c.borrow().contains_key(path)));
+    }
+
+    /// `/m/Docs/` (as Tab completion leaves it) and `/m/Docs` are one
+    /// folder to the cache.
+    #[test]
+    fn trailing_slash_is_the_same_folder() {
+        let cached_at = |p: &str| CACHE.with(|c| c.borrow().contains_key(p));
+        store(
+            &listing("/t-wf-slash/Docs/", "/t-wf-slash/Docs/"),
+            changes(),
+        );
+        assert!(cached_at("/t-wf-slash/Docs"));
+        forget("/t-wf-slash/Docs");
+        assert!(!cached_at("/t-wf-slash/Docs"));
     }
 
     #[test]

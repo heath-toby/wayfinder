@@ -2583,6 +2583,11 @@ fn run_threaded_delete(
             // (cancelled, or every delete failed).
             if success > 0 {
                 win.reload_after_removal(from, |_, _| {});
+            } else {
+                // A folder may be partly gone: show what's there now, but
+                // leave the selection where the user put it.
+                win.forget_moved(&from.removed);
+                win.reload_after_change(std::slice::from_ref(&from.folder));
             }
 
             // Announce outcome
