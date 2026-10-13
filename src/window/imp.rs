@@ -1107,7 +1107,11 @@ impl WayfinderWindowInner {
                 // Shift+Space: start or finish range selection
                 let mut sel = imp.file_selection.borrow_mut();
                 let pos = imp.selection.selected();
-                if let Some(anchor) = sel.range_anchor {
+                // An anchor set where nothing was selected is no anchor.
+                if let Some(anchor) = sel
+                    .range_anchor
+                    .filter(|a| *a != gtk::INVALID_LIST_POSITION)
+                {
                     // Finish range — select all items between anchor and current
                     // No row selected (an empty or filtered-out list) gives
                     // an invalid position: never loop to it.
@@ -1305,7 +1309,11 @@ impl WayfinderWindowInner {
             } else if key == gdk::Key::space && mods.contains(gdk::ModifierType::SHIFT_MASK) {
                 let mut sel = imp.file_selection.borrow_mut();
                 let pos = imp.selection.selected();
-                if let Some(anchor) = sel.range_anchor {
+                // An anchor set where nothing was selected is no anchor.
+                if let Some(anchor) = sel
+                    .range_anchor
+                    .filter(|a| *a != gtk::INVALID_LIST_POSITION)
+                {
                     // No row selected (an empty or filtered-out list) gives
                     // an invalid position: never loop to it.
                     let n_items = imp.selection.n_items();

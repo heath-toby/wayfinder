@@ -672,7 +672,13 @@ impl WayfinderWindow {
         // wait on the mount with the window frozen. (rclone doesn't mark
         // files executable anyway.)
         // (The model's flag also catches a folder reached through a symlink.)
-        if is_fuse_mount(&path) || self.imp().model.is_fuse() {
+        // (Its real location too: Recent Files may list one reached through
+        // a link onto a mount; resolved without touching the mount.)
+        let real = wayfinder::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(&path));
+        if is_fuse_mount(&path)
+            || is_fuse_mount(&real.to_string_lossy())
+            || self.imp().model.is_fuse()
+        {
             let ctx = WidgetExt::display(self).app_launch_context();
             let gio_file = gio::File::for_path(&path);
             let app = gio::AppInfo::default_for_type(&file.mime_type(), false);
@@ -1008,6 +1014,13 @@ impl WayfinderWindow {
         if files.is_empty() {
             return;
         }
+        if self.is_in_trash() {
+            self.announce(
+                "Items in the Bin can't be copied or moved. Restore them first.",
+                AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
         let gio_files: Vec<_> = files
             .iter()
             .map(|f| gio::File::for_path(f.path()))
@@ -1033,6 +1046,13 @@ impl WayfinderWindow {
     pub fn cut_selected(&self) {
         let files = self.get_selected_files();
         if files.is_empty() {
+            return;
+        }
+        if self.is_in_trash() {
+            self.announce(
+                "Items in the Bin can't be copied or moved. Restore them first.",
+                AccessibleAnnouncementPriority::Medium,
+            );
             return;
         }
         let gio_files: Vec<_> = files
@@ -1077,6 +1097,13 @@ impl WayfinderWindow {
         if files.is_empty() {
             return;
         }
+        if self.is_in_trash() {
+            self.announce(
+                "Items in the Bin can't be copied or moved. Restore them first.",
+                AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
         let gio_files: Vec<_> = files
             .iter()
             .map(|f| gio::File::for_path(f.path()))
@@ -1101,6 +1128,13 @@ impl WayfinderWindow {
     pub fn cut_selected_local(&self) {
         let files = self.get_selected_files();
         if files.is_empty() {
+            return;
+        }
+        if self.is_in_trash() {
+            self.announce(
+                "Items in the Bin can't be copied or moved. Restore them first.",
+                AccessibleAnnouncementPriority::Medium,
+            );
             return;
         }
         let gio_files: Vec<_> = files
@@ -1251,7 +1285,14 @@ impl WayfinderWindow {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let msg = match placement(std::path::Path::new(src), std::path::Path::new(&dest)) {
+                // By real paths (links resolved, without touching a mount):
+                // the same folder may be reached through a link.
+                let real_src =
+                    wayfinder::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(src));
+                let real_dest = wayfinder::rclone_ops::resolve_links_outside_mounts(
+                    std::path::Path::new(&dest),
+                );
+                let msg = match placement(&real_src, &real_dest) {
                     Placement::IntoItself => Some(format!(
                         "Cannot {} {name} into itself",
                         if plan.is_move { "move" } else { "copy" }
@@ -2569,6 +2610,14 @@ impl WayfinderWindow {
             let name = entry_clone.text().to_string();
             if name.is_empty() {
                 d.close();
+                return;
+            }
+            // A name, not a path: `/` or `..` would make it elsewhere.
+            if !is_plain_name(&name) {
+                w.announce(
+                    "A name can't contain / or be . or ..",
+                    AccessibleAnnouncementPriority::High,
+                );
                 return;
             }
             d.close();

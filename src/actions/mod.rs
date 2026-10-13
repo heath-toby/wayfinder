@@ -62,13 +62,16 @@ fn has_command(cmd: &str) -> bool {
     if cmd.starts_with('/') || cmd.starts_with("./") || cmd.starts_with("../") {
         return Path::new(cmd).is_file();
     }
-    std::process::Command::new("which")
-        .arg(cmd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // Looked up in $PATH here, not by running `which`: this runs as the
+    // menu opens, on the main thread, where starting a process can wait on
+    // a FUSE file this process has open.
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(cmd))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 /// Parse .desktop-like action files from a directory. Also scans immediate
@@ -372,6 +375,16 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
     if files.is_empty() {
         return;
     }
+    // The archive is made in their folder, from their names: they must
+    // all be in one (Recent Files can mix folders).
+    let folder = |f: &String| Path::new(f).parent().map(Path::to_path_buf);
+    if files.iter().any(|f| folder(f) != folder(&files[0])) {
+        parent_window.announce(
+            "Files from different folders can't be compressed together",
+            AccessibleAnnouncementPriority::Medium,
+        );
+        return;
+    }
     let dlg = gtk::Window::builder()
         .title("Compress")
         .modal(true)
@@ -630,6 +643,18 @@ fn execute_nautilus_script(
     current_dir: &str,
     tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
+    // In Recent Files (or the Bin) the location isn't a folder: run it in
+    // the first file's own.
+    let current_dir = if current_dir.contains("://") {
+        files
+            .first()
+            .and_then(|f| Path::new(f).parent())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string())
+    } else {
+        current_dir.to_string()
+    };
+    let current_dir = current_dir.as_str();
     let paths = files.join("\n");
     let uris: String = files
         .iter()

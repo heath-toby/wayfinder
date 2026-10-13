@@ -9,6 +9,9 @@
 ### Fixed
 
 - **Data loss on a mounted drive's own folder** — permanently deleting the folder a drive is mounted on (say `~/protonDrive`) emptied the whole drive; through rclone it ran `rclone purge` on the entire remote. Renaming or moving that folder moved everything off the cloud drive onto local disk, and Replace onto it deleted its contents. All of these are now refused, with the advice to unmount the drive first.
+- **File chooser could save outside the chosen folder** — a file name suggested by an app (for "Save" or saving several files) such as `../.config/autostart/x` was saved wherever it pointed, giving the app a way to write outside the folder you picked. Only the name is used now, and a typed name can't contain `/`.
+- **Offline edits** — an offline copy changed on this computer (opened from the offline copy and saved, say) is no longer overwritten by the older remote version at the next refresh. A file that has become a folder on the remote (or the reverse) no longer stops the offline refresh. The list of offline items is no longer lost or garbled when several things change it at once.
+- **Empty Bin** — folders in the Bin are emptied too; they were left behind while "Bin emptied" was announced.
 
 - **Data loss when pasting a folder onto itself** — pasting a folder into the folder it's already in and choosing Replace deleted it (or left it empty). Replacing something with itself, or with the folder that holds it, is now refused, and so is moving something to where it already is.
 - **Deleting a folder with a drive mounted inside it** — a permanent delete would have gone on into the mounted drive and deleted what's on it (a whole remote drive, say). It's now refused until the drive is unmounted. Permanent deletes of local files also no longer freeze the window while they run.
@@ -74,7 +77,12 @@
 - **Undo move to Bin** — restores the copy just moved there, not an older one from the same place; restoring a file from the Bin whose name has `#` or `%` in it restores that file.
 - **Keyboard** — Shift+Tab, and Tab when Back, Forward and Up are unavailable, no longer leave focus stuck in the file list. Shift+Space range selection can no longer freeze the window in an empty or filtered list.
 - **The Bin** — items in it can be deleted for good (Delete or Shift+Delete, after asking), and Restore restores every marked item; both used to fail. Opening, renaming, pasting or creating there now says what to do instead of failing or jumping to `/`, and the same goes for pasting into Recent Files. Restoring no longer freezes the window, and Undo names the files it really restored.
-- **Renaming** — a new name containing `/` (or `.` / `..`) is refused; on an rclone mount it moved the file into another folder.
+- **Renaming and New Folder** — a name containing `/` (or `.` / `..`) is refused; on an rclone mount a rename moved the file into another folder, and New Folder made the folder somewhere else.
+- **Copy and cut in the Bin** — say to restore first, instead of putting unusable paths on the clipboard.
+- **Pasting from phones and network locations** — a file with no place on disk is reported as not copyable, instead of the dialog closing silently.
+- **Compress** — files from different folders (in Recent Files) are no longer compressed from the wrong folder; it says to compress them separately.
+- **Scripts in Recent Files** — Nautilus scripts run from Recent Files work (they failed to start).
+- **Drives in the sidebar** — activating an unmounted drive mounts and opens it, or says why it couldn't; drives with no place on disk (some phones) are no longer shown as rows that open nothing and eject the wrong drive. Bookmarks saved without a name are read with their folder's real name (not `My%20Docs`).
 - **Zoom with several windows** — zooming in one window works (another window's zoom setting overrode it), and resetting returns to the theme's own text size.
 - **Filter** — opening a folder while a filter is active no longer announces "Filter cleared" with the old folder's count.
 - **rclone mounts with their own config** — aren't operated on directly through the default rclone config (which could have meant a different remote of the same name).

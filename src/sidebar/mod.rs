@@ -33,13 +33,15 @@ pub fn load_bookmarks() -> Vec<(String, String)> {
             let (uri, display) = if let Some((u, d)) = line.split_once(' ') {
                 (u.to_string(), d.to_string())
             } else {
-                let name = line
-                    .strip_prefix("file://")
-                    .unwrap_or(line)
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("Bookmark")
-                    .to_string();
+                // No name given: the folder's own (decoded, so `My%20Docs`
+                // is read as "My Docs").
+                let name = bookmark_path(line)
+                    .and_then(|p| {
+                        std::path::Path::new(&p)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                    })
+                    .unwrap_or_else(|| line.to_string());
                 (line.to_string(), name)
             };
             Some((uri, display))
@@ -256,9 +258,10 @@ impl WayfinderSidebar {
     }
 
     pub fn connect_place_activated<F: Fn(String) + 'static>(&self, callback: F) {
+        let callback = std::rc::Rc::new(callback);
         self.imp()
             .places_list
-            .connect_row_activated(move |_list, row| {
+            .connect_row_activated(move |list, row| {
                 let name = row.widget_name();
                 if let Some(path) = name.strip_prefix("place:") {
                     callback(path.to_string());
@@ -274,13 +277,35 @@ impl WayfinderSidebar {
                             let vol_id = vol.uuid().map(|u| u.to_string()).unwrap_or_default();
                             if vol_id == uuid {
                                 let mount_op = gio::MountOperation::new();
+                                let label = vol.name().to_string();
+                                let mounted = vol.clone();
+                                let callback = callback.clone();
+                                let list = list.clone();
+                                list.announce(
+                                    &format!("Mounting {label}"),
+                                    gtk::AccessibleAnnouncementPriority::Medium,
+                                );
+                                // Once mounted, open it — as activating a
+                                // mounted one does; if it fails, say why.
                                 vol.mount(
                                     gio::MountMountFlags::NONE,
                                     Some(&mount_op),
                                     gio::Cancellable::NONE,
-                                    |result| {
-                                        if let Err(e) = result {
+                                    move |result| match result {
+                                        Ok(()) => {
+                                            let path = mounted
+                                                .get_mount()
+                                                .and_then(|m| m.default_location().path());
+                                            if let Some(path) = path {
+                                                callback(path.to_string_lossy().to_string());
+                                            }
+                                        }
+                                        Err(e) => {
                                             log::error!("Failed to mount volume: {e}");
+                                            list.announce(
+                                                &format!("Couldn't mount {label}: {e}"),
+                                                gtk::AccessibleAnnouncementPriority::High,
+                                            );
                                         }
                                     },
                                 );
@@ -549,10 +574,12 @@ impl WayfinderSidebar {
         for mount in vm.mounts() {
             let name = mount.name().to_string();
             let root = mount.default_location();
-            let path = root
-                .path()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
+            // One with no place on disk (a phone or network share without
+            // GVfs's FUSE bridge) can't be opened here: leave it out, rather
+            // than show a row that opens nothing and ejects the wrong one.
+            let Some(path) = root.path().map(|p| p.to_string_lossy().to_string()) else {
+                continue;
+            };
 
             // Skip root filesystem and home — already in places
             if path == "/"

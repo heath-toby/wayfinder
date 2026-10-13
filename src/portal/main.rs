@@ -136,14 +136,26 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Vec<String> {
     let mut taken: Vec<std::path::PathBuf> = Vec::new();
     names
         .iter()
+        // Only a name, in the folder the user chose: an app's
+        // "../.config/…" or "/home/u/.profile" mustn't reach elsewhere.
+        .filter_map(|name| plain_name(name))
         .map(|name| {
-            let path = free_name(&dir, name, |p| {
+            let path = free_name(&dir, &name, |p| {
                 p.exists() || taken.contains(&p.to_path_buf())
             });
             taken.push(path.clone());
             gtk::gio::File::for_path(&path).uri().to_string()
         })
         .collect()
+}
+
+/// The last part of `name`, if it's a usable file name (not empty, `.`
+/// or `..`).
+fn plain_name(name: &str) -> Option<String> {
+    std::path::Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| n != "." && n != "..")
 }
 
 /// `dir/name`, or if `taken` says that's in use, `dir/stem (N).ext`.
@@ -168,7 +180,19 @@ fn free_name(
 
 #[cfg(test)]
 mod tests {
-    use super::free_name;
+    use super::{free_name, plain_name};
+
+    /// An app can't save outside the folder chosen.
+    #[test]
+    fn app_names_stay_in_the_folder() {
+        assert_eq!(
+            plain_name("../.config/autostart/x.desktop").as_deref(),
+            Some("x.desktop")
+        );
+        assert_eq!(plain_name("/home/u/.profile").as_deref(), Some(".profile"));
+        assert_eq!(plain_name(".."), None);
+        assert_eq!(plain_name("a.txt").as_deref(), Some("a.txt"));
+    }
     use std::path::Path;
 
     #[test]

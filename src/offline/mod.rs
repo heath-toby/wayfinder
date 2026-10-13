@@ -166,7 +166,25 @@ fn save_manifest(manifest: &HashMap<String, PinnedEntry>) -> Result<(), String> 
             entry.last_synced_size,
         ));
     }
-    std::fs::write(&path, contents).map_err(|e| e.to_string())
+    // Whole or not at all: a reader mustn't see it half written.
+    let part = path.with_extension("wayfinder-part");
+    std::fs::write(&part, contents).map_err(|e| e.to_string())?;
+    std::fs::rename(&part, &path).map_err(|e| e.to_string())
+}
+
+/// Held while the manifest is read, changed and written back: pins,
+/// unpins and the startup refresh run on different threads.
+static MANIFEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Change the manifest under its lock.
+fn update_manifest<R>(
+    change: impl FnOnce(&mut HashMap<String, PinnedEntry>) -> R,
+) -> Result<R, String> {
+    let _lock = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut manifest = load_manifest();
+    let result = change(&mut manifest);
+    save_manifest(&manifest)?;
+    Ok(result)
 }
 
 /// Check whether a path is currently pinned for offline access.
@@ -188,18 +206,17 @@ pub fn record_pin(original_path: &str) -> Result<(), String> {
     let mtime = mtime_secs(&meta);
     let size = if is_directory { 0 } else { meta.len() };
 
-    let mut manifest = load_manifest();
-    manifest.insert(
-        original_path.to_string(),
-        PinnedEntry {
-            original_path: original_path.to_string(),
-            is_directory,
-            last_synced_mtime: mtime,
-            last_synced_size: size,
-        },
-    );
-    save_manifest(&manifest)?;
-    Ok(())
+    update_manifest(|manifest| {
+        manifest.insert(
+            original_path.to_string(),
+            PinnedEntry {
+                original_path: original_path.to_string(),
+                is_directory,
+                last_synced_mtime: mtime,
+                last_synced_size: size,
+            },
+        );
+    })
 }
 
 /// Whether the offline copy at `cached` is complete for a source with
@@ -267,11 +284,11 @@ impl Drop for Unpinning {
 
 pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
     let _unpinning = Unpinning::new(original_path);
-    let mut manifest = load_manifest();
-    if manifest.remove(original_path).is_none() {
-        return Ok(Unpinned::Removed); // wasn't pinned
+    let (was_pinned, manifest) =
+        update_manifest(|manifest| (manifest.remove(original_path).is_some(), manifest.clone()))?;
+    if !was_pinned {
+        return Ok(Unpinned::Removed);
     }
-    save_manifest(&manifest)?;
     let cached = cache_path_for(original_path);
     if in_sync_folder(&cached) {
         // The copy is also two-way sync's local side: deleting it would
@@ -426,13 +443,14 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
         sync_file(src, &meta, &dest, remote.as_deref())?
     };
 
-    // Update manifest
-    let mut manifest = load_manifest();
-    if let Some(e) = manifest.get_mut(&entry.original_path) {
-        e.last_synced_mtime = mtime;
-        e.last_synced_size = size;
-    }
-    save_manifest(&manifest)?;
+    // Update manifest (if it's still pinned: it may have been unpinned
+    // while this ran).
+    update_manifest(|manifest| {
+        if let Some(e) = manifest.get_mut(&entry.original_path) {
+            e.last_synced_mtime = mtime;
+            e.last_synced_size = size;
+        }
+    })?;
     Ok(changed)
 }
 
@@ -473,6 +491,10 @@ const PART_SUFFIX: &str = ".wayfinder-part";
 /// Bring `dst` in line with the directory `src`. Returns true if anything
 /// was copied or removed.
 fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>) -> Result<bool, String> {
+    // A file here that's a folder on the remote now: make way for it.
+    if dst.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+        std::fs::remove_file(dst).map_err(|e| e.to_string())?;
+    }
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     let entries: Vec<std::fs::DirEntry> = {
         let _io = sleep::io_step();
@@ -529,9 +551,24 @@ fn sync_file(
     dst: &Path,
     remote: Option<&str>,
 ) -> Result<bool, String> {
-    if let Ok(dst_meta) = std::fs::metadata(dst) {
-        if dst_meta.len() == src_meta.len() && mtime_secs(&dst_meta) == mtime_secs(src_meta) {
-            return Ok(false);
+    if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+        if dst_meta.is_dir() {
+            // A folder here that's a file on the remote now: make way.
+            std::fs::remove_dir_all(dst).map_err(|e| e.to_string())?;
+        } else {
+            if dst_meta.len() == src_meta.len() && mtime_secs(&dst_meta) == mtime_secs(src_meta) {
+                return Ok(false);
+            }
+            // Changed here since it was fetched (opened from the offline
+            // copy and saved, say): keep it — replacing it with the older
+            // remote one would lose the edit.
+            if mtime_secs(&dst_meta) > mtime_secs(src_meta) {
+                log::warn!(
+                    "Offline copy {} is newer than the remote; kept",
+                    dst.display()
+                );
+                return Ok(false);
+            }
         }
     }
 

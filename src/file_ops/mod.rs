@@ -136,8 +136,10 @@ pub fn empty_trash() -> Result<u32, glib::Error> {
 
     let mut count = 0u32;
     while let Some(info) = enumerator.next_file(gio::Cancellable::NONE)? {
+        // Deleted as a whole: the Bin removes a top-level item (folder and
+        // all) itself, and refuses to have one taken apart.
         let child = trash.child(info.name());
-        if let Err(e) = delete_file_recursive(&child) {
+        if let Err(e) = child.delete(gio::Cancellable::NONE) {
             log::warn!("Failed to delete Bin item: {e}");
         } else {
             count += 1;
@@ -476,14 +478,23 @@ fn transfer_with_progress(
         return;
     };
     let dest = dest_dir.child(&name);
-    let Some(dest_path_buf) = dest_dir.path() else {
+    let display_name = name.to_string_lossy().to_string();
+    // Only files with a place on disk (a phone or network location
+    // without one can't be copied this way): say so, not just stop.
+    let (Some(dest_path_buf), Some(_)) = (dest_dir.path(), source.path()) else {
+        parent_window.announce(
+            &format!(
+                "Can't {} {display_name}: it isn't on a drive Wayfinder can reach",
+                if is_move { "move" } else { "copy" }
+            ),
+            AccessibleAnnouncementPriority::High,
+        );
         if let Some(cb) = on_complete {
             cb(false);
         }
         return;
     };
     let dest_path = dest_path_buf.to_string_lossy().to_string();
-    let display_name = name.to_string_lossy().to_string();
 
     // A folder can't go inside itself, and moving something to where it
     // already is does nothing.

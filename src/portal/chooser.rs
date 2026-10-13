@@ -714,6 +714,15 @@ pub fn show_chooser(
                 d_accept.announce("No file name", AccessibleAnnouncementPriority::High);
                 return;
             }
+            // A name, saved in the folder shown — not a path elsewhere (an
+            // app may suggest one, and saving it would go there unseen).
+            if name.contains('/') || name == "." || name == ".." {
+                d_accept.announce(
+                    "A file name can't contain / or be . or ..",
+                    AccessibleAnnouncementPriority::High,
+                );
+                return;
+            }
             let full_path = std::path::Path::new(&current_dir)
                 .join(&name)
                 .to_string_lossy()
