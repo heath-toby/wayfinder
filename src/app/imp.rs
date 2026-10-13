@@ -67,7 +67,11 @@ impl ApplicationImpl for WayfinderApplicationInner {
 
             if let Some(path) = file.path() {
                 let path_str = path.to_string_lossy().to_string();
-                if path.is_dir() {
+                if wayfinder::rclone_ops::is_fuse_path(&path_str) {
+                    // Don't stat a FUSE path here: a slow mount would hold
+                    // up startup. Navigating resolves a file to its folder.
+                    window.navigate_to_path(&path_str);
+                } else if path.is_dir() {
                     // It's a directory — navigate to it
                     window.navigate_to_path(&path_str);
                 } else if path.is_file() {
@@ -76,8 +80,9 @@ impl ApplicationImpl for WayfinderApplicationInner {
                         window.navigate_to_path(&parent.to_string_lossy());
                     }
                     // Open the file with its associated app
-                    if let Some(file_obj) = window.get_selected_file() {
-                        window.open_file(&file_obj);
+                    let ctx = gtk::prelude::WidgetExt::display(&window).app_launch_context();
+                    if let Err(e) = gio::AppInfo::launch_default_for_uri(&file.uri(), Some(&ctx)) {
+                        log::error!("Failed to open {path_str}: {e}");
                     }
                 } else {
                     // Path doesn't exist yet — try navigating (will walk up)

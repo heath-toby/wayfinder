@@ -30,7 +30,7 @@ Logic-only modules (`file_model/`, `file_ops/`, `navigation/`, `search/`, `clipb
 ### Data Flow
 
 ```
-gio::File → enumerate_children → ListStore<FileObject>
+gio::File → enumerate_children (worker thread, file_model/loader.rs) → FileInfoData → ListStore<FileObject>
   → SortListModel (dirs-first + alpha via CustomSorter)
   → FilterListModel (hidden files via CustomFilter)
   → FilterListModel (search via CustomFilter)
@@ -47,14 +47,19 @@ GObject types (`gio::ListStore`, `gio::FileInfo`, `gtk::CustomSorter`) are **NOT
 3. Poll with `glib::timeout_add_local()` on main thread
 4. Construct GObject types only after receiving plain Rust data
 
-This pattern appears in: folder size calculation, FUSE async file monitor, D-Bus service, portal backend, custom action completion announcements, compress dialog.
+This pattern appears in: directory loading, folder size calculation, FUSE async file monitor, D-Bus service, portal backend, custom action completion announcements, compress dialog.
+
+**Directory loading never blocks the main thread.** `DirectoryModel::load_directory(path, resolve, on_done)` lists on a worker thread and waits at most 100 ms (`SYNC_WAIT`) before returning; local folders finish within that, so `on_done` usually runs synchronously. Slower ones finish in the background: `is_loading()` is true meanwhile and the window shows/announces "Waiting for rclone to open X. Press Alt+Left to go back." Every navigation bumps `generation()`, and results of superseded loads are dropped (the blocked syscall can't be cancelled, only abandoned). Callers must not assume the store is populated after `load_directory` returns — put follow-up work in `on_done`. Reloads after file operations use `WayfinderWindow::reload_current(after)` → `DirectoryModel::refresh`, which updates the store in place (diff by path) so the selection survives. `DirectoryModel` is `Clone`; clones share state.
 
 **Thread-safe data extraction**: `FileInfoData` struct (plain `String`/`u64`/`i64`/`bool`) is extracted from `gio::FileInfo` on worker threads, sent through channels, then converted to `FileObject` on the main thread via `FileObject::from_data()`.
 
 ### FUSE Mount Handling
 
-`is_fuse_mount()` reads `/proc/mounts` to detect rclone, sshfs, etc. On FUSE paths:
-- Folder size calculation is **skipped** (shows "—")
+`is_fuse_mount()` reads `/proc/mounts` to detect rclone, sshfs, etc. (the worker re-checks on the canonical path, so symlinks into a mount count). Never stat, open or list a FUSE path on the main thread: a slow or frozen daemon freezes the window and Orca with it. On FUSE paths:
+- Listings request `standard::fast-content-type` instead of `standard::*` — content sniffing would read (download) every ambiguous file
+- Listings are cached (`loader.rs`, 128 folders); a cached folder is shown at once and revalidated in the background. Resting the selection on a folder for 400 ms prefetches its listing
+- Opening a file picks the app from the name-based MIME type, without a permissions check or content sniffing
+- Folder size calculation is **skipped** (shows "—"), and the local size walker never enters FUSE/network mountpoints (matched by path before any stat)
 - File monitor uses `query_info_async()` with 5-second cancellable timeout instead of sync calls
 - `trash_or_delete()` returns `NeedsPermanentDelete` when trash isn't supported, triggering a confirmation dialog
 
@@ -91,7 +96,8 @@ Sidebar and breadcrumb bar have paired toggle buttons + actions. The button stor
 ### Key Modules
 
 - `window/` — Main window (~3,300 lines across mod.rs/imp.rs): all navigation, file operations, dialogs, breadcrumb, zoom. `paste_from()` uses a `pasting` flag to prevent concurrent paste operations.
-- `file_model/` — Directory loading, sorting, filtering, file monitoring, FUSE detection
+- `file_model/` — Directory loading (background jobs and FUSE listing cache in `loader.rs`), sorting, filtering, file monitoring, FUSE detection
+- `offline/` — "Keep Available Offline" pins: incremental, atomic (`.wayfinder-part` + rename) refresh at startup; `sleep.rs` holds a logind delay inhibitor and pauses the sync before suspend
 - `file_ops/` — Copy/move with progress dialog, trash, delete, rename, conflict resolution (Replace/Skip/Rename), cross-device directory move fallback. `on_complete` callback is guaranteed to fire on all code paths (success, error, cancel, early return).
 - `sidebar/` — Places, bookmarks (GTK3 format), volumes (GIO VolumeMonitor), editable order/visibility
 - `context_menu/` — Accessible popover menus with arrow-key navigation and custom actions
@@ -102,5 +108,5 @@ Sidebar and breadcrumb bar have paired toggle buttons + actions. The button stor
 ### Dependencies
 
 - **gtk4 0.10** with `v4_14` feature
-- **zbus 5** (tokio) + **tokio 1** for D-Bus (portal and FileManager1)
+- **zbus 5** (tokio) + **tokio 1** for D-Bus (portal, FileManager1, logind sleep watcher), **futures-util 0.3** for its signal stream
 - **clap 4**, **dirs 6**, **chrono 0.4**, **open 5**, **log 0.4**, **env_logger 0.11**

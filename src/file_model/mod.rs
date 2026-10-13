@@ -1,5 +1,9 @@
-use std::cell::RefCell;
+mod loader;
+
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use gtk::gio;
 use gtk::glib;
@@ -9,13 +13,34 @@ use gtk::{CustomFilter, CustomSorter, FilterChange, FilterListModel, SortListMod
 use crate::file_object::FileObject;
 use crate::search::SearchState;
 
-/// Check whether a path resides on a FUSE filesystem (e.g. rclone, sshfs).
-/// Reads `/proc/mounts` and picks the longest matching mountpoint whose
-/// filesystem type contains "fuse".
+pub use loader::Listing;
+
+/// Check whether a path resides on a FUSE filesystem (e.g. rclone, sshfs),
+/// by its mountpoint in `/proc/mounts` (no filesystem access).
 fn is_fuse_mount(path: &str) -> bool {
     crate::rclone_ops::is_fuse_path(path)
 }
 
+/// How long a load waits for its listing before returning and finishing in
+/// the background. Local folders practically always make it, so they still
+/// load synchronously; a slow mount never holds the window up for longer.
+const SYNC_WAIT: Duration = Duration::from_millis(100);
+
+/// How a finished listing is put into the store.
+#[derive(Clone, Copy, PartialEq)]
+enum Apply {
+    /// The store is empty (a new folder): fill it.
+    Replace,
+    /// The store shows this folder already: add, remove and update items
+    /// in place, so the selection and focus stay where they are.
+    Diff,
+}
+
+type LoadDone = Box<dyn FnOnce(Result<u32, String>)>;
+type Callback = Box<dyn Fn()>;
+
+/// Cheap to clone: every clone shares the same store and state.
+#[derive(Clone)]
 pub struct DirectoryModel {
     pub store: gio::ListStore,
     pub sort_model: SortListModel,
@@ -25,9 +50,19 @@ pub struct DirectoryModel {
     pub hidden_filter: CustomFilter,
     pub search: SearchState,
     show_hidden: Rc<RefCell<bool>>,
-    current_path: RefCell<String>,
-    monitor: RefCell<Option<gio::FileMonitor>>,
-    is_fuse: RefCell<bool>,
+    current_path: Rc<RefCell<String>>,
+    monitor: Rc<RefCell<Option<gio::FileMonitor>>>,
+    is_fuse: Rc<Cell<bool>>,
+    /// Bumped by every navigation; results of older jobs are dropped.
+    generation: Rc<Cell<u64>>,
+    /// Every listing job gets a sequence number; one that finishes after
+    /// a newer one has been applied is stale and dropped.
+    next_seq: Rc<Cell<u64>>,
+    applied_seq: Rc<Cell<u64>>,
+    /// True while a navigation is waiting with nothing to show yet.
+    loading: Rc<Cell<bool>>,
+    /// Called when a background refresh changed the store on its own.
+    on_background_update: Rc<RefCell<Option<Callback>>>,
 }
 
 impl Default for DirectoryModel {
@@ -93,151 +128,338 @@ impl DirectoryModel {
             hidden_filter,
             search,
             show_hidden,
-            current_path: RefCell::new(String::new()),
-            monitor: RefCell::new(None),
-            is_fuse: RefCell::new(false),
+            current_path: Rc::new(RefCell::new(String::new())),
+            monitor: Rc::new(RefCell::new(None)),
+            is_fuse: Rc::new(Cell::new(false)),
+            generation: Rc::new(Cell::new(0)),
+            next_seq: Rc::new(Cell::new(0)),
+            applied_seq: Rc::new(Cell::new(0)),
+            loading: Rc::new(Cell::new(false)),
+            on_background_update: Rc::new(RefCell::new(None)),
         }
     }
 
     /// Load recently used files from GTK's RecentManager.
-    pub fn load_recent(&self) -> Result<u32, glib::Error> {
+    pub fn load_recent(&self, on_done: impl FnOnce(Result<u32, String>) + 'static) {
+        let gen = self.begin("recent:///", false);
         self.store.remove_all();
-        *self.current_path.borrow_mut() = "recent:///".to_string();
-        *self.is_fuse.borrow_mut() = false;
+        // Only local files; the RecentManager itself is main-thread only.
+        let paths = recent_paths();
+        self.run(
+            gen,
+            move || loader::list_recent(paths, 50),
+            Apply::Replace,
+            Box::new(on_done),
+        );
+    }
+
+    /// Load a GIO location such as `trash:///`.
+    pub fn load_uri(&self, uri: &str, on_done: impl FnOnce(Result<u32, String>) + 'static) {
+        let gen = self.begin(uri, false);
+        self.store.remove_all();
+        let uri = uri.to_string();
+        self.run(
+            gen,
+            move || loader::list_uri(&uri),
+            Apply::Replace,
+            Box::new(on_done),
+        );
+    }
+
+    /// Open a directory. `on_done` runs once the listing is in the store —
+    /// straight away for local folders and cached FUSE ones, later for a
+    /// slow mount, and never if another load supersedes this one. With
+    /// `resolve`, a path that no longer exists falls back to its nearest
+    /// existing parent; `current_path()` then reports the folder opened.
+    pub fn load_directory(
+        &self,
+        path: &str,
+        resolve: bool,
+        on_done: impl FnOnce(Result<u32, String>) + 'static,
+    ) {
+        let gen = self.begin(path, is_fuse_mount(path));
+        let job = {
+            let path = path.to_string();
+            move || loader::list_dir(&path, resolve)
+        };
+
+        if let Some(entries) = loader::cached(path) {
+            // Show the folder as it was last seen, then check it quietly.
+            self.is_fuse.set(true);
+            let objects: Vec<glib::Object> = entries
+                .iter()
+                .map(|e| FileObject::from_data(path, e).upcast())
+                .collect();
+            self.store.splice(0, self.store.n_items(), &objects);
+            on_done(Ok(self.store.n_items()));
+            let model = self.clone();
+            self.run(
+                gen,
+                job,
+                Apply::Diff,
+                Box::new(move |_| {
+                    if let Some(cb) = model.on_background_update.borrow().as_ref() {
+                        cb();
+                    }
+                }),
+            );
+            return;
+        }
+
+        self.store.remove_all();
+        self.run(gen, job, Apply::Replace, Box::new(on_done));
+    }
+
+    /// List the current location again and update the store in place,
+    /// keeping the selection. `on_done` runs afterwards (not at all if a
+    /// navigation happens meanwhile).
+    pub fn refresh(&self, on_done: impl FnOnce() + 'static) {
+        if self.loading.get() {
+            // A navigation is still on its way; its listing will be fresh.
+            return;
+        }
+        let location = self.current_path();
+        let on_done: LoadDone = Box::new(move |_| on_done());
+        let gen = self.generation.get();
+        if location == "recent:///" {
+            let paths = recent_paths();
+            self.run(
+                gen,
+                move || loader::list_recent(paths, 50),
+                Apply::Diff,
+                on_done,
+            );
+        } else if location.contains("://") {
+            self.run(
+                gen,
+                move || loader::list_uri(&location),
+                Apply::Diff,
+                on_done,
+            );
+        } else {
+            self.run(
+                gen,
+                move || loader::list_dir(&location, false),
+                Apply::Diff,
+                on_done,
+            );
+        }
+    }
+
+    /// Whether a navigation is still waiting for its listing.
+    pub fn is_loading(&self) -> bool {
+        self.loading.get()
+    }
+
+    /// Changes with every navigation; lets callers tell whether the load
+    /// they started is still the current one.
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    /// Called whenever a background check of a cached folder changed it.
+    pub fn set_on_background_update(&self, callback: impl Fn() + 'static) {
+        *self.on_background_update.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Warm the cache for a folder inside the current FUSE folder, so
+    /// opening it is instant.
+    pub fn prefetch(&self, path: &str) {
+        if self.is_fuse.get() {
+            loader::prefetch(path);
+        }
+    }
+
+    /// Start a new navigation to `location`.
+    fn begin(&self, location: &str, is_fuse: bool) -> u64 {
+        log::debug!("load {location} (fuse: {is_fuse})");
+        let gen = self.generation.get() + 1;
+        self.generation.set(gen);
+        self.loading.set(false);
+        *self.current_path.borrow_mut() = location.to_string();
+        self.is_fuse.set(is_fuse);
         *self.monitor.borrow_mut() = None;
+        gen
+    }
 
-        let manager = gtk::RecentManager::default();
-        let items = manager.items();
-
-        let mut count = 0u32;
-        for item in &items {
-            let uri = item.uri();
-            // Only show local files
-            if !uri.starts_with("file://") {
-                continue;
+    /// Run a listing job, waiting up to `SYNC_WAIT` before finishing it in
+    /// the background.
+    fn run(
+        &self,
+        gen: u64,
+        job: impl FnOnce() -> loader::ListResult + Send + 'static,
+        apply: Apply,
+        on_done: LoadDone,
+    ) {
+        let seq = self.next_seq.get() + 1;
+        self.next_seq.set(seq);
+        let rx = loader::spawn(job);
+        match rx.recv_timeout(SYNC_WAIT) {
+            Ok(result) => self.finish(gen, seq, result, apply, on_done),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.finish(gen, seq, Err("listing failed".into()), apply, on_done)
             }
-            let path_str = uri.strip_prefix("file://").unwrap_or(&uri);
-            let path = std::path::Path::new(path_str);
-            if !path.exists() {
-                continue;
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if apply == Apply::Replace {
+                    self.loading.set(true);
+                }
+                let model = self.clone();
+                let mut on_done = Some(on_done);
+                glib::timeout_add_local(Duration::from_millis(30), move || {
+                    if model.generation.get() != gen {
+                        // Superseded. The thread may still be waiting on the
+                        // mount; its result will be dropped with `rx`.
+                        return glib::ControlFlow::Break;
+                    }
+                    let result = match rx.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Ok(result) => result,
+                        Err(mpsc::TryRecvError::Disconnected) => Err("listing failed".into()),
+                    };
+                    if let Some(on_done) = on_done.take() {
+                        model.finish(gen, seq, result, apply, on_done);
+                    }
+                    glib::ControlFlow::Break
+                });
             }
+        }
+    }
 
-            let file = gio::File::for_path(path);
-            let Ok(info) = file.query_info(
-                "standard::*,time::modified",
-                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                gio::Cancellable::NONE,
-            ) else {
+    fn finish(
+        &self,
+        gen: u64,
+        seq: u64,
+        result: loader::ListResult,
+        apply: Apply,
+        on_done: LoadDone,
+    ) {
+        if gen != self.generation.get() || seq < self.applied_seq.get() {
+            log::debug!("dropping stale listing (generation {gen}, sequence {seq})");
+            return;
+        }
+        self.applied_seq.set(seq);
+        if apply == Apply::Replace {
+            self.loading.set(false);
+        }
+        let listing = match result {
+            Ok(listing) => listing,
+            Err(e) => {
+                on_done(Err(e));
+                return;
+            }
+        };
+
+        log::debug!("listed {}: {} entries", listing.path, listing.entries.len());
+        *self.current_path.borrow_mut() = listing.path.clone();
+        self.is_fuse.set(listing.is_fuse);
+        if listing.is_fuse {
+            loader::store(
+                &listing.path,
+                listing.entries.iter().map(|(_, e)| e.clone()).collect(),
+            );
+        }
+        match apply {
+            Apply::Replace => self.replace_all(&listing),
+            Apply::Diff => self.apply_diff(&listing),
+        }
+
+        if listing.path.starts_with('/') {
+            self.setup_monitor(&gio::File::for_path(&listing.path));
+            if !listing.is_fuse {
+                // Folder sizes for local folders; FUSE ones would mean
+                // walking the remote, so they keep showing a dash.
+                self.calculate_folder_sizes();
+            }
+        }
+        on_done(Ok(self.store.n_items()));
+    }
+
+    fn replace_all(&self, listing: &Listing) {
+        let objects: Vec<glib::Object> = listing
+            .entries
+            .iter()
+            .map(|(parent, data)| {
+                let fo = FileObject::from_data(parent, data);
+                if data.is_directory && !listing.is_fuse && listing.path.starts_with('/') {
+                    fo.set_size_display("Calculating...".to_string());
+                }
+                fo.upcast()
+            })
+            .collect();
+        self.store.splice(0, self.store.n_items(), &objects);
+    }
+
+    fn apply_diff(&self, listing: &Listing) {
+        // Keyed by full path: Recent can hold equal names from different folders.
+        let mut fresh: std::collections::HashMap<String, FileObject> = listing
+            .entries
+            .iter()
+            .map(|(parent, data)| {
+                let fo = FileObject::from_data(parent, data);
+                (fo.path(), fo)
+            })
+            .collect();
+        for i in (0..self.store.n_items()).rev() {
+            let Some(fo) = self.store.item(i).and_downcast::<FileObject>() else {
                 continue;
             };
-
-            let parent = path
-                .parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let file_obj = FileObject::from_file_info(&parent, &info);
-            self.store.append(&file_obj);
-            count += 1;
-
-            if count >= 50 {
-                break;
-            }
-        }
-
-        Ok(count)
-    }
-
-    pub fn load_uri(&self, uri: &str) -> Result<u32, glib::Error> {
-        self.store.remove_all();
-        *self.current_path.borrow_mut() = uri.to_string();
-        *self.is_fuse.borrow_mut() = false;
-
-        let file = gio::File::for_uri(uri);
-        let enumerator = file.enumerate_children(
-            "standard::*,time::modified",
-            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-            gio::Cancellable::NONE,
-        )?;
-
-        let mut count = 0u32;
-        while let Some(info) = enumerator.next_file(gio::Cancellable::NONE)? {
-            let file_obj = FileObject::from_file_info(uri, &info);
-            self.store.append(&file_obj);
-            count += 1;
-        }
-
-        // No file monitor for special URIs
-        *self.monitor.borrow_mut() = None;
-
-        Ok(count)
-    }
-
-    pub fn load_directory(&self, path: &str) -> Result<u32, glib::Error> {
-        self.store.remove_all();
-        *self.current_path.borrow_mut() = path.to_string();
-        *self.is_fuse.borrow_mut() = is_fuse_mount(path);
-
-        let file = gio::File::for_path(path);
-        let enumerator = file.enumerate_children(
-            "standard::*,time::modified",
-            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-            gio::Cancellable::NONE,
-        )?;
-
-        let mut count = 0u32;
-        while let Some(info) = enumerator.next_file(gio::Cancellable::NONE)? {
-            let file_obj = FileObject::from_file_info(path, &info);
-            self.store.append(&file_obj);
-            count += 1;
-        }
-
-        // Set up file monitor
-        self.setup_monitor(&file);
-
-        if *self.is_fuse.borrow() {
-            // Skip recursive folder size calculation on FUSE mounts —
-            // it would be extremely slow over the network
-            for i in 0..self.store.n_items() {
-                if let Some(item) = self.store.item(i) {
-                    let fo = item.downcast_ref::<FileObject>().unwrap();
-                    if fo.is_directory() {
-                        fo.set_size_display("\u{2014}".to_string());
+            match fresh.remove(&fo.path()) {
+                None => self.store.remove(i),
+                Some(new) => {
+                    if new.is_directory() != fo.is_directory() {
+                        self.store.splice(i, 1, &[new]);
+                    } else if new.modified() != fo.modified()
+                        || (!new.is_directory() && new.size() != fo.size())
+                        || new.mime_type() != fo.mime_type()
+                    {
+                        fo.update_from(&new);
                     }
                 }
             }
-        } else {
-            // Calculate folder sizes asynchronously
-            self.calculate_folder_sizes();
         }
-
-        Ok(count)
+        let added: Vec<glib::Object> = fresh.into_values().map(|fo| fo.upcast()).collect();
+        self.store.splice(self.store.n_items(), 0, &added);
     }
 
     fn calculate_folder_sizes(&self) {
         // Collect directory paths that need size calculation
-        let mut dir_paths: Vec<String> = Vec::new();
+        // Never walk into FUSE or network mounts (e.g. ~/protonDrive seen
+        // from ~). A thread blocked on an rclone request can't be frozen,
+        // so a scan in progress at suspend time makes the suspend fail.
+        // Mountpoints are matched by path before any stat, because even
+        // stat on a mountpoint is a request to the remote filesystem.
+        let skip = remote_mountpoints();
+        let base = self.current_path();
+
+        // (key in the store, folder name)
+        let mut dirs: Vec<(String, String)> = Vec::new();
         for i in 0..self.store.n_items() {
             if let Some(item) = self.store.item(i) {
                 let fo = item.downcast_ref::<FileObject>().unwrap();
                 if fo.is_directory() {
-                    dir_paths.push(fo.path());
+                    dirs.push((fo.path(), fo.name()));
                 }
             }
         }
 
-        if dir_paths.is_empty() {
+        if dirs.is_empty() {
             return;
         }
 
-        // Channel: thread sends (path, size) pairs, main thread polls and updates store
-        let (tx, rx) = std::sync::mpsc::channel::<(String, u64)>();
+        // Channel: thread sends (path, size) pairs, main thread polls and
+        // updates store. No size means a mountpoint that isn't walked.
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Option<u64>)>();
         let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_flag_thread = done_flag.clone();
 
         std::thread::spawn(move || {
-            for dir_path in &dir_paths {
-                let size = walk_dir_size(std::path::Path::new(dir_path));
-                let _ = tx.send((dir_path.clone(), size));
+            // Resolve symlinks here, off the main thread, so mountpoints
+            // match by path.
+            let base = std::fs::canonicalize(&base).unwrap_or_else(|_| base.into());
+            for (key, name) in &dirs {
+                let real = base.join(name);
+                let size = (!skip.contains(&real)).then(|| walk_dir_size(&real, &skip));
+                let _ = tx.send((key.clone(), size));
             }
             done_flag_thread.store(true, std::sync::atomic::Ordering::Relaxed);
         });
@@ -275,8 +497,13 @@ impl DirectoryModel {
                 if let Some(i) = idx {
                     if let Some(item) = store.item(i) {
                         let fo = item.downcast_ref::<FileObject>().unwrap();
-                        fo.set_size(size);
-                        fo.set_size_display(crate::file_object::format_size(size));
+                        match size {
+                            Some(size) => {
+                                fo.set_size(size);
+                                fo.set_size_display(crate::file_object::format_size(size));
+                            }
+                            None => fo.set_size_display("\u{2014}".to_string()),
+                        }
                     }
                 }
             }
@@ -308,7 +535,7 @@ impl DirectoryModel {
                 cancel_timer.cancel();
             });
             let result = f.query_info(
-                "standard::*,time::modified",
+                loader::attrs_for(true),
                 gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
                 Some(&cancel),
             );
@@ -339,7 +566,7 @@ impl DirectoryModel {
                 let store = self.store.clone();
                 let current_path = self.current_path.clone();
                 let sorter = self.sorter.clone();
-                let on_fuse = *self.is_fuse.borrow();
+                let on_fuse = self.is_fuse.get();
 
                 mon.connect_changed(move |_mon, file, _other, event| {
                     let path = current_path.borrow().clone();
@@ -472,7 +699,7 @@ impl DirectoryModel {
     }
 
     pub fn is_fuse(&self) -> bool {
-        *self.is_fuse.borrow()
+        self.is_fuse.get()
     }
 
     /// Set an external sorter (e.g. from ColumnView) to drive sorting
@@ -481,11 +708,49 @@ impl DirectoryModel {
     }
 }
 
-fn walk_dir_size(dir: &std::path::Path) -> u64 {
-    walk_dir_size_impl(dir, 0)
+/// Paths of recently used local files. The RecentManager is main-thread
+/// only, so this runs there; it touches no files.
+fn recent_paths() -> Vec<String> {
+    gtk::RecentManager::default()
+        .items()
+        .iter()
+        .filter(|item| item.uri().starts_with("file://"))
+        .filter_map(|item| gio::File::for_uri(&item.uri()).path())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect()
 }
 
-fn walk_dir_size_impl(dir: &std::path::Path, depth: u32) -> u64 {
+/// Mountpoints of FUSE and network filesystems, from `/proc/mounts`.
+/// Reading them can block indefinitely (and blocks suspend while it does).
+fn remote_mountpoints() -> std::collections::HashSet<std::path::PathBuf> {
+    const NETWORK: &[&str] = &["nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "ceph", "afs"];
+    let Ok(contents) = std::fs::read_to_string("/proc/mounts") else {
+        return Default::default();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let mountpoint = parts.nth(1)?;
+            let fstype = parts.next()?;
+            let remote = fstype.starts_with("fuse") || NETWORK.contains(&fstype);
+            remote.then(|| std::path::PathBuf::from(mountpoint.replace("\\040", " ")))
+        })
+        .collect()
+}
+
+fn walk_dir_size(
+    dir: &std::path::Path,
+    skip: &std::collections::HashSet<std::path::PathBuf>,
+) -> u64 {
+    walk_dir_size_impl(dir, skip, 0)
+}
+
+fn walk_dir_size_impl(
+    dir: &std::path::Path,
+    skip: &std::collections::HashSet<std::path::PathBuf>,
+    depth: u32,
+) -> u64 {
     if depth > 100 {
         return 0;
     }
@@ -494,13 +759,17 @@ fn walk_dir_size_impl(dir: &std::path::Path, depth: u32) -> u64 {
         return 0;
     };
     for entry in entries.flatten() {
-        let Ok(meta) = entry.path().symlink_metadata() else {
+        let path = entry.path();
+        if skip.contains(&path) {
+            continue;
+        }
+        let Ok(meta) = path.symlink_metadata() else {
             continue;
         };
         if meta.file_type().is_symlink() || meta.is_file() {
             total += meta.len();
         } else if meta.is_dir() {
-            total += walk_dir_size_impl(&entry.path(), depth + 1);
+            total += walk_dir_size_impl(&path, skip, depth + 1);
         }
     }
     total

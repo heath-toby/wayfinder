@@ -1530,6 +1530,7 @@ dependencies = [
  "chrono",
  "dirs",
  "env_logger",
+ "futures-util",
  "gtk4",
  "log",
  "tokio",

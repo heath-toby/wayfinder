@@ -63,32 +63,22 @@ impl WayfinderWindow {
     }
 
     /// Navigate to a path, updating history. If the path doesn't exist,
-    /// walk up the tree until we find a valid parent directory.
+    /// the nearest existing parent directory is opened instead.
     pub fn navigate_to_path(&self, path: &str) {
-        let mut path_buf = PathBuf::from(path);
-        while !path_buf.is_dir() {
-            match path_buf.parent() {
-                Some(parent) => path_buf = parent.to_path_buf(),
-                None => {
-                    path_buf = PathBuf::from("/");
-                    break;
-                }
-            }
-        }
-
-        let resolved = path_buf.to_string_lossy().to_string();
-        self.imp().nav.borrow_mut().navigate_to(path_buf);
-        self.load_directory(&resolved);
+        self.imp().nav.borrow_mut().navigate_to(PathBuf::from(path));
+        self.open_directory(path, true);
     }
 
     /// Load a directory without modifying history (used by back/forward)
     pub fn load_directory(&self, path: &str) {
-        let imp = self.imp();
+        self.open_directory(path, false);
+    }
 
-        // Save the currently selected filename for the OLD directory so we can
-        // restore it if the user navigates back later in this session.
+    /// Remember the selection in the location being left, and clear search.
+    fn leave_location(&self, new_location: &str) {
+        let imp = self.imp();
         let old_path = imp.model.current_path();
-        if !old_path.is_empty() && old_path != path {
+        if !old_path.is_empty() && old_path != new_location {
             if let Some(item) = imp.selection.selected_item() {
                 if let Some(file) = item.downcast_ref::<FileObject>() {
                     imp.last_position
@@ -98,14 +88,87 @@ impl WayfinderWindow {
             }
         }
 
-        // Clear search when navigating
         if imp.model.search.is_active() {
             imp.model.search.clear();
             imp.search_entry.set_text("");
             imp.search_bar.set_search_mode(false);
         }
+    }
 
-        let live_result = imp.model.load_directory(path);
+    /// Show `location` in the location bar, breadcrumb and nav buttons.
+    fn show_location(&self, location: &str, can_go_up: bool) {
+        let imp = self.imp();
+        imp.location_entry.set_text(location);
+        self.update_breadcrumb(location);
+        imp.back_button
+            .set_sensitive(imp.nav.borrow().can_go_back());
+        imp.forward_button
+            .set_sensitive(imp.nav.borrow().can_go_forward());
+        imp.up_button.set_sensitive(can_go_up);
+    }
+
+    fn open_directory(&self, path: &str, resolve: bool) {
+        self.leave_location(path);
+        // Show where we're going straight away, so Back works while a slow
+        // mount is still answering.
+        self.show_location(path, path != "/");
+
+        let w = self.clone();
+        let requested = path.to_string();
+        self.imp()
+            .model
+            .load_directory(path, resolve, move |result| {
+                w.finish_open_directory(&requested, result)
+            });
+        self.notify_if_waiting(path);
+    }
+
+    /// If the load just started is still waiting after a moment, say so —
+    /// in the status bar and aloud — and how to back out.
+    fn notify_if_waiting(&self, location: &str) {
+        let model = &self.imp().model;
+        if !model.is_loading() {
+            return;
+        }
+        let generation = model.generation();
+        let w = self.clone();
+        let location = location.to_string();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+            let imp = w.imp();
+            if imp.model.generation() != generation || !imp.model.is_loading() {
+                return;
+            }
+            let name = PathBuf::from(&location)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| location.clone());
+            let msg = match wayfinder::rclone_ops::fuse_daemon_name(&location) {
+                Some(daemon) => {
+                    format!("Waiting for {daemon} to open {name}. Press Alt+Left to go back.")
+                }
+                None => format!("Waiting for {name} to open. Press Alt+Left to go back."),
+            };
+            imp.status_label.set_text(&msg);
+            w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+        });
+    }
+
+    fn finish_open_directory(&self, requested: &str, live_result: Result<u32, String>) {
+        let imp = self.imp();
+        // A folder that no longer exists resolves to its nearest parent.
+        let resolved = imp.model.current_path();
+        if live_result.is_ok() && resolved != requested {
+            imp.nav
+                .borrow_mut()
+                .replace_current(PathBuf::from(&resolved));
+            self.show_location(&resolved, resolved != "/");
+        }
+        let path = if live_result.is_ok() {
+            resolved.as_str()
+        } else {
+            requested
+        };
+
         // Use the count returned directly by load_directory, NOT the
         // filtered model — the filter chain can momentarily report 0 even
         // when the underlying store is populated, which would falsely
@@ -136,9 +199,16 @@ impl WayfinderWindow {
 
         if use_cache {
             let cache_str = cache.to_string_lossy().to_string();
-            if let Ok(_count) = imp.model.load_directory(&cache_str) {
+            let w = self.clone();
+            let path = path.to_string();
+            imp.model.load_directory(&cache_str, false, move |result| {
+                if result.is_err() {
+                    return;
+                }
+                let imp = w.imp();
+                let path = path.as_str();
                 imp.location_entry.set_text(path);
-                self.update_breadcrumb(path);
+                w.update_breadcrumb(path);
                 imp.back_button
                     .set_sensitive(imp.nav.borrow().can_go_back());
                 imp.forward_button
@@ -146,7 +216,7 @@ impl WayfinderWindow {
                 let at_root = path == "/";
                 imp.up_button.set_sensitive(!at_root);
                 wayfinder::state::save_last_directory(path);
-                self.update_status();
+                w.update_status();
 
                 let dir_name = PathBuf::from(path)
                     .file_name()
@@ -157,16 +227,16 @@ impl WayfinderWindow {
                 imp.file_selection.borrow_mut().clear();
                 imp.type_ahead_buffer.borrow_mut().clear();
                 imp.selection.set_selected(0);
-                self.focus_current_view();
+                w.focus_current_view();
 
-                self.announce(
+                w.announce(
                     &format!(
                         "Opened {dir_name} from offline cache, {count} items. Mount is currently unreachable."
                     ),
                     AccessibleAnnouncementPriority::Medium,
                 );
-                return;
-            }
+            });
+            return;
         }
 
         match live_result {
@@ -241,6 +311,7 @@ impl WayfinderWindow {
             }
             Err(e) => {
                 log::error!("Failed to load directory {path}: {e}");
+                self.update_status();
                 self.announce(
                     &format!("Error: could not open {path}"),
                     AccessibleAnnouncementPriority::High,
@@ -250,34 +321,25 @@ impl WayfinderWindow {
     }
 
     pub fn load_special_uri(&self, uri: &str) {
-        let imp = self.imp();
-
-        // Save the currently selected filename for the OLD location
-        let old_path = imp.model.current_path();
-        if !old_path.is_empty() && old_path != uri {
-            if let Some(item) = imp.selection.selected_item() {
-                if let Some(file) = item.downcast_ref::<FileObject>() {
-                    imp.last_position
-                        .borrow_mut()
-                        .insert(old_path, file.name());
-                }
-            }
-        }
-
-        if imp.model.search.is_active() {
-            imp.model.search.clear();
-            imp.search_entry.set_text("");
-            imp.search_bar.set_search_mode(false);
-        }
+        self.leave_location(uri);
+        self.show_location(uri, false);
 
         let is_recent = uri == "recent:///";
-        let label = if is_recent { "Recent Files" } else { "Bin" };
-
-        let result = if is_recent {
-            imp.model.load_recent()
+        let w = self.clone();
+        let location = uri.to_string();
+        let on_done = move |result: Result<u32, String>| w.finish_special_uri(&location, result);
+        if is_recent {
+            self.imp().model.load_recent(on_done);
         } else {
-            imp.model.load_uri(uri)
-        };
+            self.imp().model.load_uri(uri, on_done);
+        }
+        self.notify_if_waiting(uri);
+    }
+
+    fn finish_special_uri(&self, uri: &str, result: Result<u32, String>) {
+        let imp = self.imp();
+        let is_recent = uri == "recent:///";
+        let label = if is_recent { "Recent Files" } else { "Bin" };
 
         match result {
             Ok(_count) => {
@@ -339,6 +401,17 @@ impl WayfinderWindow {
                 );
             }
         }
+    }
+
+    /// List the current folder again and update it in place, keeping the
+    /// selection; then update the status bar and run `after`. Doesn't
+    /// block: on a slow mount the list catches up when rclone answers.
+    pub fn reload_current(&self, after: impl FnOnce(&Self) + 'static) {
+        let w = self.clone();
+        self.imp().model.refresh(move || {
+            w.update_status();
+            after(&w);
+        });
     }
 
     pub fn update_status(&self) {
@@ -479,6 +552,28 @@ impl WayfinderWindow {
                     return;
                 }
             }
+        }
+
+        // On a FUSE mount, choose the app from the type already guessed from
+        // the name: checking the permissions or sniffing the contents would
+        // wait on the mount with the window frozen. (rclone doesn't mark
+        // files executable anyway.)
+        if is_fuse_mount(&path) {
+            let ctx = WidgetExt::display(self).app_launch_context();
+            let gio_file = gio::File::for_path(&path);
+            let app = gio::AppInfo::default_for_type(&file.mime_type(), false);
+            let launched = match app {
+                Some(app) => app.launch(&[gio_file], Some(&ctx)).map_err(|e| e.to_string()),
+                None => Err("no application for this type".to_string()),
+            };
+            if let Err(e) = launched {
+                log::error!("Failed to open {path}: {e}");
+                self.announce(
+                    &format!("Failed to open {}", file.name()),
+                    AccessibleAnnouncementPriority::High,
+                );
+            }
+            return;
         }
 
         // If the file is executable, run it directly instead of opening
@@ -848,9 +943,7 @@ impl WayfinderWindow {
             let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
                 // Move guard into the closure so it drops here on success.
                 let _g = guard;
-                let path = w.imp().model.current_path();
-                let _ = w.imp().model.load_directory(&path);
-                w.update_status();
+                w.reload_current(|_| {});
             }));
             match state.operation {
                 ClipboardOperation::Copy => {
@@ -881,9 +974,7 @@ impl WayfinderWindow {
                 let reload: Option<Box<dyn FnOnce() + 'static>> =
                     Some(Box::new(move || {
                         let _g = guard_held;
-                        let path = w.imp().model.current_path();
-                        let _ = w.imp().model.load_directory(&path);
-                        w.update_status();
+                        w.reload_current(|_| {});
                     }));
                 match state.operation {
                     ClipboardOperation::Copy => {
@@ -1292,9 +1383,7 @@ impl WayfinderWindow {
                 let w_done = w.clone();
                 let on_complete: Option<Box<dyn FnOnce() + 'static>> =
                     Some(Box::new(move || {
-                        let path = w_done.imp().model.current_path();
-                        let _ = w_done.imp().model.load_directory(&path);
-                        w_done.update_status();
+                        w_done.reload_current(|_| {});
                     }));
                 wayfinder::rclone_ops::rename_with_progress(
                     file_path.clone(),
@@ -1314,9 +1403,7 @@ impl WayfinderWindow {
                         AccessibleAnnouncementPriority::Medium,
                     );
                     // Reload directory as fallback in case file monitor doesn't catch the rename
-                    let path = w.imp().model.current_path();
-                    let _ = w.imp().model.load_directory(&path);
-                    w.update_status();
+                    w.reload_current(|_| {});
                 }
                 Err(e) => {
                     w.announce(
@@ -1558,9 +1645,7 @@ impl WayfinderWindow {
                 let pair_count = pairs.len();
                 let on_complete: Option<Box<dyn FnOnce() + 'static>> =
                     Some(Box::new(move || {
-                        let path = w_done.imp().model.current_path();
-                        let _ = w_done.imp().model.load_directory(&path);
-                        w_done.update_status();
+                        w_done.reload_current(|_| {});
                         w_done.announce(
                             &format!("Renamed {pair_count} files"),
                             AccessibleAnnouncementPriority::Medium,
@@ -1599,9 +1684,7 @@ impl WayfinderWindow {
             w.announce(&msg, AccessibleAnnouncementPriority::Medium);
 
             // Reload directory
-            let path = w.imp().model.current_path();
-            let _ = w.imp().model.load_directory(&path);
-            w.update_status();
+            w.reload_current(|_| {});
 
             d.close();
         });
@@ -1653,9 +1736,7 @@ impl WayfinderWindow {
         let w = self.clone();
         let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
             let _g = guard;
-            let current = w.imp().model.current_path();
-            let _ = w.imp().model.load_directory(&current);
-            w.update_status();
+            w.reload_current(|_| {});
         }));
 
         let src_rclone = wayfinder::rclone_ops::rclone_for_path(&path).is_some();
@@ -1735,9 +1816,7 @@ impl WayfinderWindow {
                         AccessibleAnnouncementPriority::Medium,
                     );
                     // Reload directory as fallback in case file monitor doesn't catch the new folder
-                    let path = w.imp().model.current_path();
-                    let _ = w.imp().model.load_directory(&path);
-                    w.update_status();
+                    w.reload_current(|_| {});
                 }
                 Err(e) => {
                     w.announce(
@@ -1823,9 +1902,7 @@ impl WayfinderWindow {
 
         if restored > 0 {
             // Reload directory to show restored files
-            let current = self.imp().model.current_path();
-            let _ = self.imp().model.load_directory(&current);
-            self.update_status();
+            self.reload_current(|_| {});
 
             if restored == 1 {
                 self.announce(
@@ -2241,25 +2318,23 @@ fn run_threaded_delete(
     let win = window.clone();
     let on_complete: Option<Box<dyn FnOnce(usize, usize) + 'static>> =
         Some(Box::new(move |success, failed| {
-            // Reload the current directory so the UI reflects the deletions.
-            let current = win.imp().model.current_path();
-            let _ = win.imp().model.load_directory(&current);
+            // Reload the current directory so the UI reflects the deletions,
+            // then restore focus near the previous position.
             win.imp().file_selection.borrow_mut().clear();
-            win.update_status();
-
-            // Restore focus near the previous position
-            let n_items = win.imp().selection.n_items();
-            if n_items > 0 {
-                let new_pos = if old_pos > 0 && old_pos >= n_items {
-                    n_items - 1
-                } else if old_pos > 0 {
-                    old_pos - 1
-                } else {
-                    0
-                };
-                win.imp().selection.set_selected(new_pos);
-                win.restore_focus_to_selected();
-            }
+            win.reload_current(move |win| {
+                let n_items = win.imp().selection.n_items();
+                if n_items > 0 {
+                    let new_pos = if old_pos > 0 && old_pos >= n_items {
+                        n_items - 1
+                    } else if old_pos > 0 {
+                        old_pos - 1
+                    } else {
+                        0
+                    };
+                    win.imp().selection.set_selected(new_pos);
+                    win.restore_focus_to_selected();
+                }
+            });
 
             // Announce outcome
             if failed == 0 && success > 0 {
@@ -2300,23 +2375,21 @@ fn run_rclone_direct_delete(
     let parent: gtk::Window = window.clone().upcast();
     let win = window.clone();
     let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-        let current = win.imp().model.current_path();
-        let _ = win.imp().model.load_directory(&current);
         win.imp().file_selection.borrow_mut().clear();
-        win.update_status();
-
-        let n_items = win.imp().selection.n_items();
-        if n_items > 0 {
-            let new_pos = if old_pos > 0 && old_pos >= n_items {
-                n_items - 1
-            } else if old_pos > 0 {
-                old_pos - 1
-            } else {
-                0
-            };
-            win.imp().selection.set_selected(new_pos);
-            win.restore_focus_to_selected();
-        }
+        win.reload_current(move |win| {
+            let n_items = win.imp().selection.n_items();
+            if n_items > 0 {
+                let new_pos = if old_pos > 0 && old_pos >= n_items {
+                    n_items - 1
+                } else if old_pos > 0 {
+                    old_pos - 1
+                } else {
+                    0
+                };
+                win.imp().selection.set_selected(new_pos);
+                win.restore_focus_to_selected();
+            }
+        });
         // The progress dialog already announced success/failure — don't
         // override it with a misleading "Deleted N" if rclone errored or
         // the user cancelled.

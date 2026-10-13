@@ -6,6 +6,7 @@ use gtk::{CustomFilter, FilterChange};
 
 use crate::file_object::FileObject;
 
+#[derive(Clone)]
 pub struct SearchState {
     pub filter: CustomFilter,
     query: Rc<RefCell<String>>,

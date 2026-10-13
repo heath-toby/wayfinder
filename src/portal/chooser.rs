@@ -86,6 +86,29 @@ pub fn show_chooser(
     header.pack_start(&nav_box);
     header.pack_start(&up_btn);
 
+    // Alt+Left / Alt+Right / Alt+Up, as in the main window.
+    {
+        let nav_keys = gtk::ShortcutController::new();
+        nav_keys.set_scope(gtk::ShortcutScope::Managed);
+        for (accel, button) in [
+            ("<Alt>Left", &back_btn),
+            ("<Alt>Right", &forward_btn),
+            ("<Alt>Up", &up_btn),
+        ] {
+            let button = button.clone();
+            nav_keys.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string(accel),
+                Some(gtk::CallbackAction::new(move |_, _| {
+                    if button.is_sensitive() {
+                        button.emit_clicked();
+                    }
+                    glib::Propagation::Stop
+                })),
+            ));
+        }
+        dlg.add_controller(nav_keys);
+    }
+
     // Location combo with recent directories
     let location_entry = gtk::Entry::builder()
         .hexpand(true)
@@ -583,26 +606,59 @@ fn load_dir(
     selection: &gtk::SingleSelection,
     window: &gtk::Window,
 ) {
-    match model.load_directory(path) {
-        Ok(_) => {
-            location_entry.set_text(path);
-            back_btn.set_sensitive(nav.borrow().can_go_back());
-            forward_btn.set_sensitive(nav.borrow().can_go_forward());
-            up_btn.set_sensitive(path != "/");
-            let count = model.item_count();
-            status_label.set_text(&format!("{count} items"));
-            selection.set_selected(gtk::INVALID_LIST_POSITION); // Clear selection
-            let dir_name = std::path::Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.to_string());
-            window.announce(
-                &format!("Opened {dir_name}, {count} items"),
-                AccessibleAnnouncementPriority::Medium,
-            );
-        }
-        Err(e) => {
-            window.announce(&format!("Error: {e}"), AccessibleAnnouncementPriority::High);
-        }
+    // Show where we're going straight away, so Back works while a slow
+    // mount is still answering.
+    location_entry.set_text(path);
+    back_btn.set_sensitive(nav.borrow().can_go_back());
+    forward_btn.set_sensitive(nav.borrow().can_go_forward());
+    up_btn.set_sensitive(path != "/");
+
+    let dir_name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    {
+        let m = model.clone();
+        let status_label = status_label.clone();
+        let selection = selection.clone();
+        let window = window.clone();
+        let dir_name = dir_name.clone();
+        model.load_directory(path, false, move |result| match result {
+            Ok(_) => {
+                let count = m.item_count();
+                status_label.set_text(&format!("{count} items"));
+                selection.set_selected(gtk::INVALID_LIST_POSITION); // Clear selection
+                window.announce(
+                    &format!("Opened {dir_name}, {count} items"),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+            }
+            Err(e) => {
+                status_label.set_text("");
+                window.announce(&format!("Error: {e}"), AccessibleAnnouncementPriority::High);
+            }
+        });
+    }
+
+    // Still waiting after a moment: say so, and how to back out.
+    if model.is_loading() {
+        let generation = model.generation();
+        let m = model.clone();
+        let status_label = status_label.clone();
+        let window = window.clone();
+        let daemon = wayfinder::rclone_ops::fuse_daemon_name(path);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+            if m.generation() != generation || !m.is_loading() {
+                return;
+            }
+            let msg = match daemon {
+                Some(daemon) => {
+                    format!("Waiting for {daemon} to open {dir_name}. Press Alt+Left to go back.")
+                }
+                None => format!("Waiting for {dir_name} to open. Press Alt+Left to go back."),
+            };
+            status_label.set_text(&msg);
+            window.announce(&msg, AccessibleAnnouncementPriority::Medium);
+        });
     }
 }

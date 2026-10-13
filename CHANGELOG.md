@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### FUSE / rclone mount support
+
+- **The window no longer freezes on a slow mount** — folders are listed in the background. If one takes more than a moment, the status bar shows, and Orca says, "Waiting for rclone to open Documents. Press Alt+Left to go back." Going back, or anywhere else, works straight away; the late listing is ignored. Local folders open exactly as before.
+- **Much faster listings on FUSE mounts** — Wayfinder no longer reads the start of files to work out their type there (on rclone, that meant downloading part of every file); the type comes from the file name.
+- **Instant back, up and revisits** — recently seen FUSE folders are shown at once and quietly refreshed. Resting on a folder for a moment fetches its contents in advance, so opening it is instant.
+- **Faster startup** — the last folder is listed once instead of twice, and checking that it still exists no longer holds up the window.
+- **Refresh in place** — after copying, moving, renaming or deleting, the list updates without resetting, so the selection stays where it was.
+- **Opening files on a mount** — the app is chosen from the file type without waiting on the mount.
+- **Safe to suspend** — the "Keep Available Offline" refresh pauses before the computer sleeps, and folder-size calculation never walks into a FUSE or network mount. Previously either could leave Wayfinder stuck waiting on rclone, which made suspend fail.
+- **Offline copies are refreshed, not re-downloaded** — at startup only changed files are fetched, into a temporary file that replaces the old copy once complete, so an interrupted refresh no longer loses the offline copy.
+
+### Fixed
+
+- **Opening a file from the command line** — `wayfinder some/file` now opens that file, rather than whichever item happened to be selected in its folder.
+- **Recent Files with spaces in their names** — no longer silently left out.
+- **File chooser (portal)** — Alt+Left, Alt+Right and Alt+Up now go back, forward and up.
+
 ## 2.4.0
 
 ### New features

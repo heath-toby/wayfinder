@@ -28,6 +28,12 @@ impl NavigationState {
         self.current_index += 1;
     }
 
+    /// Replace the current entry, e.g. when the folder asked for turned out
+    /// not to exist and its nearest existing parent was opened instead.
+    pub fn replace_current(&mut self, path: PathBuf) {
+        self.history[self.current_index] = path;
+    }
+
     pub fn go_back(&mut self) -> Option<&PathBuf> {
         if self.can_go_back() {
             self.current_index -= 1;

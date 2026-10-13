@@ -8,6 +8,7 @@ glib::wrapper! {
 }
 
 /// Plain data extracted from a gio::FileInfo, usable across threads.
+#[derive(Clone, PartialEq)]
 pub struct FileInfoData {
     pub name: String,
     pub is_directory: bool,
@@ -37,10 +38,16 @@ impl FileInfoData {
             })
             .unwrap_or_default();
 
-        let content_type = info
-            .content_type()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        // FUSE listings ask only for the name-based guess (see
+        // file_model::loader); asking for an attribute that wasn't
+        // requested is a GLib critical.
+        let content_type = if info.has_attribute(gio::FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE) {
+            info.content_type()
+        } else {
+            info.attribute_string(gio::FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE)
+        }
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
         Self {
             name,
@@ -105,6 +112,23 @@ impl FileObject {
             .property("search-string", &search_string)
             .property("a11y-name", &a11y_name)
             .build()
+    }
+
+    /// Copy the details that can change (size, date, type) from `other`,
+    /// an object for the same file, keeping this object and its place in
+    /// any selection. Folder sizes are left alone: they're computed
+    /// separately.
+    pub fn update_from(&self, other: &FileObject) {
+        if !self.is_directory() {
+            self.set_size(other.size());
+            self.set_size_display(other.size_display());
+        }
+        self.set_modified(other.modified());
+        self.set_modified_display(other.modified_display());
+        self.set_mime_type(other.mime_type());
+        self.set_icon(other.icon());
+        self.set_file_type_name(other.file_type_name());
+        self.set_a11y_name(other.a11y_name());
     }
 
     pub fn from_file_info(parent_path: &str, info: &gio::FileInfo) -> Self {

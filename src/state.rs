@@ -58,16 +58,12 @@ pub fn save_last_directory(path: &str) {
     set_value("directory", path);
 }
 
+/// The last directory as saved. It isn't checked here — that could block
+/// on a slow mount; navigating to it falls back to the nearest existing
+/// parent if it's gone.
 pub fn load_last_directory() -> Option<PathBuf> {
     let path_str = get_value("directory")?;
-    let mut path = PathBuf::from(path_str.trim());
-    while !path.is_dir() {
-        match path.parent() {
-            Some(parent) => path = parent.to_path_buf(),
-            None => return None,
-        }
-    }
-    Some(path)
+    Some(PathBuf::from(path_str.trim()))
 }
 
 pub fn save_view_mode(mode: &str) {
@@ -178,19 +174,8 @@ pub fn load_window_session() -> Vec<PathBuf> {
         Ok(contents) => contents
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| {
-                let mut p = PathBuf::from(l.trim());
-                while !p.is_dir() {
-                    match p.parent() {
-                        Some(parent) => p = parent.to_path_buf(),
-                        None => {
-                            p = PathBuf::from("/");
-                            break;
-                        }
-                    }
-                }
-                p
-            })
+            // Not checked here (see load_last_directory).
+            .map(|l| PathBuf::from(l.trim()))
             .collect(),
         Err(_) => Vec::new(),
     }

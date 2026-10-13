@@ -169,7 +169,7 @@ pub fn delete_with_progress(
 
     let title_label = gtk::Label::builder()
         .label(if total == 1 {
-            format!("Deleting {}", &paths[0])
+            format!("Deleting {}", paths[0])
         } else {
             format!("Deleting {total} items")
         })

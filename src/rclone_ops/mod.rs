@@ -420,6 +420,18 @@ pub fn is_fuse_path(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The program serving the FUSE mount `path` is on, for messages such as
+/// "Waiting for rclone": `rclone` for `fuse.rclone`, `sshfs` for
+/// `fuse.sshfs`. `None` when `path` isn't on a FUSE mount, or the type
+/// doesn't say.
+pub fn fuse_daemon_name(path: &str) -> Option<String> {
+    let fstype = fstype_for_path(path)?;
+    match fstype.strip_prefix("fuse.")? {
+        "portal" => Some("the document portal".to_string()),
+        daemon => Some(daemon.to_string()),
+    }
+}
+
 /// Whether `path` is specifically inside an rclone FUSE mount, per
 /// `/proc/mounts` fstype `fuse.rclone`. This is the kernel's view, which
 /// is more reliable than parsing `ps` output.

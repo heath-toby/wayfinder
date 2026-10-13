@@ -11,7 +11,9 @@
 //! When the mount returns, pinned files are re-checked and updated from
 //! the remote if newer.
 
-use std::collections::HashMap;
+mod sleep;
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Persistent file recording every FUSE mountpoint Wayfinder has ever seen
@@ -150,7 +152,9 @@ fn save_manifest(manifest: &HashMap<String, PinnedEntry>) -> Result<(), String> 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut contents = String::from("# Wayfinder offline pins — tab-separated: path<TAB>is_directory<TAB>mtime<TAB>size\n");
+    let mut contents = String::from(
+        "# Wayfinder offline pins — tab-separated: path<TAB>is_directory<TAB>mtime<TAB>size\n",
+    );
     let mut entries: Vec<&PinnedEntry> = manifest.values().collect();
     entries.sort_by(|a, b| a.original_path.cmp(&b.original_path));
     for entry in entries {
@@ -213,34 +217,37 @@ pub fn unpin_path(original_path: &str) -> Result<(), String> {
 
 /// Refresh a single pinned entry if the remote has changed.
 /// Returns true if the cached copy was updated.
+///
+/// Directories are refreshed incrementally: only files whose size or
+/// mtime differ from the cached copy are downloaded, and each lands in a
+/// temporary file first, so an interrupted refresh never loses the
+/// existing offline copy.
 pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let src = Path::new(&entry.original_path);
-    let Ok(meta) = std::fs::metadata(src) else {
+    let meta = {
+        let _io = sleep::io_step();
+        std::fs::metadata(src)
+    };
+    let Ok(meta) = meta else {
         // Source unreachable — keep cached copy as-is.
         return Ok(false);
     };
     let mtime = mtime_secs(&meta);
     let size = if meta.is_dir() { 0 } else { meta.len() };
 
-    if mtime == entry.last_synced_mtime
-        && size == entry.last_synced_size
-        && !entry.is_directory
-    {
+    if mtime == entry.last_synced_mtime && size == entry.last_synced_size && !entry.is_directory {
         return Ok(false);
     }
 
-    // Re-copy
     let dest = cache_path_for(&entry.original_path);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    if entry.is_directory {
-        // For directories, do a fresh recursive copy
-        let _ = std::fs::remove_dir_all(&dest);
-        copy_dir_all(src, &dest)?;
+    let changed = if entry.is_directory {
+        sync_dir(src, &dest)?
     } else {
-        std::fs::copy(src, &dest).map_err(|e| e.to_string())?;
-    }
+        sync_file(src, &meta, &dest)?
+    };
 
     // Update manifest
     let mut manifest = load_manifest();
@@ -249,13 +256,16 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
         e.last_synced_size = size;
     }
     save_manifest(&manifest)?;
-    Ok(true)
+    Ok(changed)
 }
 
 /// Sync all pinned entries — call on startup or when a mount returns.
 /// Returns (updated_count, error_count).
 pub fn sync_all() -> (usize, usize) {
     let manifest = load_manifest();
+    if !manifest.is_empty() {
+        sleep::ensure_watching();
+    }
     let mut updated = 0;
     let mut errors = 0;
     for entry in manifest.values() {
@@ -280,23 +290,103 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+/// Suffix for a download in progress; renamed into place when complete.
+const PART_SUFFIX: &str = ".wayfinder-part";
+
+/// Bring `dst` in line with the directory `src`. Returns true if anything
+/// was copied or removed.
+fn sync_dir(src: &Path, dst: &Path) -> Result<bool, String> {
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    let entries = std::fs::read_dir(src).map_err(|e| e.to_string())?;
-    for entry in entries.flatten() {
+    let entries: Vec<std::fs::DirEntry> = {
+        let _io = sleep::io_step();
+        std::fs::read_dir(src)
+            .and_then(|it| it.collect::<Result<_, _>>())
+            .map_err(|e| e.to_string())?
+    };
+    let mut changed = false;
+    let mut present: HashSet<std::ffi::OsString> = HashSet::new();
+    for entry in entries {
         let from = entry.path();
         let to = dst.join(entry.file_name());
+        present.insert(entry.file_name());
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         if file_type.is_dir() {
-            copy_dir_all(&from, &to)?;
+            changed |= sync_dir(&from, &to)?;
         } else if file_type.is_file() {
-            std::fs::copy(&from, &to).map_err(|e| e.to_string())?;
-        } else if file_type.is_symlink() {
-            // Skip symlinks — copying through them could pull data we don't want
+            let meta = {
+                let _io = sleep::io_step();
+                std::fs::metadata(&from)
+            };
+            let meta = meta.map_err(|e| e.to_string())?;
+            changed |= sync_file(&from, &meta, &to)?;
+        }
+        // Skip symlinks — copying through them could pull data we don't want
+    }
+
+    // Drop cached entries that no longer exist on the remote. The listing
+    // above is complete (any error returned early), so this is safe.
+    for entry in std::fs::read_dir(dst).map_err(|e| e.to_string())?.flatten() {
+        if present.contains(&entry.file_name()) {
             continue;
         }
+        let path = entry.path();
+        let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        changed |= removed.is_ok();
     }
-    Ok(())
+    Ok(changed)
+}
+
+/// Copy `src` to `dst` unless the cached copy already matches its size
+/// and mtime. Returns true if a copy was made.
+fn sync_file(src: &Path, src_meta: &std::fs::Metadata, dst: &Path) -> Result<bool, String> {
+    if let Ok(dst_meta) = std::fs::metadata(dst) {
+        if dst_meta.len() == src_meta.len() && mtime_secs(&dst_meta) == mtime_secs(src_meta) {
+            return Ok(false);
+        }
+    }
+
+    let mut part_name = dst.file_name().unwrap_or_default().to_os_string();
+    part_name.push(PART_SUFFIX);
+    let part = dst.with_file_name(part_name);
+    let result = copy_file_chunked(src, &part).and_then(|out| {
+        if let Ok(mtime) = src_meta.modified() {
+            out.set_modified(mtime)?;
+        }
+        drop(out);
+        std::fs::rename(&part, dst)
+    });
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&part);
+        return Err(e.to_string());
+    }
+    Ok(true)
+}
+
+/// Copy in chunks, holding the sleep gate only while reading, so a
+/// pending suspend can pause us between chunks.
+fn copy_file_chunked(src: &Path, dst: &Path) -> std::io::Result<std::fs::File> {
+    use std::io::{Read, Write};
+    let mut input = {
+        let _io = sleep::io_step();
+        std::fs::File::open(src)?
+    };
+    let mut out = std::fs::File::create(dst)?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = {
+            let _io = sleep::io_step();
+            input.read(&mut buf)?
+        };
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+    }
+    Ok(out)
 }

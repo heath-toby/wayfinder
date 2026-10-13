@@ -435,9 +435,44 @@ impl ObjectImpl for WayfinderWindowInner {
             self.model.set_sorter(Some(&cv_sorter));
         }
 
-        // Load initial directory
+        // Load the initial directory once construction is done — unless
+        // something navigated first (session restore, a folder passed on the
+        // command line), so a slow mount isn't listed twice at startup.
         let initial_path = self.nav.borrow().current().to_string_lossy().to_string();
-        window.navigate_to_path(&initial_path);
+        let w = window.clone();
+        glib::idle_add_local_once(move || {
+            if w.imp().model.current_path().is_empty() {
+                w.navigate_to_path(&initial_path);
+            }
+        });
+
+        // Opening a folder in a FUSE folder is instant if its listing was
+        // fetched while the selection rested on it.
+        let w = window.clone();
+        let prefetch_token = Rc::new(Cell::new(0u64));
+        self.selection.connect_selected_item_notify(move |sel| {
+            let token = prefetch_token.get() + 1;
+            prefetch_token.set(token);
+            let Some(file) = sel.selected_item().and_downcast::<FileObject>() else {
+                return;
+            };
+            if !file.is_directory() || !w.imp().model.is_fuse() {
+                return;
+            }
+            let w = w.clone();
+            let prefetch_token = prefetch_token.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+                if prefetch_token.get() == token {
+                    w.imp().model.prefetch(&file.path());
+                }
+            });
+        });
+
+        // A cached FUSE folder is shown at once and checked in the
+        // background; keep the item count right if the check changed it.
+        let w = window.clone();
+        self.model
+            .set_on_background_update(move || w.update_status());
     }
 }
 
@@ -1517,11 +1552,8 @@ impl WayfinderWindowInner {
 
 fn complete_path(partial: &str) -> Option<String> {
     let expanded = if partial.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            partial.replacen('~', &home.to_string_lossy(), 1)
-        } else {
-            return None;
-        }
+        let home = dirs::home_dir()?;
+        partial.replacen('~', &home.to_string_lossy(), 1)
     } else {
         partial.to_string()
     };
