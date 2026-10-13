@@ -723,12 +723,7 @@ impl WayfinderWindow {
     /// acts on that file: drop the marks, as other file managers do, so the
     /// menu's actions don't go to the marked files instead. (The Menu key
     /// keeps them: it's how the marked files get a menu.)
-    pub fn drop_marks_unless_clicked_is_marked(&self) {
-        // Only when the click was on a file (it's selected by then); a
-        // click on empty space says nothing about the marks.
-        if !wayfinder::views::take_right_clicked_item() {
-            return;
-        }
+    pub fn drop_marks_unless_selected_is_marked(&self) {
         let Some(file) = self.get_selected_file() else {
             return;
         };
@@ -1489,6 +1484,10 @@ impl WayfinderWindow {
             && !wayfinder::offline::inside_sync_folder(&current);
         let msg = if self.imp().offline_view.get() {
             "This is the offline copy, shown while the drive can't be reached. It can't be changed here."
+        } else if in_cache && wayfinder::offline::in_sync_folder(&current) {
+            // It holds a two-way sync folder: deleting or renaming that
+            // here would be synced to the remote.
+            "This folder holds a two-way sync folder's offline copy. Make changes inside the sync folder itself."
         } else if in_cache {
             "This is Wayfinder's store of offline copies. Changes here would be undone when they're next refreshed."
         } else {

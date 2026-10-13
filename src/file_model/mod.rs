@@ -724,10 +724,6 @@ impl DirectoryModel {
     }
 }
 
-/// Re-apply the active sort if items changed in place are now out of
-/// order (the sort model places new items, but doesn't notice changes).
-/// Only then: re-sorting replaces every row, which can make Orca lose or
-/// repeat its place.
 /// Work out the sizes of the folders `dirs` ((key in the store, name in
 /// `base`)) on a worker thread, and show each as it comes in.
 fn spawn_size_job(
@@ -793,6 +789,10 @@ fn spawn_size_job(
     });
 }
 
+/// Re-apply the active sort if items changed in place are now out of
+/// order (the sort model places new items, but doesn't notice changes).
+/// Only then: re-sorting replaces every row, which can make Orca lose or
+/// repeat its place.
 fn resort_if_needed(sort_model: &SortListModel, changed: &[FileObject]) {
     let Some(sorter) = sort_model.sorter() else {
         return;

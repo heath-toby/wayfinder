@@ -81,7 +81,7 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     let found = match Command::new("ps").arg("-eo").arg("args=").output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
             .lines()
-            .filter_map(|line| parse_rclone_mount(line, &fuse_mounts))
+            .filter_map(|line| parse_rclone_mount(line, &fuse_mounts, configured_remotes()))
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -131,7 +131,17 @@ fn fuse_mountpoints() -> Vec<String> {
 /// mount` serving one of `fuse_mounts`. Flags may come anywhere, with or
 /// without values (`--daemon`, `-v`, `--vfs-cache-mode writes`), so the
 /// mountpoint is found by name and the remote is the `name:` before it.
-fn parse_rclone_mount(line: &str, fuse_mounts: &[String]) -> Option<(String, String)> {
+/// The remotes in rclone's config (`Proton:` …), read once per process.
+fn configured_remotes() -> &'static [String] {
+    static REMOTES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    REMOTES.get_or_init(list_remotes)
+}
+
+fn parse_rclone_mount(
+    line: &str,
+    fuse_mounts: &[String],
+    remotes: &[String],
+) -> Option<(String, String)> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let rclone_idx = tokens
         .iter()
@@ -153,16 +163,23 @@ fn parse_rclone_mount(line: &str, fuse_mounts: &[String]) -> Option<(String, Str
             !t.starts_with('-') && t.contains(':') && (!t.starts_with(':') || t[1..].contains(':'))
         })
         .collect();
-    // A flag's value (`--rc-addr localhost:5572`) is preferably not the
-    // remote — but a boolean flag (`--daemon Proton:`) may come right
-    // before it, so if nothing else fits, take it anyway.
+    // Best: one naming a configured remote (`--rc-addr localhost:5572`
+    // doesn't). Failing that, one that isn't a flag's value — though a
+    // boolean flag (`--daemon Proton:`) may come right before the remote,
+    // so then the last, nearest the mountpoint.
+    let is_configured = |i: &usize| {
+        before[*i]
+            .find(':')
+            .is_some_and(|c| remotes.iter().any(|r| *r == before[*i][..=c]))
+    };
     let after_flag =
         |i: usize| i > 0 && before[i - 1].starts_with("--") && !before[i - 1].contains('=');
     let remote = candidates
         .iter()
         .rev()
-        .find(|&&i| !after_flag(i))
-        .or_else(|| candidates.first())
+        .find(|i| is_configured(i))
+        .or_else(|| candidates.iter().rev().find(|&&i| !after_flag(i)))
+        .or_else(|| candidates.last())
         .map(|&i| before[i])?;
     Some((args[mount_pos].to_string(), remote.to_string()))
 }
@@ -1029,7 +1046,7 @@ mod mount_parse_tests {
     #[test]
     fn plain_mount() {
         assert_eq!(
-            parse_rclone_mount("rclone mount Proton: /home/u/proton", &mounts()),
+            parse_rclone_mount("rclone mount Proton: /home/u/proton", &mounts(), &[]),
             Some(("/home/u/proton".into(), "Proton:".into()))
         );
     }
@@ -1039,7 +1056,7 @@ mod mount_parse_tests {
     fn flags_with_and_without_values() {
         let line = "/usr/bin/rclone -v mount --daemon --vfs-cache-mode writes Proton:Docs /home/u/proton --allow-other";
         assert_eq!(
-            parse_rclone_mount(line, &mounts()),
+            parse_rclone_mount(line, &mounts(), &[]),
             Some(("/home/u/proton".into(), "Proton:Docs".into()))
         );
     }
@@ -1048,12 +1065,28 @@ mod mount_parse_tests {
     fn flag_values_with_colons_are_not_the_remote() {
         let line = "rclone mount Proton: --rc-addr localhost:5572 /home/u/proton";
         assert_eq!(
-            parse_rclone_mount(line, &mounts()),
+            parse_rclone_mount(line, &mounts(), &[]),
             Some(("/home/u/proton".into(), "Proton:".into()))
         );
         let line = "rclone mount Proton: --rc-addr :5572 /home/u/proton";
         assert_eq!(
-            parse_rclone_mount(line, &mounts()),
+            parse_rclone_mount(line, &mounts(), &[]),
+            Some(("/home/u/proton".into(), "Proton:".into()))
+        );
+    }
+
+    /// Every candidate follows a flag: the configured remote wins.
+    #[test]
+    fn configured_remote_is_preferred() {
+        let line = "rclone mount --rc-addr localhost:5572 --daemon Proton: /home/u/proton";
+        let remotes = vec!["Proton:".to_string()];
+        assert_eq!(
+            parse_rclone_mount(line, &mounts(), &remotes),
+            Some(("/home/u/proton".into(), "Proton:".into()))
+        );
+        // Without the config to go by: the one nearest the mountpoint.
+        assert_eq!(
+            parse_rclone_mount(line, &mounts(), &[]),
             Some(("/home/u/proton".into(), "Proton:".into()))
         );
     }
@@ -1061,13 +1094,13 @@ mod mount_parse_tests {
     #[test]
     fn other_commands_and_mounts_are_ignored() {
         assert_eq!(
-            parse_rclone_mount("rclone copy Proton: /home/u/proton", &mounts()),
+            parse_rclone_mount("rclone copy Proton: /home/u/proton", &mounts(), &[]),
             None
         );
         assert_eq!(
-            parse_rclone_mount("rclone mount Drive: /mnt/drive", &mounts()),
+            parse_rclone_mount("rclone mount Drive: /mnt/drive", &mounts(), &[]),
             None
         );
-        assert_eq!(parse_rclone_mount("vim notes.txt", &mounts()), None);
+        assert_eq!(parse_rclone_mount("vim notes.txt", &mounts(), &[]), None);
     }
 }

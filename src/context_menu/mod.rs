@@ -603,7 +603,7 @@ fn add_separator(container: &gtk::Box) {
     container.append(&sep);
 }
 
-fn show_background_menu(window: &WayfinderWindow, x: f64, y: f64, in_trash: bool) {
+pub fn show_background_menu(window: &WayfinderWindow, x: f64, y: f64, in_trash: bool) {
     let popover = gtk::Popover::new();
     let vbox = menu_box();
 

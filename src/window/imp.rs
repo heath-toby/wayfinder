@@ -1510,8 +1510,14 @@ impl WayfinderWindowInner {
         let window = self.obj().clone();
         click_controller.connect_pressed(move |gesture, _n, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            window.drop_marks_unless_clicked_is_marked();
-            crate::context_menu::show_context_menu(&window, x, y);
+            // On a file: its menu. On empty space: the folder's own menu
+            // (Paste, New Folder), not one for whichever file has focus.
+            if wayfinder::views::take_right_clicked_item() {
+                window.drop_marks_unless_selected_is_marked();
+                crate::context_menu::show_context_menu(&window, x, y);
+            } else {
+                crate::context_menu::show_background_menu(&window, x, y, window.is_in_trash());
+            }
         });
         self.list_view
             .column_view()
@@ -1523,8 +1529,14 @@ impl WayfinderWindowInner {
         let window2 = self.obj().clone();
         click_controller2.connect_pressed(move |gesture, _n, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            window2.drop_marks_unless_clicked_is_marked();
-            crate::context_menu::show_context_menu(&window2, x, y);
+            // On a file: its menu. On empty space: the folder's own menu
+            // (Paste, New Folder), not one for whichever file has focus.
+            if wayfinder::views::take_right_clicked_item() {
+                window2.drop_marks_unless_selected_is_marked();
+                crate::context_menu::show_context_menu(&window2, x, y);
+            } else {
+                crate::context_menu::show_background_menu(&window2, x, y, window2.is_in_trash());
+            }
         });
         self.grid_view.grid_view().add_controller(click_controller2);
 
