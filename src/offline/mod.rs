@@ -249,10 +249,15 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    // Fetch through rclone straight from the remote when we can (see
+    // `fetch`); resolved once per pin, since it runs `ps`.
+    let remote = crate::rclone_ops::rclone_for_path(&entry.original_path)
+        .filter(|_| crate::rclone_ops::rclone_available())
+        .map(|t| t.full_remote_spec);
     let changed = if entry.is_directory {
-        sync_dir(src, &dest)?
+        sync_dir(src, &dest, remote.as_deref())?
     } else {
-        sync_file(src, &meta, &dest)?
+        sync_file(src, &meta, &dest, remote.as_deref())?
     };
 
     // Update manifest
@@ -301,7 +306,7 @@ const PART_SUFFIX: &str = ".wayfinder-part";
 
 /// Bring `dst` in line with the directory `src`. Returns true if anything
 /// was copied or removed.
-fn sync_dir(src: &Path, dst: &Path) -> Result<bool, String> {
+fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>) -> Result<bool, String> {
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     let entries: Vec<std::fs::DirEntry> = {
         let _io = sleep::io_step();
@@ -319,14 +324,16 @@ fn sync_dir(src: &Path, dst: &Path) -> Result<bool, String> {
             continue;
         };
         if file_type.is_dir() {
-            changed |= sync_dir(&from, &to)?;
+            let child = remote.map(|r| remote_child(r, &entry.file_name().to_string_lossy()));
+            changed |= sync_dir(&from, &to, child.as_deref())?;
         } else if file_type.is_file() {
             let meta = {
                 let _io = sleep::io_step();
                 std::fs::metadata(&from)
             };
             let meta = meta.map_err(|e| e.to_string())?;
-            changed |= sync_file(&from, &meta, &to)?;
+            let child = remote.map(|r| remote_child(r, &entry.file_name().to_string_lossy()));
+            changed |= sync_file(&from, &meta, &to, child.as_deref())?;
         }
         // Skip symlinks — copying through them could pull data we don't want
     }
@@ -350,7 +357,12 @@ fn sync_dir(src: &Path, dst: &Path) -> Result<bool, String> {
 
 /// Copy `src` to `dst` unless the cached copy already matches its size
 /// and mtime. Returns true if a copy was made.
-fn sync_file(src: &Path, src_meta: &std::fs::Metadata, dst: &Path) -> Result<bool, String> {
+fn sync_file(
+    src: &Path,
+    src_meta: &std::fs::Metadata,
+    dst: &Path,
+    remote: Option<&str>,
+) -> Result<bool, String> {
     if let Ok(dst_meta) = std::fs::metadata(dst) {
         if dst_meta.len() == src_meta.len() && mtime_secs(&dst_meta) == mtime_secs(src_meta) {
             return Ok(false);
@@ -360,11 +372,18 @@ fn sync_file(src: &Path, src_meta: &std::fs::Metadata, dst: &Path) -> Result<boo
     let mut part_name = dst.file_name().unwrap_or_default().to_os_string();
     part_name.push(PART_SUFFIX);
     let part = dst.with_file_name(part_name);
-    let result = copy_file_chunked(src, &part).and_then(|out| {
+    // Pause point before each file, so a pending suspend waits for no more
+    // than the file in hand.
+    drop(sleep::io_step());
+    let result = fetch(src, &part, remote).and_then(|()| {
+        // Give the copy the remote's mtime, which is what the next refresh
+        // compares against.
         if let Ok(mtime) = src_meta.modified() {
-            out.set_modified(mtime)?;
+            std::fs::File::options()
+                .write(true)
+                .open(&part)?
+                .set_modified(mtime)?;
         }
-        drop(out);
         std::fs::rename(&part, dst)
     });
     if let Err(e) = result {
@@ -374,25 +393,47 @@ fn sync_file(src: &Path, src_meta: &std::fs::Metadata, dst: &Path) -> Result<boo
     Ok(true)
 }
 
-/// Copy in chunks, holding the sleep gate only while reading, so a
-/// pending suspend can pause us between chunks.
-fn copy_file_chunked(src: &Path, dst: &Path) -> std::io::Result<std::fs::File> {
-    use std::io::{Read, Write};
-    let mut input = {
-        let _io = sleep::io_step();
-        std::fs::File::open(src)?
-    };
-    let mut out = std::fs::File::create(dst)?;
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = {
-            let _io = sleep::io_step();
-            input.read(&mut buf)?
-        };
-        if n == 0 {
-            break;
+/// Download `src` (on the mount) to the local file `dst` in a child process.
+///
+/// Not in this process: a FUSE file held open here gets a FLUSH request
+/// each time any copy of its descriptor is closed — including the copy
+/// every newly spawned child closes as it starts. While the daemon is slow
+/// that holds up the spawn, and Wayfinder spawns from its main thread
+/// (`ps`, apps opening files), so the window would freeze. With rclone the
+/// child also skips the mount and fetches straight from the remote.
+fn fetch(src: &Path, dst: &Path, remote: Option<&str>) -> std::io::Result<()> {
+    let mut cmd = match remote {
+        Some(remote) => {
+            let mut cmd = std::process::Command::new("rclone");
+            cmd.arg("copyto").arg(remote).arg(dst);
+            cmd
         }
-        out.write_all(&buf[..n])?;
+        None => {
+            let mut cmd = std::process::Command::new("cp");
+            cmd.arg("--").arg(src).arg(dst);
+            cmd
+        }
+    };
+    let status = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "copying {} failed ({status})",
+            src.display()
+        )))
     }
-    Ok(out)
+}
+
+/// The remote spec of `name` inside the remote directory `remote`.
+fn remote_child(remote: &str, name: &str) -> String {
+    if remote.ends_with(':') || remote.ends_with('/') {
+        format!("{remote}{name}")
+    } else {
+        format!("{remote}/{name}")
+    }
 }

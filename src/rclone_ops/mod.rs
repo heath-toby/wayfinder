@@ -188,14 +188,20 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
 }
 
 /// Whether the rclone binary is on PATH.
+/// Whether rclone can be run. Checked once per process: it's asked before
+/// many actions, often on the main thread, and installing or removing
+/// rclone mid-session is rare.
 pub fn rclone_available() -> bool {
-    Command::new("rclone")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("rclone")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 /// List configured rclone remotes (e.g. ["Proton:", "Drive:"]).
