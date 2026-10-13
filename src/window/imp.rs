@@ -75,6 +75,9 @@ pub struct WayfinderWindowInner {
     /// Guard so a second Ctrl+V (or drag-drop) can't fire while a paste is
     /// already running. Cleared by `paste_from`'s reload callback.
     pub pasting: Cell<bool>,
+    /// Showing a folder's offline copy because its mount is unreachable:
+    /// what's listed lives in the cache, not on the drive.
+    pub offline_view: Cell<bool>,
     pub current_view: Cell<ViewMode>,
     pub file_selection: RefCell<SelectionState>,
     pub type_ahead_buffer: Rc<RefCell<String>>,
@@ -208,6 +211,7 @@ impl Default for WayfinderWindowInner {
             search_entry,
             clipboard: RefCell::new(None),
             pasting: Cell::new(false),
+            offline_view: Cell::new(false),
             current_view: Cell::new(ViewMode::List),
             file_selection: RefCell::new(SelectionState::new()),
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),
@@ -1035,15 +1039,21 @@ impl WayfinderWindowInner {
                     imp.forward_button.grab_focus();
                 } else if imp.up_button.is_sensitive() {
                     imp.up_button.grab_focus();
-                } else {
-                    imp.location_entry.grab_focus();
+                } else if !imp.location_entry.grab_focus() {
+                    // Nowhere of ours to go: let GTK move focus on.
+                    return glib::Propagation::Proceed;
                 }
                 glib::Propagation::Stop
             } else if key == gdk::Key::ISO_Left_Tab
                 || (key == gdk::Key::Tab && mods.contains(gdk::ModifierType::SHIFT_MASK))
             {
-                imp.location_entry.grab_focus();
-                glib::Propagation::Stop
+                // The location entry isn't always in the window: if it can't
+                // take focus, let GTK move focus back, rather than trap it.
+                if imp.location_entry.grab_focus() {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
             } else if key == gdk::Key::Left && !mods.contains(gdk::ModifierType::ALT_MASK) {
                 let col = imp.current_column.get();
                 if col > 0 {
@@ -1087,9 +1097,12 @@ impl WayfinderWindowInner {
                 let pos = imp.selection.selected();
                 if let Some(anchor) = sel.range_anchor {
                     // Finish range — select all items between anchor and current
+                    // No row selected (an empty or filtered-out list) gives
+                    // an invalid position: never loop to it.
+                    let n_items = imp.selection.n_items();
                     let start = anchor.min(pos);
-                    let end = anchor.max(pos);
-                    for i in start..=end {
+                    let end = anchor.max(pos).min(n_items.saturating_sub(1));
+                    for i in (start..=end).take_while(|_| n_items > 0) {
                         if let Some(item) = imp.selection.model().and_then(|m| m.item(i)) {
                             if let Some(file) = item.downcast_ref::<FileObject>() {
                                 sel.selected.insert(file.path());
@@ -1240,15 +1253,21 @@ impl WayfinderWindowInner {
                     imp.forward_button.grab_focus();
                 } else if imp.up_button.is_sensitive() {
                     imp.up_button.grab_focus();
-                } else {
-                    imp.location_entry.grab_focus();
+                } else if !imp.location_entry.grab_focus() {
+                    // Nowhere of ours to go: let GTK move focus on.
+                    return glib::Propagation::Proceed;
                 }
                 glib::Propagation::Stop
             } else if key == gdk::Key::ISO_Left_Tab
                 || (key == gdk::Key::Tab && mods.contains(gdk::ModifierType::SHIFT_MASK))
             {
-                imp.location_entry.grab_focus();
-                glib::Propagation::Stop
+                // The location entry isn't always in the window: if it can't
+                // take focus, let GTK move focus back, rather than trap it.
+                if imp.location_entry.grab_focus() {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
             } else if key == gdk::Key::space && !mods.contains(gdk::ModifierType::SHIFT_MASK) {
                 if let Some(item) = imp.selection.selected_item() {
                     if let Some(file) = item.downcast_ref::<FileObject>() {
@@ -1275,9 +1294,12 @@ impl WayfinderWindowInner {
                 let mut sel = imp.file_selection.borrow_mut();
                 let pos = imp.selection.selected();
                 if let Some(anchor) = sel.range_anchor {
+                    // No row selected (an empty or filtered-out list) gives
+                    // an invalid position: never loop to it.
+                    let n_items = imp.selection.n_items();
                     let start = anchor.min(pos);
-                    let end = anchor.max(pos);
-                    for i in start..=end {
+                    let end = anchor.max(pos).min(n_items.saturating_sub(1));
+                    for i in (start..=end).take_while(|_| n_items > 0) {
                         if let Some(item) = imp.selection.model().and_then(|m| m.item(i)) {
                             if let Some(file) = item.downcast_ref::<FileObject>() {
                                 sel.selected.insert(file.path());

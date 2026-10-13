@@ -82,6 +82,7 @@ impl WayfinderWindow {
     /// Remember the selection in the location being left, and clear search.
     fn leave_location(&self, new_location: &str) {
         let imp = self.imp();
+        imp.offline_view.set(false);
         let old_path = imp.model.current_path();
         if !old_path.is_empty() && old_path != new_location {
             if let Some(item) = imp.selection.selected_item() {
@@ -184,8 +185,14 @@ impl WayfinderWindow {
             let cache_str = cache.to_string_lossy().to_string();
             let w = self.clone();
             let path = path.to_string();
+            imp.offline_view.set(true);
             imp.model.load_directory(&cache_str, false, move |result| {
-                if result.is_err() {
+                if let Err(e) = result {
+                    w.update_status();
+                    w.announce(
+                        &format!("Error: could not open the offline copy of {path}: {e}"),
+                        AccessibleAnnouncementPriority::High,
+                    );
                     return;
                 }
                 let imp = w.imp();
@@ -735,7 +742,8 @@ impl WayfinderWindow {
         let imp = self.imp();
         let old_pos = imp.selection.selected();
 
-        let gio_file = gio::File::for_uri(&format!("trash:///{}", file.name()));
+        // child() escapes the name: `#` or `%41` in it must stay part of it.
+        let gio_file = gio::File::for_uri("trash:///").child(file.name());
         match wayfinder::file_ops::restore_from_trash(&gio_file) {
             Ok(dest) => {
                 // Reload the trash listing so the restored item disappears
@@ -943,10 +951,16 @@ impl WayfinderWindow {
 
     /// Paste from the window-local clipboard.
     pub fn paste_local(&self) {
-        self.paste_from(self.imp().clipboard.borrow().clone(), PasteSource::Local);
+        // Bound first: a borrow held for the call would still be alive when
+        // a cut clears the clipboard at the end of the paste (a panic).
+        let clipboard = self.imp().clipboard.borrow().clone();
+        self.paste_from(clipboard, PasteSource::Local);
     }
 
     fn paste_from(&self, clipboard: Option<ClipboardState>, source: PasteSource) {
+        if self.refuse_in_offline_view() {
+            return;
+        }
         let imp = self.imp();
 
         if imp.pasting.get() {
@@ -1007,34 +1021,6 @@ impl WayfinderWindow {
         // panics in the progress callback or worker.
         let guard = PastingGuard::new(self.clone());
 
-        // rclone doesn't refuse these: a folder into itself, or a move to
-        // where it already is.
-        if use_rclone {
-            use wayfinder::file_ops::{placement, Placement};
-            let is_move = state.operation == ClipboardOperation::Cut;
-            for (src, dest) in source_paths
-                .iter()
-                .zip(landing_paths(&source_paths, &dest_dir_str))
-            {
-                let name = std::path::Path::new(src)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let msg = match placement(std::path::Path::new(src), std::path::Path::new(&dest)) {
-                    Placement::IntoItself => Some(format!(
-                        "Cannot {} {name} into itself",
-                        if is_move { "move" } else { "copy" }
-                    )),
-                    Placement::Same if is_move => Some(format!("{name} is already here")),
-                    _ => None,
-                };
-                if let Some(msg) = msg {
-                    self.announce(&msg, AccessibleAnnouncementPriority::High);
-                    return;
-                }
-            }
-        }
-
         let plan = PastePlan {
             files: state.files.clone(),
             source_paths,
@@ -1043,24 +1029,8 @@ impl WayfinderWindow {
             changed,
             moved,
         };
-        if use_rclone {
-            // rclone overwrites (or merges into) whatever is in the way
-            // without asking. If anything is, go the per-file way, which
-            // asks Skip, Replace or Rename.
-            let landing = landing_paths(&plan.source_paths, &plan.dest_dir);
-            self.run_blocking(
-                &plan.dest_dir.clone(),
-                move || landing.iter().any(|p| std::path::Path::new(p).exists()),
-                move |w, clash| {
-                    if clash {
-                        w.paste_with_gio(plan, guard);
-                    } else {
-                        w.paste_with_rclone(plan, guard);
-                    }
-                },
-            );
-        } else {
-            self.paste_with_gio(plan, guard);
+        if !self.dispatch_paste(plan, guard, use_rclone) {
+            return;
         }
 
         // Clear clipboard after cut
@@ -1085,6 +1055,56 @@ impl WayfinderWindow {
                 }
             }
         }
+    }
+
+    /// Start a paste (or drop). Returns false if it was refused.
+    fn dispatch_paste(&self, plan: PastePlan, guard: PastingGuard, use_rclone: bool) -> bool {
+        // rclone doesn't refuse these: a folder into itself, or a move to
+        // where it already is. (The per-file way checks for itself.)
+        if use_rclone {
+            use wayfinder::file_ops::{placement, Placement};
+            for (src, dest) in plan
+                .source_paths
+                .iter()
+                .zip(landing_paths(&plan.source_paths, &plan.dest_dir))
+            {
+                let name = std::path::Path::new(src)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let msg = match placement(std::path::Path::new(src), std::path::Path::new(&dest)) {
+                    Placement::IntoItself => Some(format!(
+                        "Cannot {} {name} into itself",
+                        if plan.is_move { "move" } else { "copy" }
+                    )),
+                    Placement::Same if plan.is_move => Some(format!("{name} is already here")),
+                    _ => None,
+                };
+                if let Some(msg) = msg {
+                    self.announce(&msg, AccessibleAnnouncementPriority::High);
+                    return false;
+                }
+            }
+
+            // rclone overwrites (or merges into) whatever is in the way
+            // without asking. If anything is, go the per-file way, which
+            // asks Skip, Replace or Rename.
+            let landing = landing_paths(&plan.source_paths, &plan.dest_dir);
+            self.run_blocking(
+                &plan.dest_dir.clone(),
+                move || landing.iter().any(|p| std::path::Path::new(p).exists()),
+                move |w, clash| {
+                    if clash {
+                        w.paste_with_gio(plan, guard);
+                    } else {
+                        w.paste_with_rclone(plan, guard);
+                    }
+                },
+            );
+        } else {
+            self.paste_with_gio(plan, guard);
+        }
+        true
     }
 
     /// Paste through rclone directly: one progress dialog, server-side
@@ -1153,6 +1173,9 @@ impl WayfinderWindow {
     }
 
     pub fn trash_selected(&self) {
+        if self.refuse_in_offline_view() {
+            return;
+        }
         // Pressing Delete again while a slow mount is still answering would
         // trash (or offer to permanently delete) the same files twice, so
         // skip files already on their way.
@@ -1241,7 +1264,12 @@ impl WayfinderWindow {
         // behind the question; it runs once that's answered.
         let after_question: Deferred = Default::default();
 
-        // If some files can't be trashed (e.g. FUSE mount), offer permanent deletion
+        // If some files can't be trashed (e.g. FUSE mount), offer permanent
+        // deletion — unless a drive is mounted inside one of them.
+        let perm_paths: Vec<String> = needs_perm_delete.iter().map(|f| f.path()).collect();
+        if !needs_perm_delete.is_empty() && self.refuse_if_mounts_inside(&perm_paths) {
+            needs_perm_delete.clear();
+        }
         if !needs_perm_delete.is_empty() {
             let window = self.clone();
             let count = needs_perm_delete.len();
@@ -1413,6 +1441,39 @@ impl WayfinderWindow {
         });
     }
 
+    /// In the offline copy (mount unreachable), say that files can't be
+    /// changed and return true: the change would land on the copy, not the
+    /// drive the location bar names.
+    fn refuse_in_offline_view(&self) -> bool {
+        if !self.imp().offline_view.get() {
+            return false;
+        }
+        self.announce(
+            "This is the offline copy, shown while the drive can't be reached. It can't be changed here.",
+            AccessibleAnnouncementPriority::High,
+        );
+        true
+    }
+
+    /// If a drive is mounted inside any of `paths`, say so and return true:
+    /// deleting them permanently would delete what's on that drive too.
+    fn refuse_if_mounts_inside(&self, paths: &[String]) -> bool {
+        for path in paths {
+            if let Some(mount) = wayfinder::rclone_ops::mountpoints_inside(path).first() {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.clone());
+                self.announce(
+                    &format!("Not deleted: {mount} is mounted inside {name}. Unmount it first."),
+                    AccessibleAnnouncementPriority::High,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     /// Select the item above one removed from `old_pos`, or the new last
     /// item, and focus it.
     fn select_near_removed(&self, old_pos: u32) {
@@ -1440,8 +1501,15 @@ impl WayfinderWindow {
     }
 
     pub fn delete_selected(&self) {
+        if self.refuse_in_offline_view() {
+            return;
+        }
         let files = self.get_selected_files();
         if files.is_empty() {
+            return;
+        }
+        let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
+        if self.refuse_if_mounts_inside(&paths) {
             return;
         }
 
@@ -1502,56 +1570,73 @@ impl WayfinderWindow {
                             return;
                         }
 
-                        let mut success = 0;
-                        let mut failed = 0;
-                        let mut last_error = String::new();
-
-                        for (name, path) in &file_paths {
-                            let gio_file = gio::File::for_path(path);
-                            match wayfinder::file_ops::delete_file_recursive(&gio_file) {
-                                Ok(()) => success += 1,
-                                Err(e) => {
-                                    failed += 1;
-                                    last_error = format!("{name}: {e}");
+                        // Off the main thread: a big folder takes a while,
+                        // and a link may lead onto a slow mount.
+                        let first = file_paths
+                            .first()
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or_default();
+                        window.run_blocking(
+                            &first,
+                            move || {
+                                let mut success = 0;
+                                let mut failed = 0;
+                                let mut last_error = String::new();
+                                for (name, path) in &file_paths {
+                                    let gio_file = gio::File::for_path(path);
+                                    match wayfinder::file_ops::delete_file_recursive(&gio_file) {
+                                        Ok(()) => success += 1,
+                                        Err(e) => {
+                                            failed += 1;
+                                            last_error = format!("{name}: {e}");
+                                        }
+                                    }
                                 }
-                            }
-                        }
-
-                        // Announce failures first
-                        if failed > 0 {
-                            if failed == 1 {
-                                window.announce(
-                                    &format!("Could not delete: {last_error}"),
-                                    AccessibleAnnouncementPriority::High,
-                                );
-                            } else {
-                                window.announce(
-                                    &format!("{failed} files could not be deleted"),
-                                    AccessibleAnnouncementPriority::High,
-                                );
-                            }
-                        }
-
-                        if success > 0 {
-                            // Select once the list no longer holds the
-                            // deleted rows, so focus can't land on one.
-                            let first_name = file_paths[0].0.clone();
-                            window.reload_after_removal(from, move |w, relisted| {
+                                let first_name = file_paths
+                                    .first()
+                                    .map(|(n, _)| n.clone())
+                                    .unwrap_or_default();
+                                (success, failed, last_error, first_name)
+                            },
+                            move |window, (success, failed, last_error, first_name)| {
+                                // Announce failures first
                                 if failed > 0 {
-                                    return;
+                                    if failed == 1 {
+                                        window.announce(
+                                            &format!("Could not delete: {last_error}"),
+                                            AccessibleAnnouncementPriority::High,
+                                        );
+                                    } else {
+                                        window.announce(
+                                            &format!("{failed} files could not be deleted"),
+                                            AccessibleAnnouncementPriority::High,
+                                        );
+                                    }
                                 }
-                                let msg = if success == 1 {
-                                    format!("Deleted {first_name}")
-                                } else {
-                                    format!("Deleted {success} files")
-                                };
-                                if relisted {
-                                    w.announce(&msg, AccessibleAnnouncementPriority::Medium);
-                                } else {
-                                    w.announce_after_navigation(msg);
+                                if success > 0 {
+                                    // Select once the list no longer holds the
+                                    // deleted rows, so focus can't land on one.
+                                    window.reload_after_removal(from, move |w, relisted| {
+                                        if failed > 0 {
+                                            return;
+                                        }
+                                        let msg = if success == 1 {
+                                            format!("Deleted {first_name}")
+                                        } else {
+                                            format!("Deleted {success} files")
+                                        };
+                                        if relisted {
+                                            w.announce(
+                                                &msg,
+                                                AccessibleAnnouncementPriority::Medium,
+                                            );
+                                        } else {
+                                            w.announce_after_navigation(msg);
+                                        }
+                                    });
                                 }
-                            });
-                        }
+                            },
+                        );
                     }
                 }
             },
@@ -1559,6 +1644,9 @@ impl WayfinderWindow {
     }
 
     pub fn rename_selected(&self) {
+        if self.refuse_in_offline_view() {
+            return;
+        }
         let Some(file) = self.get_selected_file() else {
             return;
         };
@@ -1637,14 +1725,15 @@ impl WayfinderWindow {
                 let changed: Vec<String> = parent_dir(&file_path).into_iter().collect();
                 let moved = vec![file_path.clone()];
                 let old_path = file_path.clone();
+                let old_check = file_path.clone();
                 let target = new_path.clone();
-                let only_case = new_name.to_lowercase() == file.name().to_lowercase();
+
                 d.close();
                 // rclone would overwrite whatever has the new name; GIO's
                 // rename refuses, and so do we.
                 w.run_blocking(
                     &file_path,
-                    move || std::path::Path::new(&target).exists() && !only_case,
+                    move || rename_clash(&old_check, &target),
                     move |w, clash| {
                         if clash {
                             w.announce(
@@ -1733,6 +1822,9 @@ impl WayfinderWindow {
     }
 
     pub fn batch_rename(&self) {
+        if self.refuse_in_offline_view() {
+            return;
+        }
         let files = self.get_selected_files();
         if files.len() < 2 {
             self.announce(
@@ -1948,8 +2040,7 @@ impl WayfinderWindow {
                     &changed[0].clone(),
                     move || {
                         check.iter().find_map(|(old, new)| {
-                            let only_case = old.to_lowercase() == new.to_lowercase();
-                            (!only_case && std::path::Path::new(new).exists()).then(|| {
+                            rename_clash(old, new).then(|| {
                                 std::path::Path::new(new)
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
@@ -2046,6 +2137,9 @@ impl WayfinderWindow {
     }
 
     pub fn handle_drop(&self, uri_str: &str) {
+        if self.refuse_in_offline_view() {
+            return;
+        }
         let imp = self.imp();
         if imp.pasting.get() {
             self.announce(
@@ -2065,48 +2159,28 @@ impl WayfinderWindow {
         let guard = PastingGuard::new(self.clone());
 
         let dest_dir_str = imp.model.current_path();
-        let parent_window: gtk::Window = self.clone().upcast();
-        let changed = vec![dest_dir_str.clone()];
-        let landed = landing_paths(&paths, &dest_dir_str);
-
-        let src_rclone = paths
+        let use_rclone = (paths
             .iter()
-            .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some());
-        let dst_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
-        if (src_rclone || dst_rclone) && wayfinder::rclone_ops::rclone_available() {
-            let w = self.clone();
-            let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                let _g = guard;
-                w.forget_moved(&landed);
-                w.reload_after_change(&changed);
-            }));
-            wayfinder::rclone_ops::copy_paths_with_progress(
-                paths,
-                dest_dir_str,
-                &parent_window,
-                reload,
-            );
-        } else {
-            // One copy per file; the guard drops when the last one is done.
-            let shared_guard = std::rc::Rc::new(guard);
-            let dest_dir = gio::File::for_path(&dest_dir_str);
-            for path in &paths {
-                let w = self.clone();
-                let guard_held = shared_guard.clone();
-                let changed = changed.clone();
-                let landed = landed.clone();
-                let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                    let _g = guard_held;
-                    w.forget_moved(&landed);
-                    w.reload_after_change(&changed);
-                }));
-                let source = gio::File::for_path(path);
-                wayfinder::file_ops::copy_with_progress(&source, &dest_dir, &parent_window, reload);
-            }
-        }
+            .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some())
+            || wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some())
+            && wayfinder::rclone_ops::rclone_available();
+        // A drop copies, with the same care as a paste: nothing into
+        // itself, nothing overwritten without asking.
+        let plan = PastePlan {
+            files: paths.iter().map(gio::File::for_path).collect(),
+            moved: landing_paths(&paths, &dest_dir_str),
+            changed: vec![dest_dir_str.clone()],
+            source_paths: paths,
+            dest_dir: dest_dir_str,
+            is_move: false,
+        };
+        self.dispatch_paste(plan, guard, use_rclone);
     }
 
     pub fn create_new_folder(&self) {
+        if self.refuse_in_offline_view() {
+            return;
+        }
         let window = self.clone();
 
         let entry = gtk::Entry::builder()
@@ -2234,9 +2308,11 @@ impl WayfinderWindow {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // Find the item in trash by original path
+            // Find the item in trash by original path — the most recently
+            // trashed, if an older copy from the same place is there too.
+            let mut newest: Option<(String, std::path::PathBuf)> = None;
             if let Ok(enumerator) = trash.enumerate_children(
-                "standard::name,trash::orig-path",
+                "standard::name,trash::orig-path,trash::deletion-date",
                 gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
                 gio::Cancellable::NONE,
             ) {
@@ -2245,15 +2321,24 @@ impl WayfinderWindow {
                         .attribute_byte_string("trash::orig-path")
                         .map(|p| p.to_string())
                         .unwrap_or_default();
-                    if orig == *path {
-                        let trash_file = trash.child(info.name());
-                        match wayfinder::file_ops::restore_from_trash(&trash_file) {
-                            Ok(_) => restored += 1,
-                            Err(e) => {
-                                log::error!("Failed to restore {name}: {e}");
-                            }
-                        }
-                        break;
+                    if orig != *path {
+                        continue;
+                    }
+                    // ISO 8601 local time: later sorts after.
+                    let date = info
+                        .attribute_string("trash::deletion-date")
+                        .map(|d| d.to_string())
+                        .unwrap_or_default();
+                    if newest.as_ref().is_none_or(|(d, _)| date > *d) {
+                        newest = Some((date, info.name()));
+                    }
+                }
+            }
+            if let Some((_, trashed_name)) = newest {
+                match wayfinder::file_ops::restore_from_trash(&trash.child(trashed_name)) {
+                    Ok(_) => restored += 1,
+                    Err(e) => {
+                        log::error!("Failed to restore {name}: {e}");
                     }
                 }
             }
@@ -2827,6 +2912,20 @@ fn landing_paths(sources: &[String], dest_dir: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether renaming `old` to `new` would replace another file. A name that
+/// differs only in case is the same file on a case-insensitive remote —
+/// but on a case-sensitive one it's another file, so compare identities.
+fn rename_clash(old: &str, new: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(new_meta) = std::fs::symlink_metadata(new) else {
+        return false;
+    };
+    match std::fs::symlink_metadata(old) {
+        Ok(old_meta) => (old_meta.dev(), old_meta.ino()) != (new_meta.dev(), new_meta.ino()),
+        Err(_) => true,
+    }
+}
+
 /// The new name given to more than one file, if any, in rename `pairs`.
 fn duplicate_target(pairs: &[(String, String)]) -> Option<String> {
     let mut seen = std::collections::HashSet::new();
@@ -2862,7 +2961,31 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dropped_paths, duplicate_target, landing_paths, position_near_removed};
+    use super::{
+        dropped_paths, duplicate_target, landing_paths, position_near_removed, rename_clash,
+    };
+
+    #[test]
+    fn renaming_onto_another_file_clashes() {
+        let d = std::env::temp_dir().join(format!("wayfinder-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (a, b) = (d.join("Report.txt"), d.join("report.txt"));
+        std::fs::write(&a, b"a").unwrap();
+        let (a, b) = (
+            a.to_string_lossy().to_string(),
+            b.to_string_lossy().to_string(),
+        );
+        // Nothing there yet.
+        assert!(!rename_clash(&a, &b));
+        // A different file with the name differing only in case (a
+        // case-sensitive filesystem): a clash.
+        std::fs::write(&b, b"b").unwrap();
+        assert!(rename_clash(&a, &b));
+        // The same file.
+        assert!(!rename_clash(&a, &a));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn batch_rename_to_one_name_is_caught() {

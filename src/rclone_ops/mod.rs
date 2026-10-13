@@ -99,6 +99,26 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     found
 }
 
+/// Filesystems mounted inside `path` (not at it): deleting `path` would
+/// reach into them — a whole remote drive, perhaps. By path, from
+/// /proc/mounts; no filesystem access.
+pub fn mountpoints_inside(path: &str) -> Vec<String> {
+    let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
+    mountpoints_inside_of(&proc_mounts, path)
+}
+
+fn mountpoints_inside_of(proc_mounts: &str, path: &str) -> Vec<String> {
+    let inside = format!("{}/", path.trim_end_matches('/'));
+    proc_mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|m| m.replace("\\040", " "))
+        .filter(|m| m.starts_with(&inside))
+        .collect()
+}
+
 /// FUSE mountpoints from /proc/mounts.
 fn fuse_mountpoints() -> Vec<String> {
     let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
@@ -999,7 +1019,25 @@ mod fuse_type_tests {
 
 #[cfg(test)]
 mod mount_parse_tests {
-    use super::parse_rclone_mount;
+    use super::{mountpoints_inside_of, parse_rclone_mount};
+
+    #[test]
+    fn mounts_inside_a_folder_are_found() {
+        let mounts = "/dev/sda1 / ext4 rw 0 0\n\
+                      gdrive: /home/u/mnt/gdrive fuse.rclone rw 0 0\n\
+                      /dev/sdb1 /home/u/mnt2 ext4 rw 0 0\n\
+                      x /home/u/My\\040Disk fuse rw 0 0\n";
+        assert_eq!(
+            mountpoints_inside_of(mounts, "/home/u/mnt"),
+            vec!["/home/u/mnt/gdrive"]
+        );
+        assert_eq!(
+            mountpoints_inside_of(mounts, "/home/u"),
+            vec!["/home/u/mnt/gdrive", "/home/u/mnt2", "/home/u/My Disk"]
+        );
+        // Mounted at it, not inside: deleting it fails rather than reaching in.
+        assert!(mountpoints_inside_of(mounts, "/home/u/mnt2").is_empty());
+    }
 
     fn mounts() -> Vec<String> {
         vec!["/home/u/proton".to_string()]
