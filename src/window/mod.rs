@@ -700,6 +700,14 @@ impl WayfinderWindow {
         }
     }
 
+    /// Select `name` the next time `folder` is opened.
+    pub fn remember_selection(&self, folder: &str, name: &str) {
+        self.imp()
+            .last_position
+            .borrow_mut()
+            .insert(folder.to_string(), name.to_string());
+    }
+
     pub fn get_selected_file(&self) -> Option<FileObject> {
         self.imp().selection.selected_item().and_downcast()
     }

@@ -218,19 +218,40 @@ fn check_downloaded(src_meta: &std::fs::Metadata, cached: &Path) -> Result<(), S
 }
 
 /// Unpin a path: remove from manifest and delete its cached copy.
-pub fn unpin_path(original_path: &str) -> Result<(), String> {
+/// Returns whether the offline copy was kept because it's part of a
+/// two-way sync folder.
+pub fn unpin_path(original_path: &str) -> Result<bool, String> {
     let mut manifest = load_manifest();
     if manifest.remove(original_path).is_none() {
-        return Ok(()); // wasn't pinned
+        return Ok(false); // wasn't pinned
     }
     save_manifest(&manifest)?;
     let cached = cache_path_for(original_path);
+    if in_sync_folder(&cached) {
+        // The copy is also two-way sync's local side: deleting it would
+        // make the next sync delete the files on the remote too.
+        return Ok(true);
+    }
     if cached.is_dir() {
         let _ = std::fs::remove_dir_all(&cached);
     } else if cached.is_file() {
         let _ = std::fs::remove_file(&cached);
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Whether the offline copy at `cached` overlaps a two-way sync folder's
+/// local side (is it, is inside it, or holds it). Such a copy belongs to
+/// the sync: pinning must neither overwrite nor delete anything there.
+pub fn in_sync_folder(cached: &Path) -> bool {
+    crate::rclone_sync::load_pairs()
+        .values()
+        .any(|pair| paths_overlap(cached, Path::new(&pair.sync_local_path)))
+}
+
+/// Whether one of `a` and `b` is, or is inside, the other.
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
 }
 
 /// Refresh a single pinned entry if the remote has changed.
@@ -245,6 +266,12 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     // exist as an empty mountpoint directory, and syncing from it would
     // delete the offline copy just when it's needed.
     if !crate::rclone_ops::is_fuse_path(&entry.original_path) {
+        return Ok(false);
+    }
+    // Two-way sync keeps this copy up to date, in both directions; a
+    // one-way refresh would overwrite or delete local changes it hasn't
+    // uploaded yet.
+    if in_sync_folder(&cache_path_for(&entry.original_path)) {
         return Ok(false);
     }
     let src = Path::new(&entry.original_path);
@@ -452,7 +479,18 @@ fn remote_child(remote: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::check_downloaded;
+    use super::{check_downloaded, paths_overlap};
+    use std::path::Path;
+
+    #[test]
+    fn copies_overlap_a_sync_folder_inside_or_around_it() {
+        let sync = Path::new("/c/proton/Work");
+        assert!(paths_overlap(Path::new("/c/proton/Work"), sync));
+        assert!(paths_overlap(Path::new("/c/proton/Work/Taxes"), sync));
+        assert!(paths_overlap(Path::new("/c/proton"), sync));
+        assert!(!paths_overlap(Path::new("/c/proton/Workshop"), sync));
+        assert!(!paths_overlap(Path::new("/c/proton/Play"), sync));
+    }
 
     fn dir(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("wayfinder-pin-{}-{name}", std::process::id()));

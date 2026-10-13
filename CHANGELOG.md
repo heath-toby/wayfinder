@@ -5,6 +5,9 @@
 ### Fixed
 
 - **Data loss when pasting a folder onto itself** — pasting a folder into the folder it's already in and choosing Replace deleted it (or left it empty). Replacing something with itself, or with the folder that holds it, is now refused, and so is moving something to where it already is.
+- **Two-way sync and offline copies** — "Remove Offline Copy" on something inside a two-way sync folder deleted sync's local copy, so the next sync deleted those files on the remote too. The offline refresh at startup could also overwrite or remove local changes in a sync folder that hadn't been uploaded yet. Offline copies inside a sync folder are now left to the sync: never refreshed one way, deleted on unpin, or downloaded over. Changing a sync's remote or folder now starts it afresh, instead of every sync failing.
+- **Delete in the sidebar** — pressing Delete on a place such as Home moved whatever was selected in the file list to the Bin; it now does nothing there (it still removes a bookmark).
+- **Right-clicking a bookmark** — removed it at once; it now opens the bookmark menu (Remove Bookmark, Edit Sidebar). Removing a bookmark is announced, and focus goes to a neighbouring place.
 - **Copying a folder into itself** — pasting a folder into one of its own subfolders copied it into itself over and over until the disk filled; it's now refused.
 - **Overwriting on rclone mounts** — pasting onto an rclone mount where a file or folder of the same name already exists now asks Skip, Replace or Rename, as everywhere else, instead of silently overwriting it; renaming to a name that's taken, or a batch rename that would give two files the same name, is refused.
 - **rclone copies and moves** — empty folders are copied and moved too, and moving a folder no longer leaves an empty copy of its folder tree behind. When rclone fails, its error message is read out in full.
@@ -39,6 +42,10 @@
 - **Keep Available Offline** — only says "Available offline" when the copy really arrived; a failed, cancelled or skipped download is reported and not marked as pinned. Pinning a single file through rclone now stores it where Wayfinder looks for it (it was put inside a folder of the same name).
 - **Custom actions** — with several files selected, an action that takes one file (such as Extract Here or Checksum) now runs on each of them, not just the first; actions are only offered when they suit every selected file; file names containing `%c`, `%i` or `%k`, and URIs with spaces or `#`, are passed correctly; the progress window can be put away with "Continue in background" or Escape (it used to stay up, blocking the window, for as long as the program ran — a terminal, say).
 - **Compress** — file names beginning with `-` are no longer mistaken for options, and an existing archive of the same name is reported instead of being added to or replaced.
+- **File chooser (portal)** — Back, Forward and Up no longer crash it. The chosen file is passed to the app correctly when its name has spaces, `#`, `%` or accented letters (it could open the wrong file). Saving over an existing file asks first. A file chosen in one folder is no longer returned after moving to another, the selected file is shown and read out, and when choosing a folder, the folder being shown can be chosen. Enter in the file name field saves; Escape cancels.
+- **Bookmarks** — folders with spaces or accented letters are bookmarked correctly (they were written so that GTK apps, and Wayfinder, opened the wrong folder), and such bookmarks made by other apps open properly.
+- **"Show in folder"** — from other apps, it now selects the file, and works for files with spaces or accented letters in their path.
+- **Open With per file** — the app chosen for a file whose path contains `=` is remembered.
 - **Open With** — pressing Enter on "Open With" moves focus into the submenu.
 - **Right-click** — right-clicking a file opens the menu for that file; it used to act on whichever file was selected before.
 

@@ -115,7 +115,12 @@ pub fn pair_for(local_path: &str) -> Option<SyncPair> {
 /// for rclone FUSE mounts this should be the offline cache path.
 pub fn set_pair(local_path: &str, sync_local_path: &str, remote: &str) -> Result<(), String> {
     let mut pairs = load_pairs();
-    let existing = pairs.get(local_path).cloned();
+    // A pair whose ends changed is a new pair: its first sync must
+    // establish a fresh baseline (--resync), and it hasn't synced yet.
+    let existing = pairs
+        .get(local_path)
+        .filter(|p| p.remote == remote && p.sync_local_path == sync_local_path)
+        .cloned();
     pairs.insert(
         local_path.to_string(),
         SyncPair {

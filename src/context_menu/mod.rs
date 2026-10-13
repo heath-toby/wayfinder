@@ -273,8 +273,12 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                 move || {
                     if was_pinned {
                         match wayfinder::offline::unpin_path(&p) {
-                            Ok(()) => w.announce(
+                            Ok(false) => w.announce(
                                 "Offline copy removed",
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            ),
+                            Ok(true) => w.announce(
+                                "No longer kept offline. The copy stays: it's part of a two-way sync folder",
                                 gtk::AccessibleAnnouncementPriority::Medium,
                             ),
                             Err(e) => w.announce(
@@ -283,6 +287,18 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                             ),
                         }
                     } else {
+                        // Inside a two-way sync folder, the copy is already
+                        // kept (both ways); downloading over it would undo
+                        // local changes not yet synced.
+                        if wayfinder::offline::in_sync_folder(&wayfinder::offline::cache_path_for(
+                            &p,
+                        )) {
+                            w.announce(
+                                "Already available offline through two-way sync",
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            );
+                            return;
+                        }
                         let parent_window: gtk::Window = w.clone().upcast();
                         let pin_path_str = p.clone();
                         let w_done = w.clone();

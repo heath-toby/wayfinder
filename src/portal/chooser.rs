@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::AccessibleAnnouncementPriority;
@@ -143,7 +144,7 @@ pub fn show_chooser(
     bottom_bar.set_margin_start(8);
     bottom_bar.set_margin_end(8);
 
-    let filename_entry = if is_save {
+    let (filename_entry, selected_label) = if is_save {
         let entry = gtk::Entry::builder()
             .hexpand(true)
             .placeholder_text("Filename")
@@ -151,7 +152,7 @@ pub fn show_chooser(
             .build();
         entry.update_property(&[gtk::accessible::Property::Label("File name")]);
         bottom_bar.append(&entry);
-        Some(entry)
+        (Some(entry), None)
     } else {
         // For Open, show a read-only label that shows the selected file
         let label = gtk::Label::builder()
@@ -161,7 +162,7 @@ pub fn show_chooser(
             .build();
         label.update_property(&[gtk::accessible::Property::Label("Selected file")]);
         bottom_bar.append(&label);
-        None
+        (None, Some(label))
     };
 
     let cancel_btn = gtk::Button::with_label("Cancel");
@@ -355,7 +356,9 @@ pub fn show_chooser(
         let sel = selection.clone();
         let d = dlg.clone();
         back_btn.connect_clicked(move |_| {
-            if let Some(path) = nav.borrow_mut().go_back().cloned() {
+            // Bound first, so the borrow ends before load_dir borrows again.
+            let back = nav.borrow_mut().go_back().cloned();
+            if let Some(path) = back {
                 load_dir(
                     &model,
                     &path.to_string_lossy(),
@@ -382,7 +385,8 @@ pub fn show_chooser(
         let sel = selection.clone();
         let d = dlg.clone();
         forward_btn.connect_clicked(move |_| {
-            if let Some(path) = nav.borrow_mut().go_forward().cloned() {
+            let forward = nav.borrow_mut().go_forward().cloned();
+            if let Some(path) = forward {
                 load_dir(
                     &model,
                     &path.to_string_lossy(),
@@ -409,7 +413,8 @@ pub fn show_chooser(
         let sel = selection.clone();
         let d = dlg.clone();
         up_btn.connect_clicked(move |_| {
-            if let Some(parent) = nav.borrow().go_up() {
+            let up = nav.borrow().go_up();
+            if let Some(parent) = up {
                 nav.borrow_mut().navigate_to(parent.clone());
                 load_dir(
                     &model,
@@ -446,12 +451,24 @@ pub fn show_chooser(
         });
     }
 
+    // A selection belongs to the folder it was made in: moving elsewhere
+    // (every move shows the new location in the entry) clears it.
+    if let Some(label) = selected_label.clone() {
+        let sf = selected_file.clone();
+        location_entry.connect_changed(move |_| {
+            if sf.borrow_mut().take().is_some() {
+                label.set_text("No file selected");
+            }
+        });
+    }
+
     // -- Space to select file (deliberate selection) --
     let space_controller = gtk::EventControllerKey::new();
     space_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let sel_for_space = selection.clone();
     let sf = selected_file.clone();
     let fn_entry = filename_entry.clone();
+    let sel_label = selected_label.clone();
     let d = dlg.clone();
     space_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
         if key == gtk::gdk::Key::space {
@@ -461,6 +478,9 @@ pub fn show_chooser(
                         *sf.borrow_mut() = Some(file.path());
                         if let Some(ref entry) = fn_entry {
                             entry.set_text(&file.name());
+                        }
+                        if let Some(ref label) = sel_label {
+                            label.set_text(&file.name());
                         }
                         d.announce(
                             &format!("Selected {}", file.name()),
@@ -482,6 +502,7 @@ pub fn show_chooser(
     let sel_for_space2 = selection.clone();
     let sf2 = selected_file.clone();
     let fn_entry2 = filename_entry.clone();
+    let sel_label2 = selected_label.clone();
     let d2 = dlg.clone();
     space_controller2.connect_key_pressed(move |_ctrl, key, _code, _mods| {
         if key == gtk::gdk::Key::space {
@@ -491,6 +512,9 @@ pub fn show_chooser(
                         *sf2.borrow_mut() = Some(file.path());
                         if let Some(ref entry) = fn_entry2 {
                             entry.set_text(&file.name());
+                        }
+                        if let Some(ref label) = sel_label2 {
+                            label.set_text(&file.name());
                         }
                         d2.announce(
                             &format!("Selected {}", file.name()),
@@ -568,41 +592,97 @@ pub fn show_chooser(
     let model_accept = model.clone();
     let d_accept = dlg.clone();
     accept_btn.connect_clicked(move |_| {
-        let uri = if is_save {
-            // For Save: use the filename entry text combined with current directory
-            if let Some(ref entry) = fn_accept {
-                let name = entry.text().to_string();
-                if !name.is_empty() {
-                    let dir = model_accept.current_path();
-                    let full_path = if dir == "/" {
-                        format!("/{name}")
-                    } else {
-                        format!("{dir}/{name}")
-                    };
-                    Some(format!("file://{full_path}"))
-                } else {
-                    None
+        let current_dir = model_accept.current_path();
+        let send = {
+            let tx = tx_accept.clone();
+            let d = d_accept.clone();
+            move |path: &str| {
+                if let Some(tx) = tx.borrow_mut().take() {
+                    let _ = tx.send(ChooserResult {
+                        uris: vec![gio::File::for_path(path).uri().to_string()],
+                        cancelled: false,
+                    });
                 }
-            } else {
-                None
+                d.close();
             }
-        } else {
-            // For Open: use the space-selected file
-            sf_accept.borrow().as_ref().map(|p| format!("file://{p}"))
         };
 
-        if let Some(uri) = uri {
-            if let Some(tx) = tx_accept.borrow_mut().take() {
-                let _ = tx.send(ChooserResult {
-                    uris: vec![uri],
-                    cancelled: false,
-                });
+        if is_save {
+            // For Save: the filename entry text in the current directory.
+            let name = fn_accept
+                .as_ref()
+                .map(|e| e.text().to_string())
+                .unwrap_or_default();
+            if name.is_empty() {
+                d_accept.announce("No file name", AccessibleAnnouncementPriority::High);
+                return;
             }
-            d_accept.close();
-        } else {
-            d_accept.announce("No file selected", AccessibleAnnouncementPriority::High);
+            let full_path = std::path::Path::new(&current_dir)
+                .join(&name)
+                .to_string_lossy()
+                .to_string();
+            // Ask before replacing an existing file, as GTK's chooser does.
+            // (Checking may touch a slow mount: not on the main thread.)
+            let check = full_path.clone();
+            let d = d_accept.clone();
+            wayfinder::background::run(
+                move || std::path::Path::new(&check).exists(),
+                move |exists| {
+                    if !exists {
+                        send(&full_path);
+                        return;
+                    }
+                    let confirm = gtk::AlertDialog::builder()
+                        .message(format!("Replace “{name}”?"))
+                        .detail("A file with this name already exists. Replacing it overwrites its contents.")
+                        .buttons(["Cancel", "Replace"])
+                        .cancel_button(0)
+                        .default_button(0)
+                        .build();
+                    confirm.choose(Some(&d), gio::Cancellable::NONE, move |choice| {
+                        if choice == Ok(1) {
+                            send(&full_path);
+                        }
+                    });
+                },
+                || {},
+            );
+            return;
+        }
+
+        // For Open: the space-selected file — if it's in this folder (it
+        // may have been chosen before moving elsewhere). Choosing a folder,
+        // with none selected, means the one being shown.
+        let chosen = sf_accept
+            .borrow()
+            .clone()
+            .filter(|p| {
+                std::path::Path::new(p).parent() == Some(std::path::Path::new(&current_dir))
+            })
+            .or_else(|| directory_mode.then(|| current_dir.clone()));
+        match chosen {
+            Some(path) => send(&path),
+            None => d_accept.announce("No file selected", AccessibleAnnouncementPriority::High),
         }
     });
+
+    // Enter in the file name field saves; Escape cancels.
+    if let Some(entry) = filename_entry.as_ref() {
+        let accept = accept_btn.clone();
+        entry.connect_activate(move |_| accept.emit_clicked());
+    }
+    {
+        let cancel = cancel_btn.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                cancel.emit_clicked();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        dlg.add_controller(keys);
+    }
 
     // Close window = cancel
     let tx_close = result_tx.clone();

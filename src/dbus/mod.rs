@@ -93,29 +93,45 @@ fn handle_request(app: &gtk::Application, request: DbusRequest) {
         }
         DbusRequest::Items(uris) => {
             for uri in uris {
-                let path = uri_to_path(&uri);
-                if let Some(parent) = PathBuf::from(&path).parent() {
-                    open_or_raise(app, &parent.to_string_lossy());
-                }
+                show_item(app, &uri_to_path(&uri));
             }
         }
         DbusRequest::ItemProperties(uris) => {
             if let Some(uri) = uris.first() {
-                let path = uri_to_path(uri);
-                if let Some(parent) = PathBuf::from(&path).parent() {
-                    open_or_raise(app, &parent.to_string_lossy());
-                }
+                show_item(app, &uri_to_path(uri));
             }
         }
     }
 }
 
+/// A `file://` URI as a path, percent-decoded (`My%20Files` is
+/// `My Files`); anything else as it is.
 fn uri_to_path(uri: &str) -> String {
-    if let Some(path) = uri.strip_prefix("file://") {
-        path.to_string()
-    } else {
-        uri.to_string()
+    if uri.starts_with("file://") {
+        if let Some(path) = gtk::gio::File::for_uri(uri).path() {
+            return path.to_string_lossy().to_string();
+        }
     }
+    uri.to_string()
+}
+
+/// Open the folder holding `path` with `path` selected ("Show in folder").
+fn show_item(app: &gtk::Application, path: &str) {
+    let path = PathBuf::from(path);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        open_or_raise(app, &path.to_string_lossy());
+        return;
+    };
+    let parent = parent.to_string_lossy().to_string();
+    let name = name.to_string_lossy().to_string();
+    let window = app
+        .windows()
+        .into_iter()
+        .find_map(|w| w.downcast::<crate::window::WayfinderWindow>().ok());
+    let window = window.unwrap_or_else(|| crate::window::WayfinderWindow::new(app));
+    window.remember_selection(&parent, &name);
+    window.navigate_to_path(&parent);
+    window.present();
 }
 
 fn open_or_raise(app: &gtk::Application, path: &str) {

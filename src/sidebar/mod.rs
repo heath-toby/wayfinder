@@ -62,10 +62,27 @@ fn save_bookmarks(bookmarks: &[(String, String)]) {
     }
 }
 
+/// The local folder a bookmark URI names (percent-decoded); `None` for
+/// other URIs (`sftp://…`), which Wayfinder can't open from the sidebar.
+pub fn bookmark_path(uri: &str) -> Option<String> {
+    uri.starts_with("file://")
+        .then(|| gtk::gio::File::for_uri(uri).path())
+        .flatten()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Where the bookmark for `path` is in `bookmarks`.
+fn bookmark_index(bookmarks: &[(String, String)], path: &str) -> Option<usize> {
+    bookmarks
+        .iter()
+        .position(|(u, _)| bookmark_path(u).as_deref() == Some(path))
+}
+
 pub fn add_bookmark(path: &str) -> bool {
-    let uri = format!("file://{path}");
+    // Encoded as GTK writes it: a space would end the URI on reading.
+    let uri = gtk::gio::File::for_path(path).uri().to_string();
     let mut bookmarks = load_bookmarks();
-    if bookmarks.iter().any(|(u, _)| *u == uri) {
+    if bookmark_index(&bookmarks, path).is_some() {
         return false; // already exists
     }
     let name = std::path::Path::new(path)
@@ -77,10 +94,80 @@ pub fn add_bookmark(path: &str) -> bool {
     true
 }
 
-pub fn remove_bookmark(uri: &str) {
+pub fn remove_bookmark(path: &str) {
     let mut bookmarks = load_bookmarks();
-    bookmarks.retain(|(u, _)| u != uri);
+    bookmarks.retain(|(u, _)| bookmark_path(u).as_deref() != Some(path));
     save_bookmarks(&bookmarks);
+}
+
+/// Remove a bookmark's row (and the bookmark), say so, and put focus on a
+/// neighbouring row that can take it.
+fn remove_bookmark_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
+    let name = row.widget_name().to_string();
+    let Some(path) = name.strip_prefix("bookmark:") else {
+        return;
+    };
+    remove_bookmark(path);
+    let display = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let idx = row.index();
+    list.remove(row);
+    let next = [idx, idx - 1]
+        .into_iter()
+        .filter(|i| *i >= 0)
+        .filter_map(|i| list.row_at_index(i))
+        .find(|r| r.is_selectable());
+    if let Some(next) = next {
+        list.select_row(Some(&next));
+        next.grab_focus();
+    }
+    list.announce(
+        &format!("Bookmark {display} removed"),
+        gtk::AccessibleAnnouncementPriority::Medium,
+    );
+}
+
+/// The menu for a bookmark row: Remove Bookmark, Edit Sidebar.
+fn show_bookmark_menu(
+    sidebar: &WayfinderSidebar,
+    parent: &gtk::Window,
+    list: &gtk::ListBox,
+    row: &gtk::ListBoxRow,
+) {
+    let popover = gtk::Popover::new();
+    popover.set_parent(row);
+    popover.set_has_arrow(false);
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    vbox.add_css_class("menu");
+
+    let remove_btn = gtk::Button::with_label("Remove Bookmark");
+    remove_btn.add_css_class("flat");
+    let pop = popover.clone();
+    let list_ref = list.clone();
+    let row_ref = row.clone();
+    remove_btn.connect_clicked(move |_| {
+        pop.popdown();
+        remove_bookmark_row(&list_ref, &row_ref);
+    });
+    vbox.append(&remove_btn);
+
+    let edit_btn = gtk::Button::with_label("Edit Sidebar");
+    edit_btn.add_css_class("flat");
+    let s = sidebar.clone();
+    let p = parent.clone();
+    let pop2 = popover.clone();
+    edit_btn.connect_clicked(move |_| {
+        pop2.popdown();
+        s.show_edit_dialog(&p);
+    });
+    vbox.append(&edit_btn);
+
+    popover.set_child(Some(&vbox));
+    popover.connect_closed(|pop| pop.unparent());
+    popover.popup();
 }
 
 struct PlaceEntry {
@@ -202,20 +289,12 @@ impl WayfinderSidebar {
             };
             let name = row.widget_name().to_string();
 
-            // Delete key: remove bookmark
+            // Delete key: remove a bookmark. On other rows it does nothing —
+            // it mustn't reach the window, which would delete the files
+            // selected in the (unseen) file list.
             if key == gdk::Key::Delete {
-                let Some(path) = name.strip_prefix("bookmark:") else {
-                    return glib::Propagation::Proceed;
-                };
-                let uri = format!("file://{path}");
-                remove_bookmark(&uri);
-                let idx = row.index();
-                list.remove(&row);
-                if idx > 0 {
-                    if let Some(prev) = list.row_at_index(idx - 1) {
-                        list.select_row(Some(&prev));
-                        prev.grab_focus();
-                    }
+                if name.starts_with("bookmark:") {
+                    remove_bookmark_row(&list, &row);
                 }
                 return glib::Propagation::Stop;
             }
@@ -270,15 +349,12 @@ impl WayfinderSidebar {
 
             // Swap in the bookmarks file
             let mut bookmarks = load_bookmarks();
-            let current_uri = format!("file://{}", name.strip_prefix("bookmark:").unwrap_or(""));
             let target_name = target_widget.as_ref().unwrap().widget_name().to_string();
-            let target_uri = format!(
-                "file://{}",
-                target_name.strip_prefix("bookmark:").unwrap_or("")
+            let cur_idx = bookmark_index(&bookmarks, name.strip_prefix("bookmark:").unwrap_or(""));
+            let tgt_idx = bookmark_index(
+                &bookmarks,
+                target_name.strip_prefix("bookmark:").unwrap_or(""),
             );
-
-            let cur_idx = bookmarks.iter().position(|(u, _)| *u == current_uri);
-            let tgt_idx = bookmarks.iter().position(|(u, _)| *u == target_uri);
 
             if let (Some(ci), Some(ti)) = (cur_idx, tgt_idx) {
                 // Get the neighbour's display name for announcement
@@ -383,8 +459,13 @@ impl WayfinderSidebar {
         list.insert(&sep_row, insert_pos);
 
         // Insert bookmark rows
-        for (i, (uri, display_name)) in bookmarks.iter().enumerate() {
-            let path = uri.strip_prefix("file://").unwrap_or(uri);
+        // Only local folders: other URIs (sftp://…) can't be opened here.
+        let local: Vec<(String, &String)> = bookmarks
+            .iter()
+            .filter_map(|(uri, name)| bookmark_path(uri).map(|p| (p, name)))
+            .collect();
+        for (i, (path, display_name)) in local.iter().enumerate() {
+            let path = path.as_str();
 
             let icon = gtk::Image::from_icon_name("folder-symbolic");
             icon.set_pixel_size(16);
@@ -412,19 +493,6 @@ impl WayfinderSidebar {
             row.update_property(&[gtk::accessible::Property::Label(&format!(
                 "Bookmark: {display_name}"
             ))]);
-
-            // Right-click to remove
-            let click = gtk::GestureClick::new();
-            click.set_button(3);
-            let uri_clone = uri.clone();
-            let list_ref = list.clone();
-            let row_ref = row.clone();
-            click.connect_pressed(move |gesture, _n, _x, _y| {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                remove_bookmark(&uri_clone);
-                list_ref.remove(&row_ref);
-            });
-            row.add_controller(click);
 
             list.insert(&row, insert_pos + 1 + i as i32);
         }
@@ -677,10 +745,16 @@ impl WayfinderSidebar {
         let parent = parent_window.clone();
         let list = self.imp().places_list.clone();
         click.connect_pressed(move |gesture, _n, x, y| {
-            // Don't claim the event if it's on a bookmark or trash row (they have their own menus)
+            // The Bin row has its own menu; a bookmark gets the bookmark menu.
             if let Some(row) = list.row_at_y(y as i32) {
                 let name = row.widget_name().to_string();
-                if name.starts_with("bookmark:") || name == "place:trash:///" {
+                if name == "place:trash:///" {
+                    return;
+                }
+                if name.starts_with("bookmark:") {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    list.select_row(Some(&row));
+                    show_bookmark_menu(&sidebar, &parent, &list, &row);
                     return;
                 }
             }
@@ -727,42 +801,7 @@ impl WayfinderSidebar {
             if let Some(row) = list2.selected_row() {
                 let name = row.widget_name().to_string();
                 if name.starts_with("bookmark:") {
-                    // Show a popover with "Remove Bookmark" and "Edit Sidebar"
-                    let popover = gtk::Popover::new();
-                    popover.set_parent(&row);
-                    popover.set_has_arrow(false);
-
-                    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                    vbox.add_css_class("menu");
-
-                    let uri = format!("file://{}", name.strip_prefix("bookmark:").unwrap_or(""));
-
-                    let remove_btn = gtk::Button::with_label("Remove Bookmark");
-                    remove_btn.add_css_class("flat");
-                    let pop = popover.clone();
-                    let list_ref = list2.clone();
-                    let row_ref = row.clone();
-                    remove_btn.connect_clicked(move |_| {
-                        pop.popdown();
-                        remove_bookmark(&uri);
-                        list_ref.remove(&row_ref);
-                    });
-                    vbox.append(&remove_btn);
-
-                    let edit_btn = gtk::Button::with_label("Edit Sidebar");
-                    edit_btn.add_css_class("flat");
-                    let s = sidebar2.clone();
-                    let p = parent2.clone();
-                    let pop2 = popover.clone();
-                    edit_btn.connect_clicked(move |_| {
-                        pop2.popdown();
-                        s.show_edit_dialog(&p);
-                    });
-                    vbox.append(&edit_btn);
-
-                    popover.set_child(Some(&vbox));
-                    popover.connect_closed(|pop| pop.unparent());
-                    popover.popup();
+                    show_bookmark_menu(&sidebar2, &parent2, &list2, &row);
                     return glib::Propagation::Stop;
                 }
             }
@@ -1296,5 +1335,23 @@ impl WayfinderSidebar {
 impl Default for WayfinderSidebar {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bookmark_path;
+
+    #[test]
+    fn bookmark_uris_are_decoded() {
+        assert_eq!(
+            bookmark_path("file:///home/u/My%20Docs").as_deref(),
+            Some("/home/u/My Docs")
+        );
+        assert_eq!(
+            bookmark_path("file:///home/u/Caf%C3%A9").as_deref(),
+            Some("/home/u/Café")
+        );
+        assert_eq!(bookmark_path("sftp://host/dir"), None);
     }
 }

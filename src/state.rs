@@ -200,14 +200,23 @@ fn load_file_apps() -> HashMap<String, String> {
         Ok(contents) => {
             let mut map = HashMap::new();
             for line in contents.lines() {
-                if let Some((key, value)) = line.split_once('=') {
-                    map.insert(key.trim().to_string(), value.trim().to_string());
+                if let Some((key, value)) = parse_file_app(line) {
+                    map.insert(key, value);
                 }
             }
             map
         }
         Err(_) => HashMap::new(),
     }
+}
+
+/// One `path=desktop_id` line. Split at the last `=`: a path may contain
+/// one, a desktop id doesn't. The path is kept exactly (it may begin or
+/// end with a space).
+fn parse_file_app(line: &str) -> Option<(String, String)> {
+    let (key, value) = line.rsplit_once('=')?;
+    let value = value.trim();
+    (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
 }
 
 fn save_file_apps(map: &HashMap<String, String>) {
@@ -279,5 +288,22 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
         .join("\n");
     if let Err(e) = fs::write(&file, contents) {
         log::warn!("Failed to save sidebar config: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_file_app;
+
+    #[test]
+    fn paths_with_equals_signs_keep_their_app() {
+        assert_eq!(
+            parse_file_app("/home/u/Downloads/watch?v=abc.mp4=vlc.desktop"),
+            Some((
+                "/home/u/Downloads/watch?v=abc.mp4".into(),
+                "vlc.desktop".into()
+            ))
+        );
+        assert_eq!(parse_file_app("no equals sign"), None);
     }
 }
