@@ -1050,13 +1050,17 @@ impl WayfinderWindow {
     }
 
     pub fn trash_selected(&self) {
-        let files = self.get_selected_files();
-        if files.is_empty() {
-            return;
-        }
         // Pressing Delete again while a slow mount is still answering would
-        // trash (or offer to permanently delete) the same files twice.
-        if self.imp().trash_in_progress.replace(true) {
+        // trash (or offer to permanently delete) the same files twice, so
+        // skip files already on their way.
+        let files: Vec<FileObject> = {
+            let trashing = self.imp().trashing.borrow();
+            self.get_selected_files()
+                .into_iter()
+                .filter(|f| !trashing.contains(&f.path()))
+                .collect()
+        };
+        if files.is_empty() {
             return;
         }
 
@@ -1064,19 +1068,31 @@ impl WayfinderWindow {
         let old_pos = self.imp().selection.selected();
 
         let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
+        self.imp().trashing.borrow_mut().extend(paths.iter().cloned());
+        let count = paths.len();
         self.run_blocking(
             &paths[0].clone(),
             move || {
-                paths
-                    .iter()
-                    .map(|p| {
-                        wayfinder::file_ops::trash_or_delete(&gio::File::for_path(p))
-                            .map_err(|e| e.to_string())
-                    })
-                    .collect::<Vec<_>>()
+                // A panic would drop the result and leave these paths
+                // marked as in progress for good.
+                std::panic::catch_unwind(|| {
+                    paths
+                        .iter()
+                        .map(|p| {
+                            wayfinder::file_ops::trash_or_delete(&gio::File::for_path(p))
+                                .map_err(|e| e.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|_| (0..count).map(|_| Err("internal error".to_string())).collect())
             },
             move |w, results| {
-                w.imp().trash_in_progress.set(false);
+                {
+                    let mut trashing = w.imp().trashing.borrow_mut();
+                    for f in &files {
+                        trashing.remove(&f.path());
+                    }
+                }
                 w.finish_trash(files, old_pos, results)
             },
         );

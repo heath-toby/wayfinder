@@ -4,6 +4,7 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
 use crate::window::WayfinderWindow;
+use wayfinder::file_object::FileObject;
 
 #[derive(Default)]
 pub struct WayfinderApplicationInner;
@@ -72,27 +73,19 @@ impl ApplicationImpl for WayfinderApplicationInner {
                     // up startup. Navigating resolves a file to its folder;
                     // whether to open it is checked in the background.
                     window.navigate_to_path(&path_str);
-                    let ctx = gtk::prelude::WidgetExt::display(&window).app_launch_context();
-                    let uri = file.uri().to_string();
-                    let probe = path.clone();
-                    wayfinder::background::run(
-                        move || probe.is_file(),
-                        move |is_file| {
-                            if is_file {
-                                // The async variant picks the app off this thread too.
-                                gio::AppInfo::launch_default_for_uri_async(
-                                    &uri,
-                                    Some(&ctx),
-                                    gio::Cancellable::NONE,
-                                    move |result| {
-                                        if let Err(e) = result {
-                                            log::error!("Failed to open {path_str}: {e}");
-                                        }
-                                    },
-                                );
+                    let probe = path_str.clone();
+                    window.run_blocking(
+                        &path_str,
+                        move || wayfinder::file_model::query_file(&probe),
+                        |w, found| {
+                            if let Some((parent, data)) = found {
+                                if !data.is_directory {
+                                    // Same as opening it from the list: the
+                                    // per-file app, or one chosen by name.
+                                    w.open_file(&FileObject::from_data(&parent, &data));
+                                }
                             }
                         },
-                        || {},
                     );
                 } else if path.is_dir() {
                     // It's a directory — navigate to it

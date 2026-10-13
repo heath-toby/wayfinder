@@ -372,20 +372,11 @@ fn sync_file(
     let mut part_name = dst.file_name().unwrap_or_default().to_os_string();
     part_name.push(PART_SUFFIX);
     let part = dst.with_file_name(part_name);
-    // Pause point before each file, so a pending suspend waits for no more
-    // than the file in hand.
-    drop(sleep::io_step());
-    let result = fetch(src, &part, remote).and_then(|()| {
-        // Give the copy the remote's mtime, which is what the next refresh
-        // compares against.
-        if let Ok(mtime) = src_meta.modified() {
-            std::fs::File::options()
-                .write(true)
-                .open(&part)?
-                .set_modified(mtime)?;
-        }
-        std::fs::rename(&part, dst)
-    });
+    // The copy keeps the mtime of what was actually fetched (rclone and
+    // `cp --preserve` both set it). If the mount shows something newer —
+    // say an upload still pending in rclone's write cache — the next
+    // refresh sees the difference and fetches again.
+    let result = fetch(src, &part, remote).and_then(|()| std::fs::rename(&part, dst));
     if let Err(e) = result {
         let _ = std::fs::remove_file(&part);
         return Err(e.to_string());
@@ -400,25 +391,21 @@ fn sync_file(
 /// every newly spawned child closes as it starts. While the daemon is slow
 /// that holds up the spawn, and Wayfinder spawns from its main thread
 /// (`ps`, apps opening files), so the window would freeze. With rclone the
-/// child also skips the mount and fetches straight from the remote.
+/// child also skips the mount and fetches straight from the remote; if
+/// that fails (e.g. the mount uses a config this rclone doesn't see), the
+/// file is copied through the mount instead.
 fn fetch(src: &Path, dst: &Path, remote: Option<&str>) -> std::io::Result<()> {
-    let mut cmd = match remote {
-        Some(remote) => {
-            let mut cmd = std::process::Command::new("rclone");
-            cmd.arg("copyto").arg(remote).arg(dst);
-            cmd
+    if let Some(remote) = remote {
+        let mut cmd = std::process::Command::new("rclone");
+        cmd.arg("copyto").arg(remote).arg(dst);
+        if run_quietly(&mut cmd)?.success() {
+            return Ok(());
         }
-        None => {
-            let mut cmd = std::process::Command::new("cp");
-            cmd.arg("--").arg(src).arg(dst);
-            cmd
-        }
-    };
-    let status = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
+        log::warn!("rclone copyto {remote} failed; copying through the mount");
+    }
+    let mut cmd = std::process::Command::new("cp");
+    cmd.arg("--preserve=timestamps").arg("--").arg(src).arg(dst);
+    let status = run_quietly(&mut cmd)?;
     if status.success() {
         Ok(())
     } else {
@@ -427,6 +414,13 @@ fn fetch(src: &Path, dst: &Path, remote: Option<&str>) -> std::io::Result<()> {
             src.display()
         )))
     }
+}
+
+fn run_quietly(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    sleep::run_child(cmd)
 }
 
 /// The remote spec of `name` inside the remote directory `remote`.

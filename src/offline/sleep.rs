@@ -17,12 +17,16 @@ static PAUSED: AtomicBool = AtomicBool::new(false);
 /// Held by the sync worker for the duration of one FUSE I/O step.
 static IO_LOCK: Mutex<()> = Mutex::new(());
 static START: Once = Once::new();
+/// The download running in a child process, so a pending suspend can stop
+/// it: a child reading the mount when the session freezes would make the
+/// suspend fail just as an in-process read would.
+static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 
 /// Longest we hold up a suspend waiting for an in-flight step to finish.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Block until it's safe to touch the FUSE mount, then hold the returned
-/// guard for one I/O step (a stat, a directory listing, a chunk read).
+/// guard for one I/O step (a stat, a directory listing, a download).
 pub(super) fn io_step() -> MutexGuard<'static, ()> {
     loop {
         let guard = IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -31,6 +35,26 @@ pub(super) fn io_step() -> MutexGuard<'static, ()> {
         }
         drop(guard);
         std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Run `cmd` to completion as one I/O step: it waits while sleep is
+/// pending, and is killed if sleep begins while it runs.
+pub(super) fn run_child(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    let _io = io_step();
+    *CHILD.lock().unwrap_or_else(|e| e.into_inner()) = Some(cmd.spawn()?);
+    loop {
+        {
+            let mut slot = CHILD.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(child) = slot.as_mut() else {
+                return Err(std::io::Error::other("download child went missing"));
+            };
+            if let Some(status) = child.try_wait()? {
+                slot.take();
+                return Ok(status);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -90,6 +114,10 @@ async fn watch() -> zbus::Result<()> {
         };
         if going_down {
             PAUSED.store(true, Ordering::SeqCst);
+            // Stop a download in progress; it's fetched again next time.
+            if let Some(child) = CHILD.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                let _ = child.kill();
+            }
             // Wait for any in-flight step to finish. Once we get the lock,
             // the worker will see PAUSED before its next step.
             let deadline = Instant::now() + DRAIN_TIMEOUT;

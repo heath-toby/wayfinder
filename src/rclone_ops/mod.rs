@@ -187,7 +187,6 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     results
 }
 
-/// Whether the rclone binary is on PATH.
 /// Whether rclone can be run. Checked once per process: it's asked before
 /// many actions, often on the main thread, and installing or removing
 /// rclone mid-session is rare.

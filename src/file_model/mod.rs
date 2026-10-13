@@ -32,8 +32,13 @@ enum Apply {
     /// The store is empty (a new folder): fill it.
     Replace,
     /// The store shows this folder already: add, remove and update items
-    /// in place, so the selection and focus stay where they are.
+    /// in place, so the selection and focus stay where they are. A failed
+    /// listing leaves the store alone (it may be a passing error).
     Diff,
+    /// Like `Diff`, checking a folder shown from the cache. A failed
+    /// listing means what's shown was never confirmed: the store is
+    /// emptied and the error reported.
+    Revalidate,
 }
 
 type LoadDone = Box<dyn FnOnce(Result<u32, String>)>;
@@ -67,8 +72,10 @@ pub struct DirectoryModel {
     /// Called with (location, error) when a background refresh found the
     /// location can no longer be listed; the store has been emptied.
     on_background_error: Rc<RefCell<Option<ErrorCallback>>>,
-    /// Background refreshes still waiting for their listing.
-    refreshes_in_flight: Rc<Cell<u32>>,
+    /// Refresh threads still running — counted by the threads themselves,
+    /// so one left waiting on a dead mount after the user moved on still
+    /// counts.
+    refreshes_in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Default for DirectoryModel {
@@ -143,7 +150,7 @@ impl DirectoryModel {
             loading: Rc::new(Cell::new(false)),
             on_background_update: Rc::new(RefCell::new(None)),
             on_background_error: Rc::new(RefCell::new(None)),
-            refreshes_in_flight: Rc::new(Cell::new(0)),
+            refreshes_in_flight: Default::default(),
         }
     }
 
@@ -204,7 +211,7 @@ impl DirectoryModel {
             self.run(
                 gen,
                 job,
-                Apply::Diff,
+                Apply::Revalidate,
                 Box::new(move |_| {
                     if let Some(cb) = model.on_background_update.borrow().as_ref() {
                         cb();
@@ -222,7 +229,11 @@ impl DirectoryModel {
     /// waiting — so checking for changes each time the window is focused
     /// can't pile up threads on a mount that has stopped answering.
     pub fn refresh_if_idle(&self, on_done: impl FnOnce() + 'static) {
-        if self.refreshes_in_flight.get() == 0 {
+        if self
+            .refreshes_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
             self.refresh(on_done);
         }
     }
@@ -318,7 +329,17 @@ impl DirectoryModel {
     ) {
         let seq = self.next_seq.get() + 1;
         self.next_seq.set(seq);
-        let rx = loader::spawn(job);
+        let rx = if apply == Apply::Replace {
+            loader::spawn(job)
+        } else {
+            let in_flight = self.refreshes_in_flight.clone();
+            in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            loader::spawn(move || {
+                let result = job();
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                result
+            })
+        };
         if apply == Apply::Replace {
             match rx.recv_timeout(SYNC_WAIT) {
                 Ok(result) => return self.finish(gen, seq, result, apply, on_done),
@@ -327,8 +348,6 @@ impl DirectoryModel {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => self.loading.set(true),
             }
-        } else {
-            self.refreshes_in_flight.set(self.refreshes_in_flight.get() + 1);
         }
 
         let model = self.clone();
@@ -345,11 +364,6 @@ impl DirectoryModel {
                     Err(mpsc::TryRecvError::Disconnected) => Some(Err("listing failed".into())),
                 }
             };
-            if apply == Apply::Diff {
-                model
-                    .refreshes_in_flight
-                    .set(model.refreshes_in_flight.get().saturating_sub(1));
-            }
             if let (Some(result), Some(on_done)) = (result, on_done.take()) {
                 model.finish(gen, seq, result, apply, on_done);
             }
@@ -384,8 +398,11 @@ impl DirectoryModel {
             Ok(listing) => listing,
             Err(e) => {
                 if apply == Apply::Diff {
-                    // The location can't be listed any more (deleted, mount
-                    // gone): stop showing what it held.
+                    log::warn!("refreshing {} failed: {e}", self.current_path());
+                }
+                if apply == Apply::Revalidate {
+                    // The cached listing on screen can't be confirmed
+                    // (deleted, mount gone): stop showing what it held.
                     let location = self.current_path();
                     self.store.remove_all();
                     loader::forget(&location);
@@ -409,7 +426,7 @@ impl DirectoryModel {
         }
         match apply {
             Apply::Replace => self.replace_all(&listing),
-            Apply::Diff => self.apply_diff(&listing),
+            Apply::Diff | Apply::Revalidate => self.apply_diff(&listing),
         }
 
         if listing.path.starts_with('/') && !listing.is_fuse {
@@ -448,7 +465,7 @@ impl DirectoryModel {
                 (fo.path(), fo)
             })
             .collect();
-        let mut updated = false;
+        let mut updated: Vec<FileObject> = Vec::new();
         for i in (0..self.store.n_items()).rev() {
             let Some(fo) = self.store.item(i).and_downcast::<FileObject>() else {
                 continue;
@@ -463,24 +480,14 @@ impl DirectoryModel {
                         || new.mime_type() != fo.mime_type()
                     {
                         fo.update_from(&new);
-                        updated = true;
+                        updated.push(fo);
                     }
                 }
             }
         }
         let added: Vec<glib::Object> = fresh.into_values().map(|fo| fo.upcast()).collect();
         self.store.splice(self.store.n_items(), 0, &added);
-        if updated {
-            self.resort();
-        }
-    }
-
-    /// Re-apply the active sort after items changed in place (new items
-    /// are placed by the sort model on insertion, changed ones aren't).
-    fn resort(&self) {
-        if let Some(sorter) = self.sort_model.sorter() {
-            sorter.changed(gtk::SorterChange::Different);
-        }
+        resort_if_needed(&self.sort_model, &updated);
     }
 
     fn calculate_folder_sizes(&self) {
@@ -643,9 +650,7 @@ impl DirectoryModel {
                                     let new_obj = FileObject::from_file_info(&path, &info);
                                     if let Some(fo) = store.item(idx).and_downcast::<FileObject>() {
                                         fo.update_from(&new_obj);
-                                        if let Some(sorter) = sort_model.sorter() {
-                                            sorter.changed(gtk::SorterChange::Different);
-                                        }
+                                        resort_if_needed(&sort_model, &[fo]);
                                     }
                                 }
                             }
@@ -691,6 +696,51 @@ impl DirectoryModel {
     pub fn set_sorter(&self, sorter: Option<&impl IsA<gtk::Sorter>>) {
         self.sort_model.set_sorter(sorter);
     }
+}
+
+/// Re-apply the active sort if items changed in place are now out of
+/// order (the sort model places new items, but doesn't notice changes).
+/// Only then: re-sorting replaces every row, which can make Orca lose or
+/// repeat its place.
+fn resort_if_needed(sort_model: &SortListModel, changed: &[FileObject]) {
+    let Some(sorter) = sort_model.sorter() else {
+        return;
+    };
+    let n = sort_model.n_items();
+    let out_of_order = changed.iter().any(|fo| {
+        let Some(pos) = (0..n).find(|&i| sort_model.item(i).as_ref() == Some(fo.upcast_ref())) else {
+            return false;
+        };
+        let before = pos
+            .checked_sub(1)
+            .and_then(|i| sort_model.item(i))
+            .is_some_and(|prev| sorter.compare(&prev, fo) == gtk::Ordering::Larger);
+        let after = sort_model
+            .item(pos + 1)
+            .is_some_and(|next| sorter.compare(fo, &next) == gtk::Ordering::Larger);
+        before || after
+    });
+    if out_of_order {
+        sorter.changed(gtk::SorterChange::Different);
+    }
+}
+
+/// Look up one file — off the main thread, it may be on a slow mount —
+/// without sniffing its contents on a FUSE mount. Returns its folder and
+/// details.
+pub fn query_file(path: &str) -> Option<(String, crate::file_object::FileInfoData)> {
+    let info = gio::File::for_path(path)
+        .query_info(
+            loader::attrs_for(crate::rclone_ops::is_fuse_path(path)),
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
+        .ok()?;
+    let parent = std::path::Path::new(path)
+        .parent()?
+        .to_string_lossy()
+        .to_string();
+    Some((parent, crate::file_object::FileInfoData::from_file_info(&info)))
 }
 
 /// Paths of recently used local files. The RecentManager is main-thread

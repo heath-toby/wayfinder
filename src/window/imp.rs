@@ -80,8 +80,8 @@ pub struct WayfinderWindowInner {
     pub type_ahead_buffer: Rc<RefCell<String>>,
     pub type_ahead_generation: Rc<Cell<u32>>,
     pub last_trashed: RefCell<Vec<String>>,
-    /// A move to Bin is still waiting on the filesystem.
-    pub trash_in_progress: Cell<bool>,
+    /// Paths whose move to Bin is still waiting on the filesystem.
+    pub trashing: RefCell<std::collections::HashSet<String>>,
     /// Remembers the last-selected filename per directory so that
     /// navigating back into a folder restores the previous selection.
     pub last_position: RefCell<std::collections::HashMap<String, String>>,
@@ -213,7 +213,7 @@ impl Default for WayfinderWindowInner {
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),
             type_ahead_generation: Rc::new(Cell::new(0)),
             last_trashed: RefCell::new(Vec::new()),
-            trash_in_progress: Cell::new(false),
+            trashing: RefCell::new(std::collections::HashSet::new()),
             last_position: RefCell::new(std::collections::HashMap::new()),
             zoom_level: Cell::new(100),
             zoom_css: gtk::CssProvider::new(),
@@ -493,6 +493,14 @@ impl ObjectImpl for WayfinderWindowInner {
         self.model.set_on_background_error(move |location, e| {
             if location.starts_with('/') {
                 w.finish_open_directory(&location, Err(e));
+            } else {
+                // Bin or Recent Files.
+                log::error!("Failed to refresh {location}: {e}");
+                w.update_status();
+                w.announce(
+                    &format!("Error: could not refresh: {e}"),
+                    AccessibleAnnouncementPriority::High,
+                );
             }
         });
     }
