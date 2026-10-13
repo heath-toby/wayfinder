@@ -44,6 +44,8 @@ pub struct Listing {
     /// The location actually listed: the requested one, or its nearest
     /// existing ancestor when the job was asked to resolve.
     pub path: String,
+    /// `path` with symlinks resolved: where it really is.
+    pub real_path: String,
     pub is_fuse: bool,
     /// Each entry with the folder it lives in (they differ for Recent).
     pub entries: Vec<(String, FileInfoData)>,
@@ -69,7 +71,8 @@ pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
     let path = dir.to_string_lossy().to_string();
     // Decide on the real location, so a symlink into a mount counts as FUSE.
     let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-    let is_fuse = crate::rclone_ops::is_fuse_path(&real.to_string_lossy());
+    let real_path = real.to_string_lossy().to_string();
+    let is_fuse = crate::rclone_ops::is_fuse_path(&real_path);
 
     let enumerator = gio::File::for_path(&dir)
         .enumerate_children(
@@ -87,6 +90,7 @@ pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
     }
     Ok(Listing {
         path,
+        real_path,
         is_fuse,
         entries,
     })
@@ -110,6 +114,7 @@ pub(super) fn list_uri(uri: &str) -> ListResult {
     }
     Ok(Listing {
         path: uri.to_string(),
+        real_path: uri.to_string(),
         is_fuse: false,
         entries,
     })
@@ -138,6 +143,7 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
     }
     Ok(Listing {
         path: "recent:///".to_string(),
+        real_path: "recent:///".to_string(),
         is_fuse: false,
         entries,
     })
@@ -160,24 +166,47 @@ pub(super) fn spawn(
 
 const CACHE_LIMIT: usize = 128;
 
+/// A location's cached listing.
+struct Cached {
+    at: Instant,
+    /// Where the location really is (symlinks resolved).
+    real_path: String,
+    entries: Vec<FileInfoData>,
+}
+
 thread_local! {
-    static CACHE: RefCell<HashMap<String, (Instant, Vec<FileInfoData>)>> =
-        RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<String, Cached>> = RefCell::new(HashMap::new());
     static PREFETCHING: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The cached listing of `path`, if its mount is still there. Once it has
+/// gone (cleanly unmounted, leaving an empty mountpoint), the listing would
+/// hide that — and the offline copy that should be shown instead.
 pub(super) fn cached(path: &str) -> Option<Vec<FileInfoData>> {
-    CACHE.with(|c| c.borrow().get(path).map(|(_, entries)| entries.clone()))
+    CACHE.with(|c| {
+        let cache = c.borrow();
+        let cached = cache.get(path)?;
+        crate::rclone_ops::is_fuse_path(&cached.real_path).then(|| cached.entries.clone())
+    })
 }
 
-pub(super) fn store(path: &str, entries: Vec<FileInfoData>) {
+/// Cache the listing of `listing.path`.
+pub(super) fn store(listing: &Listing) {
+    let entries = listing.entries.iter().map(|(_, e)| e.clone()).collect();
     CACHE.with(|c| {
         let mut cache = c.borrow_mut();
-        cache.insert(path.to_string(), (Instant::now(), entries));
+        cache.insert(
+            listing.path.clone(),
+            Cached {
+                at: Instant::now(),
+                real_path: listing.real_path.clone(),
+                entries,
+            },
+        );
         if cache.len() > CACHE_LIMIT {
             let oldest = cache
                 .iter()
-                .min_by_key(|(_, (at, _))| *at)
+                .min_by_key(|(_, cached)| cached.at)
                 .map(|(k, _)| k.clone());
             if let Some(oldest) = oldest {
                 cache.remove(&oldest);
@@ -202,7 +231,7 @@ pub(super) fn prefetch(path: &str) {
     let fresh = CACHE.with(|c| {
         c.borrow()
             .get(path)
-            .is_some_and(|(at, _)| at.elapsed().as_secs() < 30)
+            .is_some_and(|cached| cached.at.elapsed().as_secs() < 30)
     });
     if fresh || PREFETCHING.with(Cell::get) {
         return;
@@ -216,12 +245,51 @@ pub(super) fn prefetch(path: &str) {
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         match rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
-            Ok(Ok(listing)) if listing.is_fuse => {
-                store(&path, listing.entries.into_iter().map(|(_, e)| e).collect());
-            }
+            Ok(Ok(listing)) if listing.is_fuse => store(&listing),
             _ => {}
         }
         PREFETCHING.with(|p| p.set(false));
         gtk::glib::ControlFlow::Break
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listing(path: &str, real_path: &str) -> Listing {
+        Listing {
+            path: path.to_string(),
+            real_path: real_path.to_string(),
+            is_fuse: true,
+            entries: vec![(
+                path.to_string(),
+                FileInfoData {
+                    name: "report.txt".to_string(),
+                    is_directory: false,
+                    size: 1,
+                    modified: 0,
+                    modified_display: String::new(),
+                    content_type: String::new(),
+                },
+            )],
+        }
+    }
+
+    /// Once a mount has gone, its cached listings aren't shown: the empty
+    /// mountpoint (and the offline copy) is what's really there.
+    #[test]
+    fn cache_is_not_used_once_the_mount_has_gone() {
+        let path = "/nonexistent-wayfinder-test/Docs";
+        store(&listing(path, path));
+        assert!(cached(path).is_none());
+    }
+
+    #[test]
+    fn forgotten_listings_are_gone() {
+        let path = "/nonexistent-wayfinder-test/Other";
+        store(&listing(path, path));
+        forget(path);
+        assert!(CACHE.with(|c| !c.borrow().contains_key(path)));
+    }
 }

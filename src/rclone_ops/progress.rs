@@ -150,8 +150,7 @@ pub fn show<W>(
             match std::fs::write(&path, &text) {
                 Ok(()) => {
                     let msg = format!("Log saved to {path}");
-                    parent_for_save
-                        .announce(&msg, AccessibleAnnouncementPriority::Medium);
+                    parent_for_save.announce(&msg, AccessibleAnnouncementPriority::Medium);
                     btn.set_label("Saved");
                 }
                 Err(e) => {
@@ -164,7 +163,10 @@ pub fn show<W>(
         });
     }
 
-    parent.announce(labels.initial_status, AccessibleAnnouncementPriority::Medium);
+    parent.announce(
+        labels.initial_status,
+        AccessibleAnnouncementPriority::Medium,
+    );
     dlg.present();
     status.grab_focus();
 
@@ -248,18 +250,12 @@ pub fn show<W>(
                                 .map(|f| f(&r))
                                 .unwrap_or_else(|| "Done.".to_string());
                             status_clone.set_text(&msg);
-                            parent_clone.announce(
-                                &msg,
-                                AccessibleAnnouncementPriority::Medium,
-                            );
+                            parent_clone.announce(&msg, AccessibleAnnouncementPriority::Medium);
                         }
                         Ok(_) if was_cancelled => {
                             let msg = "Cancelled before completion.";
                             status_clone.set_text(msg);
-                            parent_clone.announce(
-                                msg,
-                                AccessibleAnnouncementPriority::Medium,
-                            );
+                            parent_clone.announce(msg, AccessibleAnnouncementPriority::Medium);
                         }
                         Ok(r) => {
                             let tail: String = r

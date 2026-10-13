@@ -177,6 +177,30 @@ pub fn show_chooser(
     // Status label
     let status_label = gtk::Label::builder().xalign(0.0).margin_start(8).build();
 
+    // A cached folder's background check changed it, or found it can no
+    // longer be listed (the list has been emptied): say so, as the main
+    // window does.
+    {
+        let m = model.clone();
+        let sl = status_label.clone();
+        model.set_on_background_update(move || {
+            sl.set_text(&format!("{} items", m.item_count()));
+        });
+        let sl = status_label.clone();
+        let window = dlg.clone();
+        model.set_on_background_error(move |location, e| {
+            log::error!("Failed to refresh {location}: {e}");
+            sl.set_text("");
+            window.announce(
+                &format!(
+                    "Error: could not open {}",
+                    wayfinder::file_model::display_name(&location)
+                ),
+                AccessibleAnnouncementPriority::High,
+            );
+        });
+    }
+
     // Layout
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.append(&view_stack);

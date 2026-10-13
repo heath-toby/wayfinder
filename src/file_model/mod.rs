@@ -201,7 +201,13 @@ impl DirectoryModel {
         };
 
         if let Some(entries) = loader::cached(path) {
-            // Show the folder as it was last seen, then check it quietly.
+            // Show the folder as it was last seen, then check it quietly —
+            // as it is: if it has gone, that's an error to report (and the
+            // offline copy to show), not its parent to switch to unseen.
+            let job = {
+                let path = path.to_string();
+                move || loader::list_dir(&path, false)
+            };
             self.is_fuse.set(true);
             let objects: Vec<glib::Object> = entries
                 .iter()
@@ -460,10 +466,7 @@ impl DirectoryModel {
         *self.current_path.borrow_mut() = listing.path.clone();
         self.is_fuse.set(listing.is_fuse);
         if listing.is_fuse {
-            loader::store(
-                &listing.path,
-                listing.entries.iter().map(|(_, e)| e.clone()).collect(),
-            );
+            loader::store(&listing);
         }
         match apply {
             Apply::Replace => self.replace_all(&listing),

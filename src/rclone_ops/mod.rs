@@ -40,8 +40,7 @@ pub fn rclone_for_path(local_path: &str) -> Option<RcloneTarget> {
     let mut best_len = 0;
     for entry in &mounts {
         // Match either "<mountpoint>" exactly or "<mountpoint>/..."
-        let is_prefix = local_path == entry.0
-            || local_path.starts_with(&format!("{}/", entry.0));
+        let is_prefix = local_path == entry.0 || local_path.starts_with(&format!("{}/", entry.0));
         if is_prefix && entry.0.len() > best_len {
             best_len = entry.0.len();
             best = Some(entry);
@@ -420,9 +419,16 @@ pub fn delete_args(remote_spec: &str, is_directory: bool) -> Vec<String> {
 /// `/home/Toby/protonDrive_backup` does not falsely match a mountpoint at
 /// `/home/Toby/protonDrive`.
 pub fn is_fuse_path(path: &str) -> bool {
-    fstype_for_path(path)
-        .map(|t| t.contains("fuse"))
-        .unwrap_or(false)
+    fstype_for_path(path).is_some_and(|t| is_daemon_fuse(&t))
+}
+
+/// Whether a mount of type `fstype` is served by a FUSE daemon: `fuse`,
+/// `fuse.<daemon>` (rclone, sshfs…), and `fuseblk` too — ntfs-3g and
+/// exfat-fuse are daemons like any other, frozen at suspend, so a local
+/// NTFS disk gets the same care. Not `fusectl`, the kernel's control
+/// filesystem.
+fn is_daemon_fuse(fstype: &str) -> bool {
+    fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse.")
 }
 
 /// The program serving the FUSE mount `path` is on, for messages such as
@@ -480,8 +486,7 @@ fn fstype_for_path(path: &str) -> Option<String> {
         }
         let mountpoint = parts[1].replace("\\040", " ");
         let fstype = parts[2];
-        let is_prefix = path == mountpoint
-            || path.starts_with(&format!("{mountpoint}/"));
+        let is_prefix = path == mountpoint || path.starts_with(&format!("{mountpoint}/"));
         if is_prefix && mountpoint.len() > best_len {
             best_len = mountpoint.len();
             best_fstype = Some(fstype.to_string());
@@ -520,12 +525,7 @@ fn run_serial(
             overall_ok = false;
             break;
         }
-        let _ = tx.send(RcloneEvent::Log(format!(
-            "[{}/{}] {}",
-            i + 1,
-            total,
-            label
-        )));
+        let _ = tx.send(RcloneEvent::Log(format!("[{}/{}] {}", i + 1, total, label)));
 
         let (sub_tx, sub_rx) = std::sync::mpsc::channel::<RcloneEvent>();
         if let Err(e) = run_streaming(&args, sub_tx) {
@@ -937,11 +937,7 @@ pub fn batch_rename_with_progress(
 
 /// Build a single (label, args) step for a copy or move from `src` into
 /// `dest_dir`. The destination spec preserves the source basename.
-fn build_copy_or_move_step(
-    src: &str,
-    dest_dir: &str,
-    is_move: bool,
-) -> (String, Vec<String>) {
+fn build_copy_or_move_step(src: &str, dest_dir: &str, is_move: bool) -> (String, Vec<String>) {
     let basename = std::path::Path::new(src)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -991,4 +987,24 @@ fn summarise_delete_line(line: &str) -> Option<String> {
         return Some(line.trim().to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod fuse_type_tests {
+    use super::is_daemon_fuse;
+
+    #[test]
+    fn daemon_mounts_are_fuse() {
+        assert!(is_daemon_fuse("fuse.rclone"));
+        assert!(is_daemon_fuse("fuse.sshfs"));
+        assert!(is_daemon_fuse("fuse"));
+        // Deliberately: ntfs-3g is a daemon frozen at suspend too.
+        assert!(is_daemon_fuse("fuseblk"));
+    }
+
+    #[test]
+    fn other_filesystems_are_not() {
+        assert!(!is_daemon_fuse("ext4"));
+        assert!(!is_daemon_fuse("fusectl"));
+    }
 }
