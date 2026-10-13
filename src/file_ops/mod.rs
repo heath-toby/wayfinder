@@ -39,6 +39,23 @@ pub fn delete_file_recursive(file: &gio::File) -> Result<(), glib::Error> {
     delete_tree(file)
 }
 
+/// An error if a drive is mounted inside something in the Bin (it was
+/// moved there with its folder): deleting from the Bin would delete what's
+/// on the drive.
+pub fn refuse_mounts_in_bin() -> Result<(), glib::Error> {
+    let Some(bin) = dirs::data_dir().map(|d| d.join("Trash")) else {
+        return Ok(());
+    };
+    let real = std::fs::canonicalize(&bin).unwrap_or(bin);
+    match crate::rclone_ops::mountpoints_inside(&real.to_string_lossy()).first() {
+        Some(mount) => Err(glib::Error::new(
+            gio::IOErrorEnum::Busy,
+            &format!("{mount} is mounted inside something in the Bin; unmount it first"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// `path` with every link resolved but its last part: a link is judged as
 /// itself (deleting or copying it touches only the link), not as the
 /// folder it leads to.
@@ -127,6 +144,7 @@ pub fn restore_from_trash(file: &gio::File) -> Result<String, glib::Error> {
 
 /// Empty the Bin — permanently delete all items
 pub fn empty_trash() -> Result<u32, glib::Error> {
+    refuse_mounts_in_bin()?;
     let trash = gio::File::for_uri("trash:///");
     let enumerator = trash.enumerate_children(
         "standard::name",
@@ -351,6 +369,9 @@ pub fn delete_with_progress(
 /// exposes POSIX semantics. Faster startup than GIO for our use case
 /// because we skip the full file-info enumeration on each child.
 fn delete_path_recursive_std(path: &std::path::Path) -> Result<(), String> {
+    // As delete_file_recursive: never into a drive mounted inside, judged
+    // on the real path.
+    refuse_mounts_inside(&gio::File::for_path(path)).map_err(|e| e.to_string())?;
     let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if meta.file_type().is_dir() {
         std::fs::remove_dir_all(path).map_err(|e| e.to_string())

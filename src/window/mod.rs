@@ -1044,6 +1044,10 @@ impl WayfinderWindow {
 
     /// Cut selected files to the global (cross-window) clipboard.
     pub fn cut_selected(&self) {
+        // Moving files out of the offline copy would lose it.
+        if self.refuse_in_offline_view() {
+            return;
+        }
         let files = self.get_selected_files();
         if files.is_empty() {
             return;
@@ -1126,6 +1130,10 @@ impl WayfinderWindow {
 
     /// Cut selected files to the window-local clipboard.
     pub fn cut_selected_local(&self) {
+        // Moving files out of the offline copy would lose it.
+        if self.refuse_in_offline_view() {
+            return;
+        }
         let files = self.get_selected_files();
         if files.is_empty() {
             return;
@@ -1423,6 +1431,12 @@ impl WayfinderWindow {
                 .collect()
         };
         if files.is_empty() {
+            return;
+        }
+        // A drive mounted inside goes along into the Bin, and emptying the
+        // Bin would then delete what's on it.
+        let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
+        if self.refuse_if_mounts_inside(&paths) {
             return;
         }
 
@@ -1828,6 +1842,13 @@ impl WayfinderWindow {
             move |result| {
                 if let Ok(choice) = result {
                     if choice == 1 && window.is_in_trash() {
+                        if let Err(e) = wayfinder::file_ops::refuse_mounts_in_bin() {
+                            window.announce(
+                                &format!("Not deleted: {e}"),
+                                AccessibleAnnouncementPriority::High,
+                            );
+                            return;
+                        }
                         // Items in the Bin are deleted through the Bin itself
                         // (their paths are trash:/// URIs).
                         let uris: Vec<(String, String)> = file_paths.clone();

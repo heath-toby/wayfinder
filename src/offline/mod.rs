@@ -268,6 +268,31 @@ pub fn is_unpinning(original_path: &str) -> bool {
         .any(|p| paths_overlap(Path::new(p), Path::new(original_path)))
 }
 
+/// Pins being refreshed right now.
+static REFRESHING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Marks a pin as being refreshed while alive.
+struct Refreshing(String);
+
+impl Refreshing {
+    fn new(path: &str) -> Self {
+        REFRESHING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path.to_string());
+        Self(path.to_string())
+    }
+}
+
+impl Drop for Refreshing {
+    fn drop(&mut self) {
+        let mut list = REFRESHING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = list.iter().position(|p| *p == self.0) {
+            list.swap_remove(i);
+        }
+    }
+}
+
 /// Marks a path as being unpinned while alive.
 struct Unpinning(String);
 
@@ -291,6 +316,16 @@ impl Drop for Unpinning {
 }
 
 pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
+    // Deleting a copy the startup refresh is writing into would leave a
+    // stray part of it behind.
+    if REFRESHING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| paths_overlap(Path::new(p), Path::new(original_path)))
+    {
+        return Err("it's being refreshed right now; try again in a moment".to_string());
+    }
     let _unpinning = Unpinning::new(original_path);
     let (was_pinned, manifest) =
         update_manifest(|manifest| (manifest.remove(original_path).is_some(), manifest.clone()))?;
@@ -408,6 +443,7 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
 /// temporary file first, so an interrupted refresh never loses the
 /// existing offline copy.
 pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
+    let _refreshing = Refreshing::new(&entry.original_path);
     // Pins live on rclone mounts. If the mount isn't up, the path may still
     // exist as an empty mountpoint directory, and syncing from it would
     // delete the offline copy just when it's needed.
@@ -445,6 +481,7 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let remote = crate::rclone_ops::rclone_for_path(&entry.original_path)
         .filter(|_| crate::rclone_ops::rclone_available())
         .map(|t| t.full_remote_spec);
+    KEPT_LOCAL.with(|k| k.set(false));
     let changed = if entry.is_directory {
         sync_dir(src, &dest, remote.as_deref(), entry.last_refreshed)?
     } else {
@@ -457,7 +494,12 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
         if let Some(e) = manifest.get_mut(&entry.original_path) {
             e.last_synced_mtime = mtime;
             e.last_synced_size = size;
-            e.last_refreshed = now_secs();
+            // Moved on only if nothing of the user's was kept: otherwise
+            // what was kept would no longer count as theirs next time,
+            // and be removed.
+            if !KEPT_LOCAL.with(|k| k.get()) {
+                e.last_refreshed = now_secs();
+            }
         }
     })?;
     Ok(changed)
@@ -492,6 +534,18 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+thread_local! {
+    /// Set when a refresh kept something changed in the copy here.
+    static KEPT_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A refresh is keeping `path`, changed in the offline copy since the last
+/// refresh.
+fn note_kept(path: &Path) {
+    log::warn!("Offline copy {} changed here; kept", path.display());
+    KEPT_LOCAL.with(|k| k.set(true));
 }
 
 fn now_secs() -> i64 {
@@ -532,7 +586,7 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, since: i64) -> Result<
     // unless it was changed here since the last refresh (the user's).
     if dst.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
         if changed_since(dst, since) {
-            log::warn!("Offline copy {} changed here; kept", dst.display());
+            note_kept(dst);
             return Ok(false);
         }
         std::fs::remove_file(dst).map_err(|e| e.to_string())?;
@@ -577,7 +631,7 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, since: i64) -> Result<
         let path = entry.path();
         // Made or changed here since the last refresh: the user's, kept.
         if changed_since(&path, since) {
-            log::warn!("Offline copy {} changed here; kept", path.display());
+            note_kept(&path);
             continue;
         }
         let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -605,7 +659,7 @@ fn sync_file(
             // unless something in it was changed here since the last
             // refresh.
             if changed_since(dst, since) {
-                log::warn!("Offline copy {} changed here; kept", dst.display());
+                note_kept(dst);
                 return Ok(false);
             }
             std::fs::remove_dir_all(dst).map_err(|e| e.to_string())?;
@@ -613,14 +667,12 @@ fn sync_file(
             if dst_meta.len() == src_meta.len() && mtime_secs(&dst_meta) == mtime_secs(src_meta) {
                 return Ok(false);
             }
-            // Changed here since it was fetched (opened from the offline
-            // copy and saved, say): keep it — replacing it with the older
-            // remote one would lose the edit.
-            if mtime_secs(&dst_meta) > mtime_secs(src_meta) {
-                log::warn!(
-                    "Offline copy {} is newer than the remote; kept",
-                    dst.display()
-                );
+            // Changed here since the last refresh (opened from the offline
+            // copy and saved, say): keep it — replacing it with the remote
+            // one would lose the edit. (Whether the remote's date is older
+            // or newer says nothing about that.)
+            if changed_since(dst, since) {
+                note_kept(dst);
                 return Ok(false);
             }
         }

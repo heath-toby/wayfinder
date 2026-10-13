@@ -273,15 +273,22 @@ fn parse_rclone_mount(
     };
     let after_flag =
         |i: usize| i > 0 && before[i - 1].starts_with("--") && !before[i - 1].contains('=');
-    let remote = candidates
+    let remote_idx = *candidates
         .iter()
         .rev()
         .find(|&&i| is_configured(&i) && !after_flag(i))
         .or_else(|| candidates.iter().rev().find(|i| is_configured(i)))
         .or_else(|| candidates.iter().rev().find(|&&i| !after_flag(i)))
-        .or_else(|| candidates.last())
-        .map(|&i| before[i])?;
-    Some((args[mount_pos].to_string(), remote.to_string()))
+        .or_else(|| candidates.last())?;
+    // `ps` drops quoting: "gdrive:Shared Docs" shows as two words. A plain
+    // word after the remote that isn't a flag's value means the remote was
+    // cut short — don't guess (a guess would act on another remote path).
+    let stray =
+        (remote_idx + 1..before.len()).any(|i| !before[i].starts_with('-') && !after_flag(i));
+    if stray {
+        return None;
+    }
+    Some((args[mount_pos].to_string(), before[remote_idx].to_string()))
 }
 
 /// Whether rclone can be run. Checked once per process: it's asked before
@@ -1246,6 +1253,20 @@ mod mount_parse_tests {
         );
         let line = "rclone --config work.conf mount Proton: /home/u/proton";
         assert_eq!(parse_rclone_mount(line, &mounts(), &remotes), None);
+    }
+
+    /// ps shows `"gdrive:Shared Docs"` unquoted: not to be read as
+    /// `gdrive:Shared`.
+    #[test]
+    fn remotes_cut_by_spaces_are_not_guessed() {
+        let line = "rclone mount gdrive:Shared Docs /home/u/proton";
+        assert_eq!(parse_rclone_mount(line, &mounts(), &[]), None);
+        // A flag's value after the remote is fine.
+        let line = "rclone mount gdrive:Shared --vfs-cache-mode writes /home/u/proton";
+        assert_eq!(
+            parse_rclone_mount(line, &mounts(), &[]),
+            Some(("/home/u/proton".into(), "gdrive:Shared".into()))
+        );
     }
 
     #[test]

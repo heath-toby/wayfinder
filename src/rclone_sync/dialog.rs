@@ -290,6 +290,20 @@ pub fn show_dialog(
                 }
             }
 
+            // Final guard 3: no drive mounted inside the folder (bisync
+            // would sync, and delete, what's on it — the remote it may be).
+            // (Strictly inside: syncing a drive's own top folder is fine.)
+            if let Some(mount) = crate::rclone_ops::mountpoints_inside(&sync_local)
+                .iter()
+                .find(|m| m.trim_end_matches('/') != sync_local.trim_end_matches('/'))
+            {
+                parent.announce(
+                    &format!("Refusing to sync: {mount} is mounted inside this folder. Unmount it, or pick a folder without one."),
+                    AccessibleAnnouncementPriority::High,
+                );
+                return;
+            }
+
             // Final guard 2: if the kernel reports the local sync path as a
             // fuse.rclone mount (the dangerous case) refuse to proceed. The
             // upstream redirect should have rewritten this to a cache path

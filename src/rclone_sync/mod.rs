@@ -180,6 +180,9 @@ pub fn bisync_args(pair: &SyncPair) -> Vec<String> {
         "--conflict-suffix".to_string(),
         "conflict-local,conflict-remote".to_string(),
         "--resilient".to_string(),
+        // Never into a drive mounted inside the folder: syncing one with
+        // the remote could make bisync delete what's on it.
+        "--one-file-system".to_string(),
     ];
     if pair.initial_resync_done {
         args.push("--recover".to_string());
@@ -214,4 +217,3 @@ pub fn count_conflicts(stdout: &str, stderr: &str) -> usize {
         })
         .count()
 }
-
