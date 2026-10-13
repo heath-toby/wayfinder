@@ -460,11 +460,16 @@ impl ObjectImpl for WayfinderWindowInner {
 
         // Opening a folder in a FUSE folder is instant if its listing was
         // fetched while the selection rested on it.
-        let w = window.clone();
+        // (Weak: the window owns the selection, so a strong reference here
+        // would keep a closed window alive.)
+        let w = window.downgrade();
         let prefetch_token = Rc::new(Cell::new(0u64));
         self.selection.connect_selected_item_notify(move |sel| {
             let token = prefetch_token.get() + 1;
             prefetch_token.set(token);
+            let Some(w) = w.upgrade() else {
+                return;
+            };
             let Some(file) = sel.selected_item().and_downcast::<FileObject>() else {
                 return;
             };
@@ -519,6 +524,10 @@ impl WindowImpl for WayfinderWindowInner {
         let window = self.obj();
         let (w, h) = window.default_size();
         wayfinder::state::save_window_size(w, h);
+        // A folder still opening on a stuck mount mustn't keep the closed
+        // window alive, nor finish opening (and be saved as the last
+        // folder) if the mount answers later.
+        self.model.abandon_loading();
         self.parent_close_request()
     }
 }
@@ -951,18 +960,26 @@ impl WayfinderWindowInner {
                             if entry.text() != text.as_str() {
                                 return;
                             }
-                            if let Some(completed) = completed {
-                                let added = wayfinder::path_complete::added_text(&text, &completed);
-                                entry.set_text(&completed);
-                                entry.set_position(-1);
-                                if !added.is_empty() {
-                                    dlg.announce(added, AccessibleAnnouncementPriority::Medium);
+                            use wayfinder::path_complete::Completion;
+                            match completed {
+                                Completion::Text(completed) => {
+                                    let added =
+                                        wayfinder::path_complete::added_text(&text, &completed);
+                                    entry.set_text(&completed);
+                                    entry.set_position(-1);
+                                    if !added.is_empty() {
+                                        dlg.announce(added, AccessibleAnnouncementPriority::Medium);
+                                    }
                                 }
-                            } else if text.contains('/') {
-                                dlg.announce(
+                                Completion::Several(n) => dlg.announce(
+                                    &format!("{n} matches"),
+                                    AccessibleAnnouncementPriority::Medium,
+                                ),
+                                Completion::NoMatch if text.contains('/') => dlg.announce(
                                     "No completions",
                                     AccessibleAnnouncementPriority::Medium,
-                                );
+                                ),
+                                Completion::NoMatch => {}
                             }
                         },
                         move || {
@@ -1195,8 +1212,12 @@ impl WayfinderWindowInner {
 
         // Announce column data on selection change in list view only.
         // Icon view is a native GtkListView — Orca reads it directly.
-        let window2 = self.obj().clone();
+        // (Weak: the window owns the selection.)
+        let window2 = self.obj().downgrade();
         self.selection.connect_selected_item_notify(move |_sel| {
+            let Some(window2) = window2.upgrade() else {
+                return;
+            };
             if window2.imp().current_view.get() == ViewMode::List {
                 window2.imp().announce_current_cell(&window2);
             }

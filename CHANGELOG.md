@@ -20,7 +20,9 @@
 - **Moved and renamed folders** — going back to a folder you've just moved or renamed on a mount no longer opens its old contents as if it were still there.
 - **Move to Bin messages** — when some of the selected files had to be deleted permanently instead, "Moved … to Bin" names a file that really went to the Bin.
 - **Cancelled deletes** — cancelling a permanent delete on a mount (or one where nothing could be deleted) no longer moves the selection.
-- **Memory** — each closed window, and each file chooser dialog, is now freed; previously they stayed in memory until Wayfinder quit. A file chooser closed while a folder was still opening on a stuck mount stops waiting for it.
+- **Memory** — each closed window, and each file chooser dialog, is now freed; previously they stayed in memory until Wayfinder quit. A window or file chooser closed while a folder was still opening on a stuck mount stops waiting for it — so a closed window can no longer finish opening that folder later and save it as the folder to start in.
+- **Dropping files** — files dragged in from other apps are copied even when their names contain spaces or other special characters, and dropping several files at once copies them all.
+- **Tab completion with several matches** — Go to Location now says how many entries match (for example "2 matches") instead of "No completions".
 - **`~` with an unusual home setting** — Tab completion of `~/…` works when `$HOME` ends in `/`, or is `/` itself.
 
 ### Development

@@ -385,10 +385,6 @@ impl WayfinderWindow {
         self.imp().model.refresh(move |_| w.update_status());
     }
 
-    /// After files changed in `folders` (pasted into, moved out of, renamed
-    /// in): drop their cached listings, so none is shown out of date — if
-    /// the user went elsewhere while a slow mount answered, or the reload
-    /// is cut short — and reload the current folder.
     /// Files or folders at `paths` were moved or renamed away: drop the
     /// cached listings of the old locations and everything inside them.
     pub fn forget_moved(&self, paths: &[String]) {
@@ -397,6 +393,10 @@ impl WayfinderWindow {
         }
     }
 
+    /// After files changed in `folders` (pasted into, moved out of, renamed
+    /// in): drop their cached listings, so none is shown out of date — if
+    /// the user went elsewhere while a slow mount answered, or the reload
+    /// is cut short — and reload the current folder.
     pub fn reload_after_change(&self, folders: &[String]) {
         let model = &self.imp().model;
         for folder in folders {
@@ -1284,6 +1284,10 @@ impl WayfinderWindow {
         model.forget_cached(&from.folder);
         for path in &from.removed {
             model.forget_cached_under(path);
+            // Their own folders too: in Recent Files that isn't the view.
+            if let Some(parent) = parent_dir(path) {
+                model.forget_cached(&parent);
+            }
         }
         if model.current_path() != from.folder {
             after(self, false);
@@ -1891,38 +1895,50 @@ impl WayfinderWindow {
             return;
         }
 
+        let paths = dropped_paths(uri_str);
+        if paths.is_empty() {
+            return;
+        }
+
         // Set the guard before any per-path resolution work so two rapid
         // drops can't both pass the check.
         let guard = PastingGuard::new(self.clone());
 
-        let path = if let Some(p) = uri_str.strip_prefix("file://") {
-            p.to_string()
-        } else {
-            uri_str.to_string()
-        };
-
         let dest_dir_str = imp.model.current_path();
         let parent_window: gtk::Window = self.clone().upcast();
-        let w = self.clone();
         let changed = vec![dest_dir_str.clone()];
-        let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-            let _g = guard;
-            w.reload_after_change(&changed);
-        }));
 
-        let src_rclone = wayfinder::rclone_ops::rclone_for_path(&path).is_some();
+        let src_rclone = paths
+            .iter()
+            .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some());
         let dst_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
         if (src_rclone || dst_rclone) && wayfinder::rclone_ops::rclone_available() {
+            let w = self.clone();
+            let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                let _g = guard;
+                w.reload_after_change(&changed);
+            }));
             wayfinder::rclone_ops::copy_paths_with_progress(
-                vec![path],
+                paths,
                 dest_dir_str,
                 &parent_window,
                 reload,
             );
         } else {
-            let source = gio::File::for_path(&path);
+            // One copy per file; the guard drops when the last one is done.
+            let shared_guard = std::rc::Rc::new(guard);
             let dest_dir = gio::File::for_path(&dest_dir_str);
-            wayfinder::file_ops::copy_with_progress(&source, &dest_dir, &parent_window, reload);
+            for path in &paths {
+                let w = self.clone();
+                let guard_held = shared_guard.clone();
+                let changed = changed.clone();
+                let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                    let _g = guard_held;
+                    w.reload_after_change(&changed);
+                }));
+                let source = gio::File::for_path(path);
+                wayfinder::file_ops::copy_with_progress(&source, &dest_dir, &parent_window, reload);
+            }
         }
     }
 
@@ -2585,6 +2601,27 @@ fn run_rclone_direct_delete(
     wayfinder::rclone_ops::delete_with_progress(rclone_items, &parent, on_complete);
 }
 
+/// The local paths in dropped text: a `text/uri-list` (one URI per line,
+/// `#` lines are comments) or a plain path. URIs are decoded, so
+/// `file:///home/u/My%20Report.pdf` gives `/home/u/My Report.pdf`.
+fn dropped_paths(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            if line.starts_with("file://") {
+                gio::File::for_uri(line)
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string())
+            } else if line.starts_with('/') {
+                Some(line.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// The folder holding `path`.
 fn parent_dir(path: &str) -> Option<String> {
     std::path::Path::new(path)
@@ -2607,7 +2644,27 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::position_near_removed;
+    use super::{dropped_paths, position_near_removed};
+
+    #[test]
+    fn dropped_uris_are_decoded() {
+        assert_eq!(
+            dropped_paths("file:///home/u/My%20Report.pdf"),
+            vec!["/home/u/My Report.pdf"]
+        );
+    }
+
+    #[test]
+    fn dropped_uri_list_gives_every_file() {
+        let list = "# from a file manager\r\nfile:///a/one.txt\r\nfile:///a/two%23.txt\r\n";
+        assert_eq!(dropped_paths(list), vec!["/a/one.txt", "/a/two#.txt"]);
+    }
+
+    #[test]
+    fn dropped_plain_path_is_kept() {
+        assert_eq!(dropped_paths("/a/b c.txt"), vec!["/a/b c.txt"]);
+        assert!(dropped_paths("https://example.com/x").is_empty());
+    }
 
     #[test]
     fn selection_moves_to_the_item_above() {

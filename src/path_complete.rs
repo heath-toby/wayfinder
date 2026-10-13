@@ -10,10 +10,20 @@ pub fn expand_tilde(text: &str) -> String {
     expand_with(text, dirs::home_dir().as_deref())
 }
 
-/// Complete `partial`. `None` if nothing matches, or the matches agree on
-/// nothing more than is typed. Lists a directory, so may block on a slow
-/// mount: call it off the main thread.
-pub fn complete(partial: &str) -> Option<String> {
+/// The outcome of completing a typed path.
+#[derive(Debug, PartialEq)]
+pub enum Completion {
+    /// The text completed this far.
+    Text(String),
+    /// Several entries match, agreeing on nothing more than is typed.
+    Several(usize),
+    /// Nothing matches.
+    NoMatch,
+}
+
+/// Complete `partial`. Lists a directory, so may block on a slow mount:
+/// call it off the main thread.
+pub fn complete(partial: &str) -> Completion {
     complete_with(partial, dirs::home_dir().as_deref())
 }
 
@@ -59,7 +69,7 @@ fn contract_with(path: &str, home: &Path) -> String {
     }
 }
 
-fn complete_with(partial: &str, home: Option<&Path>) -> Option<String> {
+fn complete_with(partial: &str, home: Option<&Path>) -> Completion {
     let expanded = expand_with(partial, home);
     // Answer in the form typed.
     let as_typed = |path: &str| match home {
@@ -71,13 +81,19 @@ fn complete_with(partial: &str, home: Option<&Path>) -> Option<String> {
         (expanded.as_str(), "")
     } else {
         let p = Path::new(&expanded);
-        let dir = p.parent()?.to_str()?;
-        let prefix = p.file_name()?.to_str()?;
+        let (Some(dir), Some(prefix)) = (
+            p.parent().and_then(|d| d.to_str()),
+            p.file_name().and_then(|f| f.to_str()),
+        ) else {
+            return Completion::NoMatch;
+        };
         (dir, prefix)
     };
 
     let dir = if dir_str.is_empty() { "." } else { dir_str };
-    let entries = std::fs::read_dir(dir).ok()?;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Completion::NoMatch;
+    };
 
     let prefix_lower = prefix.to_lowercase();
     let mut matches: Vec<String> = entries
@@ -106,15 +122,21 @@ fn complete_with(partial: &str, home: Option<&Path>) -> Option<String> {
         .collect();
 
     matches.sort();
-    let (first, rest) = matches.split_first()?;
+    let Some((first, rest)) = matches.split_first() else {
+        return Completion::NoMatch;
+    };
     if rest.is_empty() {
-        return Some(as_typed(first));
+        return Completion::Text(as_typed(first));
     }
 
     let common = rest
         .iter()
         .fold(first.as_str(), |common, m| common_prefix(common, m));
-    (common.len() > expanded.len()).then(|| as_typed(common))
+    if common.len() > expanded.len() {
+        Completion::Text(as_typed(common))
+    } else {
+        Completion::Several(matches.len())
+    }
 }
 
 /// The longest start `a` and `b` share, ending on a character boundary.
@@ -133,6 +155,14 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The completed text, or `None`.
+    fn text(c: Completion) -> Option<String> {
+        match c {
+            Completion::Text(t) => Some(t),
+            _ => None,
+        }
+    }
 
     /// A fresh directory holding `home/` (with the given subfolders and
     /// files) and `homex/`, a sibling whose name starts with home's.
@@ -190,7 +220,7 @@ mod tests {
         assert_eq!(contract_with("/home/toby/Music/", home), "~/Music/");
         let f = Fixture::new("slash", &["Development"], &[]);
         let home = format!("{}/", f.home().display());
-        let completed = complete_with("~/Dev", Some(Path::new(&home))).unwrap();
+        let completed = text(complete_with("~/Dev", Some(Path::new(&home)))).unwrap();
         assert_eq!(completed, "~/Development/");
     }
 
@@ -217,7 +247,7 @@ mod tests {
     fn absolute_path_under_home_stays_absolute() {
         let f = Fixture::new("absolute", &["Development"], &[]);
         let typed = f.path("home/Dev");
-        let completed = complete_with(&typed, Some(&f.home())).unwrap();
+        let completed = text(complete_with(&typed, Some(&f.home()))).unwrap();
         assert_eq!(completed, f.path("home/Development/"));
         assert_eq!(added_text(&typed, &completed), "elopment/");
     }
@@ -225,7 +255,7 @@ mod tests {
     #[test]
     fn tilde_path_stays_tilde() {
         let f = Fixture::new("tilde", &["Development"], &[]);
-        let completed = complete_with("~/Dev", Some(&f.home())).unwrap();
+        let completed = text(complete_with("~/Dev", Some(&f.home()))).unwrap();
         assert_eq!(completed, "~/Development/");
         assert_eq!(added_text("~/Dev", &completed), "elopment/");
     }
@@ -235,17 +265,20 @@ mod tests {
     fn sibling_of_home_is_not_contracted() {
         let f = Fixture::new("sibling", &[], &[]);
         let typed = format!("{}x", f.home().display());
-        let completed = complete_with(&typed, Some(&f.home())).unwrap();
+        let completed = text(complete_with(&typed, Some(&f.home()))).unwrap();
         assert_eq!(completed, f.path("homex/"));
     }
 
     #[test]
     fn several_matches_complete_to_what_they_share() {
         let f = Fixture::new("several", &[], &["report-2024.txt", "report-2025.txt"]);
-        let completed = complete_with("~/rep", Some(&f.home())).unwrap();
+        let completed = text(complete_with("~/rep", Some(&f.home()))).unwrap();
         assert_eq!(completed, "~/report-202");
-        // Nothing more to add.
-        assert_eq!(complete_with("~/report-202", Some(&f.home())), None);
+        // Both match, agreeing on nothing more: say how many, not "none".
+        assert_eq!(
+            complete_with("~/report-202", Some(&f.home())),
+            Completion::Several(2)
+        );
     }
 
     /// Names that differ inside a multi-byte character mustn't split it.
@@ -254,14 +287,14 @@ mod tests {
         // The old code counted the shared start in characters and cut it
         // in bytes, landing inside the second "é" and panicking.
         let f = Fixture::new("utf8", &[], &["ééa", "ééb"]);
-        let completed = complete_with("~/é", Some(&f.home())).unwrap();
+        let completed = text(complete_with("~/é", Some(&f.home()))).unwrap();
         assert_eq!(completed, "~/éé");
     }
 
     #[test]
     fn match_in_another_case_announces_the_whole_name() {
         let f = Fixture::new("case", &["Documents"], &[]);
-        let completed = complete_with("~/doc", Some(&f.home())).unwrap();
+        let completed = text(complete_with("~/doc", Some(&f.home()))).unwrap();
         assert_eq!(completed, "~/Documents/");
         assert_eq!(added_text("~/doc", &completed), "Documents/");
     }
@@ -270,11 +303,11 @@ mod tests {
     fn hidden_files_only_when_asked_for() {
         let f = Fixture::new("hidden", &[], &[".profile", "photo.jpg"]);
         assert_eq!(
-            complete_with("~/p", Some(&f.home())).unwrap(),
+            text(complete_with("~/p", Some(&f.home()))).unwrap(),
             "~/photo.jpg"
         );
         assert_eq!(
-            complete_with("~/.p", Some(&f.home())).unwrap(),
+            text(complete_with("~/.p", Some(&f.home()))).unwrap(),
             "~/.profile"
         );
     }
@@ -282,6 +315,6 @@ mod tests {
     #[test]
     fn no_match_is_none() {
         let f = Fixture::new("none", &[], &["a.txt"]);
-        assert_eq!(complete_with("~/zzz", Some(&f.home())), None);
+        assert_eq!(complete_with("~/zzz", Some(&f.home())), Completion::NoMatch);
     }
 }
