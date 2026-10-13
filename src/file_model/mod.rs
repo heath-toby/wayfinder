@@ -41,7 +41,9 @@ enum Apply {
     Revalidate,
 }
 
-type LoadDone = Box<dyn FnOnce(Result<u32, String>)>;
+/// Called once a job is over: with its outcome, or `None` if a navigation
+/// superseded it.
+type LoadDone = Box<dyn FnOnce(Option<Result<u32, String>>)>;
 type Callback = Box<dyn Fn()>;
 type ErrorCallback = Box<dyn Fn(String, String)>;
 
@@ -164,7 +166,7 @@ impl DirectoryModel {
             gen,
             move || loader::list_recent(paths, 50),
             Apply::Replace,
-            Box::new(on_done),
+            unless_superseded(on_done),
         );
     }
 
@@ -177,7 +179,7 @@ impl DirectoryModel {
             gen,
             move || loader::list_uri(&uri),
             Apply::Replace,
-            Box::new(on_done),
+            unless_superseded(on_done),
         );
     }
 
@@ -212,7 +214,10 @@ impl DirectoryModel {
                 gen,
                 job,
                 Apply::Revalidate,
-                Box::new(move |_| {
+                Box::new(move |outcome| {
+                    if outcome.is_none() {
+                        return;
+                    }
                     if let Some(cb) = model.on_background_update.borrow().as_ref() {
                         cb();
                     }
@@ -222,7 +227,7 @@ impl DirectoryModel {
         }
 
         self.store.remove_all();
-        self.run(gen, job, Apply::Replace, Box::new(on_done));
+        self.run(gen, job, Apply::Replace, unless_superseded(on_done));
     }
 
     /// Like `refresh`, but does nothing while another refresh is still
@@ -234,20 +239,26 @@ impl DirectoryModel {
             .load(std::sync::atomic::Ordering::SeqCst)
             == 0
         {
-            self.refresh(on_done);
+            self.refresh(move |listed| {
+                if listed {
+                    on_done();
+                }
+            });
         }
     }
 
     /// List the current location again and update the store in place,
-    /// keeping the selection. `on_done` runs afterwards — not at all if a
-    /// navigation is under way or happens meanwhile.
-    pub fn refresh(&self, on_done: impl FnOnce() + 'static) {
+    /// keeping the selection. `on_done` always runs, told whether the store
+    /// now shows a fresh listing: `false` if listing failed (the store is
+    /// left as it was), or a navigation was under way (its listing will be
+    /// fresh) or happened meanwhile.
+    pub fn refresh(&self, on_done: impl FnOnce(bool) + 'static) {
         if self.loading.get() {
-            // A navigation is still on its way; its listing will be fresh.
+            on_done(false);
             return;
         }
         let location = self.current_path();
-        let on_done: LoadDone = Box::new(move |_| on_done());
+        let on_done: LoadDone = Box::new(move |outcome| on_done(matches!(outcome, Some(Ok(_)))));
         let gen = self.generation.get();
         if location == "recent:///" {
             let paths = recent_paths();
@@ -277,6 +288,30 @@ impl DirectoryModel {
     /// Whether a navigation is still waiting for its listing.
     pub fn is_loading(&self) -> bool {
         self.loading.get()
+    }
+
+    /// If the navigation just started to `location` is still waiting after
+    /// a moment, call `notify` with a message saying so (to show and
+    /// announce) and how to back out.
+    pub fn notify_if_waiting(&self, location: &str, notify: impl FnOnce(String) + 'static) {
+        if !self.is_loading() {
+            return;
+        }
+        let generation = self.generation();
+        let model = self.clone();
+        let location = location.to_string();
+        glib::timeout_add_local_once(Duration::from_millis(400), move || {
+            if model.generation() != generation || !model.is_loading() {
+                return;
+            }
+            let name = display_name(&location);
+            notify(match crate::rclone_ops::fuse_daemon_name(&location) {
+                Some(daemon) => {
+                    format!("Waiting for {daemon} to open {name}. Press Alt+Left to go back.")
+                }
+                None => format!("Waiting for {name} to open. Press Alt+Left to go back."),
+            });
+        });
     }
 
     /// Changes with every navigation; lets callers tell whether the load
@@ -356,6 +391,9 @@ impl DirectoryModel {
             let result = if model.generation.get() != gen {
                 // Superseded. The thread may still be waiting on the mount;
                 // its result will be dropped with `rx`.
+                if let Some(on_done) = on_done.take() {
+                    on_done(None);
+                }
                 None
             } else {
                 match rx.try_recv() {
@@ -381,13 +419,14 @@ impl DirectoryModel {
     ) {
         if gen != self.generation.get() {
             log::debug!("dropping listing for a location left behind (generation {gen})");
+            on_done(None);
             return;
         }
         if seq < self.applied_seq.get() {
             // A newer listing of this location is already applied, so the
             // store is at least as fresh as this one would make it.
             log::debug!("skipping listing overtaken by a newer one (sequence {seq})");
-            on_done(Ok(self.store.n_items()));
+            on_done(Some(Ok(self.store.n_items())));
             return;
         }
         self.applied_seq.set(seq);
@@ -410,7 +449,7 @@ impl DirectoryModel {
                         cb(location, e.clone());
                     }
                 }
-                on_done(Err(e));
+                on_done(Some(Err(e)));
                 return;
             }
         };
@@ -437,7 +476,7 @@ impl DirectoryModel {
             self.setup_monitor(&gio::File::for_path(&listing.path));
             self.calculate_folder_sizes();
         }
-        on_done(Ok(self.store.n_items()));
+        on_done(Some(Ok(self.store.n_items())));
     }
 
     fn replace_all(&self, listing: &Listing) {
@@ -708,7 +747,8 @@ fn resort_if_needed(sort_model: &SortListModel, changed: &[FileObject]) {
     };
     let n = sort_model.n_items();
     let out_of_order = changed.iter().any(|fo| {
-        let Some(pos) = (0..n).find(|&i| sort_model.item(i).as_ref() == Some(fo.upcast_ref())) else {
+        let Some(pos) = (0..n).find(|&i| sort_model.item(i).as_ref() == Some(fo.upcast_ref()))
+        else {
             return false;
         };
         let before = pos
@@ -740,7 +780,10 @@ pub fn query_file(path: &str) -> Option<(String, crate::file_object::FileInfoDat
         .parent()?
         .to_string_lossy()
         .to_string();
-    Some((parent, crate::file_object::FileInfoData::from_file_info(&info)))
+    Some((
+        parent,
+        crate::file_object::FileInfoData::from_file_info(&info),
+    ))
 }
 
 /// Paths of recently used local files. The RecentManager is main-thread
@@ -808,4 +851,43 @@ fn walk_dir_size_impl(
         }
     }
     total
+}
+
+/// A navigation's `on_done`, which doesn't run if it's superseded.
+fn unless_superseded(on_done: impl FnOnce(Result<u32, String>) + 'static) -> LoadDone {
+    Box::new(move |outcome| {
+        if let Some(result) = outcome {
+            on_done(result);
+        }
+    })
+}
+
+/// How to name a location when speaking of it: a folder by its own name.
+pub fn display_name(location: &str) -> String {
+    match location {
+        "recent:///" => "Recent Files".to_string(),
+        l if l.starts_with("trash:") => "the Bin".to_string(),
+        l => std::path::Path::new(l)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| l.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_name;
+
+    #[test]
+    fn folders_are_named_by_their_own_name() {
+        assert_eq!(display_name("/home/toby/Music"), "Music");
+        assert_eq!(display_name("/home/toby/Music/"), "Music");
+        assert_eq!(display_name("/"), "/");
+    }
+
+    #[test]
+    fn special_locations_get_their_names() {
+        assert_eq!(display_name("trash:///"), "the Bin");
+        assert_eq!(display_name("recent:///"), "Recent Files");
+    }
 }

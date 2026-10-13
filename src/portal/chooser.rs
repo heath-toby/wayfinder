@@ -615,16 +615,12 @@ fn load_dir(
     forward_btn.set_sensitive(nav.borrow().can_go_forward());
     up_btn.set_sensitive(path != "/");
 
-    let dir_name = std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
+    let dir_name = wayfinder::file_model::display_name(path);
     {
         let m = model.clone();
         let status_label = status_label.clone();
         let selection = selection.clone();
         let window = window.clone();
-        let dir_name = dir_name.clone();
         model.load_directory(path, false, move |result| match result {
             Ok(_) => {
                 let count = m.item_count();
@@ -643,24 +639,10 @@ fn load_dir(
     }
 
     // Still waiting after a moment: say so, and how to back out.
-    if model.is_loading() {
-        let generation = model.generation();
-        let m = model.clone();
-        let status_label = status_label.clone();
-        let window = window.clone();
-        let daemon = wayfinder::rclone_ops::fuse_daemon_name(path);
-        glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
-            if m.generation() != generation || !m.is_loading() {
-                return;
-            }
-            let msg = match daemon {
-                Some(daemon) => {
-                    format!("Waiting for {daemon} to open {dir_name}. Press Alt+Left to go back.")
-                }
-                None => format!("Waiting for {dir_name} to open. Press Alt+Left to go back."),
-            };
-            status_label.set_text(&msg);
-            window.announce(&msg, AccessibleAnnouncementPriority::Medium);
-        });
-    }
+    let status_label = status_label.clone();
+    let window = window.clone();
+    model.notify_if_waiting(path, move |msg| {
+        status_label.set_text(&msg);
+        window.announce(&msg, AccessibleAnnouncementPriority::Medium);
+    });
 }

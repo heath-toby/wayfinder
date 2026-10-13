@@ -81,9 +81,7 @@ impl WayfinderWindow {
         if !old_path.is_empty() && old_path != new_location {
             if let Some(item) = imp.selection.selected_item() {
                 if let Some(file) = item.downcast_ref::<FileObject>() {
-                    imp.last_position
-                        .borrow_mut()
-                        .insert(old_path, file.name());
+                    imp.last_position.borrow_mut().insert(old_path, file.name());
                 }
             }
         }
@@ -126,29 +124,9 @@ impl WayfinderWindow {
     /// If the load just started is still waiting after a moment, say so —
     /// in the status bar and aloud — and how to back out.
     fn notify_if_waiting(&self, location: &str) {
-        let model = &self.imp().model;
-        if !model.is_loading() {
-            return;
-        }
-        let generation = model.generation();
         let w = self.clone();
-        let location = location.to_string();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
-            let imp = w.imp();
-            if imp.model.generation() != generation || !imp.model.is_loading() {
-                return;
-            }
-            let name = PathBuf::from(&location)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| location.clone());
-            let msg = match wayfinder::rclone_ops::fuse_daemon_name(&location) {
-                Some(daemon) => {
-                    format!("Waiting for {daemon} to open {name}. Press Alt+Left to go back.")
-                }
-                None => format!("Waiting for {name} to open. Press Alt+Left to go back."),
-            };
-            imp.status_label.set_text(&msg);
+        self.imp().model.notify_if_waiting(location, move |msg| {
+            w.imp().status_label.set_text(&msg);
             w.announce(&msg, AccessibleAnnouncementPriority::Medium);
         });
     }
@@ -270,11 +248,7 @@ impl WayfinderWindow {
 
                 // Restore previous selection for this directory if we've
                 // visited it before this session, otherwise start at 0.
-                let remembered = imp
-                    .last_position
-                    .borrow()
-                    .get(path)
-                    .cloned();
+                let remembered = imp.last_position.borrow().get(path).cloned();
                 let mut selected_pos: u32 = 0;
                 if let Some(name) = remembered {
                     let model = &imp.model.filter_model;
@@ -404,13 +378,14 @@ impl WayfinderWindow {
     }
 
     /// List the current folder again and update it in place, keeping the
-    /// selection; then update the status bar and run `after`. Doesn't
-    /// block: on a slow mount the list catches up when rclone answers.
-    pub fn reload_current(&self, after: impl FnOnce(&Self) + 'static) {
+    /// selection; then update the status bar. Doesn't block: on a slow
+    /// mount the list catches up when rclone answers.
+    pub fn reload_current(&self) {
         let w = self.clone();
-        self.imp().model.refresh(move || {
-            w.update_status();
-            after(&w);
+        self.imp().model.refresh(move |listed| {
+            if listed {
+                w.update_status();
+            }
         });
     }
 
@@ -591,7 +566,9 @@ impl WayfinderWindow {
             let gio_file = gio::File::for_path(&path);
             let app = gio::AppInfo::default_for_type(&file.mime_type(), false);
             let launched = match app {
-                Some(app) => app.launch(&[gio_file], Some(&ctx)).map_err(|e| e.to_string()),
+                Some(app) => app
+                    .launch(&[gio_file], Some(&ctx))
+                    .map_err(|e| e.to_string()),
                 None => Err("no application for this type".to_string()),
             };
             if let Err(e) = launched {
@@ -956,8 +933,7 @@ impl WayfinderWindow {
         let any_src_rclone = source_paths
             .iter()
             .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some());
-        let dest_rclone =
-            wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
+        let dest_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
         let use_rclone = (any_src_rclone || dest_rclone)
             && wayfinder::rclone_ops::rclone_available()
             && !source_paths.is_empty();
@@ -971,7 +947,7 @@ impl WayfinderWindow {
             let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
                 // Move guard into the closure so it drops here on success.
                 let _g = guard;
-                w.reload_current(|_| {});
+                w.reload_current();
             }));
             match state.operation {
                 ClipboardOperation::Copy => {
@@ -999,11 +975,10 @@ impl WayfinderWindow {
             for source in &state.files {
                 let w = self.clone();
                 let guard_held = shared_guard.clone();
-                let reload: Option<Box<dyn FnOnce() + 'static>> =
-                    Some(Box::new(move || {
-                        let _g = guard_held;
-                        w.reload_current(|_| {});
-                    }));
+                let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                    let _g = guard_held;
+                    w.reload_current();
+                }));
                 match state.operation {
                     ClipboardOperation::Copy => {
                         wayfinder::file_ops::copy_with_progress(
@@ -1064,11 +1039,13 @@ impl WayfinderWindow {
             return;
         }
 
-        // Remember position before deletion
-        let old_pos = self.imp().selection.selected();
+        let from = RemovedFrom::here(self);
 
         let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
-        self.imp().trashing.borrow_mut().extend(paths.iter().cloned());
+        self.imp()
+            .trashing
+            .borrow_mut()
+            .extend(paths.iter().cloned());
         let count = paths.len();
         self.run_blocking(
             &paths[0].clone(),
@@ -1084,7 +1061,11 @@ impl WayfinderWindow {
                         })
                         .collect::<Vec<_>>()
                 })
-                .unwrap_or_else(|_| (0..count).map(|_| Err("internal error".to_string())).collect())
+                .unwrap_or_else(|_| {
+                    (0..count)
+                        .map(|_| Err("internal error".to_string()))
+                        .collect()
+                })
             },
             move |w, results| {
                 {
@@ -1093,7 +1074,7 @@ impl WayfinderWindow {
                         trashing.remove(&f.path());
                     }
                 }
-                w.finish_trash(files, old_pos, results)
+                w.finish_trash(files, from, results)
             },
         );
     }
@@ -1101,7 +1082,7 @@ impl WayfinderWindow {
     fn finish_trash(
         &self,
         files: Vec<FileObject>,
-        old_pos: u32,
+        from: RemovedFrom,
         results: Vec<Result<wayfinder::file_ops::TrashResult, String>>,
     ) {
         let imp = self.imp();
@@ -1156,6 +1137,7 @@ impl WayfinderWindow {
                 .collect();
             let file_path_dirs: Vec<bool> =
                 needs_perm_delete.iter().map(|f| f.is_directory()).collect();
+            let from = from.clone();
 
             dialog.choose(
                 Some(&window.clone()),
@@ -1176,14 +1158,10 @@ impl WayfinderWindow {
                                     .zip(file_path_dirs.iter())
                                     .map(|((_, p), d)| (p.clone(), *d))
                                     .collect();
-                                run_rclone_direct_delete(
-                                    &window,
-                                    rclone_items,
-                                    0,
-                                );
+                                run_rclone_direct_delete(&window, rclone_items, from);
                             } else {
                                 // Other FUSE mounts: threaded std::fs delete.
-                                run_threaded_delete(&window, file_paths, 0);
+                                run_threaded_delete(&window, file_paths, from);
                             }
                         }
                     }
@@ -1209,34 +1187,21 @@ impl WayfinderWindow {
                     AccessibleAnnouncementPriority::High,
                 );
             }
-            if success == 0 && needs_perm_delete.is_empty() {
-                return;
-            }
         }
-
-        imp.file_selection.borrow_mut().clear();
-        self.update_status();
+        if success == 0 {
+            // Nothing left the folder; a permanent delete (if confirmed)
+            // reloads and selects for itself.
+            return;
+        }
 
         // Refresh, then focus the item above the deleted one (or the new
         // last item) and confirm.
         let first_name = files[0].name();
-        self.reload_current(move |w| {
-            let imp = w.imp();
-            let n_items = imp.selection.n_items();
-            if n_items > 0 {
-                let new_pos = if old_pos > 0 && old_pos >= n_items {
-                    n_items - 1
-                } else if old_pos > 0 {
-                    old_pos - 1
-                } else {
-                    0
-                };
-                imp.selection.set_selected(new_pos);
-                w.restore_focus_to_selected();
-            }
-
+        self.reload_after_removal(from, move |w, relisted| {
             if failed == 0 && success > 0 {
-                let now_empty = imp.selection.n_items() == 0;
+                // Unless the folder was just listed again, the current
+                // view's emptiness says nothing about it.
+                let now_empty = relisted && w.imp().selection.n_items() == 0;
                 let msg = if success == 1 {
                     if now_empty {
                         format!("Moved {first_name} to Bin, folder is now empty")
@@ -1249,8 +1214,66 @@ impl WayfinderWindow {
                     format!("Moved {success} files to Bin")
                 };
 
-                w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                if relisted {
+                    w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                } else {
+                    w.announce_after_navigation(msg);
+                }
             }
+        });
+    }
+
+    /// After items were removed `from` a folder: list it again, select the
+    /// item above the removed one (or the new last item), then run `after`,
+    /// told whether that happened. It doesn't if the user went elsewhere
+    /// while a slow mount answered (even if they came back), or if a
+    /// navigation gets in before the listing; `after` runs either way.
+    fn reload_after_removal(&self, from: RemovedFrom, after: impl FnOnce(&Self, bool) + 'static) {
+        let model = &self.imp().model;
+        if model.current_path() != from.folder {
+            after(self, false);
+            return;
+        }
+        if model.generation() == from.generation {
+            self.imp().file_selection.borrow_mut().clear();
+            self.update_status();
+        }
+        let w = self.clone();
+        model.refresh(move |listed| {
+            let relisted = listed && w.imp().model.generation() == from.generation;
+            if listed {
+                w.update_status();
+            }
+            if relisted {
+                w.select_near_removed(from.old_pos);
+            }
+            after(&w, relisted);
+        });
+    }
+
+    /// Select the item above one removed from `old_pos`, or the new last
+    /// item, and focus it.
+    fn select_near_removed(&self, old_pos: u32) {
+        let imp = self.imp();
+        if let Some(pos) = position_near_removed(old_pos, imp.selection.n_items()) {
+            imp.selection.set_selected(pos);
+            self.restore_focus_to_selected();
+        }
+    }
+
+    /// Announce `msg` once a navigation under way has finished, so it comes
+    /// after that folder's "Opened" announcement instead of with it.
+    fn announce_after_navigation(&self, msg: String) {
+        let w = self.clone();
+        let mut polls = 0;
+        glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
+            polls += 1;
+            // Don't wait forever on a mount that has stopped answering.
+            if w.imp().model.is_loading() && polls < 40 {
+                return glib::ControlFlow::Continue;
+            }
+            w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+            glib::ControlFlow::Break
         });
     }
 
@@ -1261,7 +1284,7 @@ impl WayfinderWindow {
         }
 
         let window = self.clone();
-        let old_pos = self.imp().selection.selected();
+        let from = RemovedFrom::here(self);
         let count = files.len();
 
         let message = if count == 1 {
@@ -1303,11 +1326,7 @@ impl WayfinderWindow {
                                 .zip(file_path_dirs.iter())
                                 .map(|((_, p), d)| (p.clone(), *d))
                                 .collect();
-                            run_rclone_direct_delete(
-                                &window,
-                                rclone_items,
-                                old_pos,
-                            );
+                            run_rclone_direct_delete(&window, rclone_items, from);
                             return;
                         }
 
@@ -1317,7 +1336,7 @@ impl WayfinderWindow {
                         // UI stays responsive.
                         let any_slow = file_paths.iter().any(|(_, p)| is_fuse_mount(p));
                         if any_slow {
-                            run_threaded_delete(&window, file_paths, old_pos);
+                            run_threaded_delete(&window, file_paths, from);
                             return;
                         }
 
@@ -1355,18 +1374,7 @@ impl WayfinderWindow {
                             window.imp().file_selection.borrow_mut().clear();
                             window.update_status();
 
-                            let n_items = window.imp().selection.n_items();
-                            if n_items > 0 {
-                                let new_pos = if old_pos > 0 && old_pos >= n_items {
-                                    n_items - 1
-                                } else if old_pos > 0 {
-                                    old_pos - 1
-                                } else {
-                                    0
-                                };
-                                window.imp().selection.set_selected(new_pos);
-                                window.restore_focus_to_selected();
-                            }
+                            window.select_near_removed(from.old_pos);
 
                             if failed == 0 {
                                 let msg = if success == 1 {
@@ -1460,10 +1468,9 @@ impl WayfinderWindow {
                     .map(|p| p.join(&new_name).to_string_lossy().to_string())
                     .unwrap_or_else(|| new_name.clone());
                 let w_done = w.clone();
-                let on_complete: Option<Box<dyn FnOnce() + 'static>> =
-                    Some(Box::new(move || {
-                        w_done.reload_current(|_| {});
-                    }));
+                let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                    w_done.reload_current();
+                }));
                 wayfinder::rclone_ops::rename_with_progress(
                     file_path.clone(),
                     new_path,
@@ -1490,7 +1497,7 @@ impl WayfinderWindow {
                             AccessibleAnnouncementPriority::Medium,
                         );
                         // Reload directory as fallback in case file monitor doesn't catch the rename
-                        w.reload_current(|_| {});
+                        w.reload_current();
                     }
                     Err(e) => {
                         w.announce(
@@ -1730,19 +1737,14 @@ impl WayfinderWindow {
                 let parent: gtk::Window = w.clone().upcast();
                 let w_done = w.clone();
                 let pair_count = pairs.len();
-                let on_complete: Option<Box<dyn FnOnce() + 'static>> =
-                    Some(Box::new(move || {
-                        w_done.reload_current(|_| {});
-                        w_done.announce(
-                            &format!("Renamed {pair_count} files"),
-                            AccessibleAnnouncementPriority::Medium,
-                        );
-                    }));
-                wayfinder::rclone_ops::batch_rename_with_progress(
-                    pairs,
-                    &parent,
-                    on_complete,
-                );
+                let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                    w_done.reload_current();
+                    w_done.announce(
+                        &format!("Renamed {pair_count} files"),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                }));
+                wayfinder::rclone_ops::batch_rename_with_progress(pairs, &parent, on_complete);
                 d.close();
                 return;
             }
@@ -1779,7 +1781,7 @@ impl WayfinderWindow {
                     w.announce(&msg, AccessibleAnnouncementPriority::Medium);
 
                     // Reload directory
-                    w.reload_current(|_| {});
+                    w.reload_current();
                 },
             );
         });
@@ -1831,7 +1833,7 @@ impl WayfinderWindow {
         let w = self.clone();
         let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
             let _g = guard;
-            w.reload_current(|_| {});
+            w.reload_current();
         }));
 
         let src_rclone = wayfinder::rclone_ops::rclone_for_path(&path).is_some();
@@ -1920,7 +1922,7 @@ impl WayfinderWindow {
                             AccessibleAnnouncementPriority::Medium,
                         );
                         // Reload directory as fallback in case file monitor doesn't catch the new folder
-                        w.reload_current(|_| {});
+                        w.reload_current();
                     }
                     Err(e) => {
                         w.announce(
@@ -2006,7 +2008,7 @@ impl WayfinderWindow {
 
         if restored > 0 {
             // Reload directory to show restored files
-            self.reload_current(|_| {});
+            self.reload_current();
 
             if restored == 1 {
                 self.announce(
@@ -2408,12 +2410,33 @@ fn is_fuse_mount(path: &str) -> bool {
     wayfinder::rclone_ops::is_fuse_path(path)
 }
 
+/// Where items are being removed from, to select near them afterwards.
+#[derive(Clone)]
+struct RemovedFrom {
+    folder: String,
+    /// The navigation then; a new one means the user has been elsewhere.
+    generation: u64,
+    /// The position selected then.
+    old_pos: u32,
+}
+
+impl RemovedFrom {
+    fn here(window: &WayfinderWindow) -> Self {
+        let imp = window.imp();
+        Self {
+            folder: imp.model.current_path(),
+            generation: imp.model.generation(),
+            old_pos: imp.selection.selected(),
+        }
+    }
+}
+
 /// Spawn a threaded delete with a non-modal progress dialog. Used for
 /// FUSE mounts where each per-file delete may take seconds.
 fn run_threaded_delete(
     window: &WayfinderWindow,
     file_paths: Vec<(String, String)>,
-    old_pos: u32,
+    from: RemovedFrom,
 ) {
     let parent: gtk::Window = window.clone().upcast();
     let paths: Vec<String> = file_paths.iter().map(|(_, p)| p.clone()).collect();
@@ -2422,23 +2445,9 @@ fn run_threaded_delete(
     let win = window.clone();
     let on_complete: Option<Box<dyn FnOnce(usize, usize) + 'static>> =
         Some(Box::new(move |success, failed| {
-            // Reload the current directory so the UI reflects the deletions,
-            // then restore focus near the previous position.
-            win.imp().file_selection.borrow_mut().clear();
-            win.reload_current(move |win| {
-                let n_items = win.imp().selection.n_items();
-                if n_items > 0 {
-                    let new_pos = if old_pos > 0 && old_pos >= n_items {
-                        n_items - 1
-                    } else if old_pos > 0 {
-                        old_pos - 1
-                    } else {
-                        0
-                    };
-                    win.imp().selection.set_selected(new_pos);
-                    win.restore_focus_to_selected();
-                }
-            });
+            // Reload so the UI reflects the deletions, then restore focus
+            // near the previous position.
+            win.reload_after_removal(from, |_, _| {});
 
             // Announce outcome
             if failed == 0 && success > 0 {
@@ -2459,10 +2468,7 @@ fn run_threaded_delete(
                     AccessibleAnnouncementPriority::High,
                 );
             } else {
-                win.announce(
-                    "Deletion cancelled",
-                    AccessibleAnnouncementPriority::Medium,
-                );
+                win.announce("Deletion cancelled", AccessibleAnnouncementPriority::Medium);
             }
         }));
     wayfinder::file_ops::delete_with_progress(paths, &parent, on_complete);
@@ -2474,29 +2480,54 @@ fn run_threaded_delete(
 fn run_rclone_direct_delete(
     window: &WayfinderWindow,
     rclone_items: Vec<(String, bool)>,
-    old_pos: u32,
+    from: RemovedFrom,
 ) {
     let parent: gtk::Window = window.clone().upcast();
     let win = window.clone();
     let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-        win.imp().file_selection.borrow_mut().clear();
-        win.reload_current(move |win| {
-            let n_items = win.imp().selection.n_items();
-            if n_items > 0 {
-                let new_pos = if old_pos > 0 && old_pos >= n_items {
-                    n_items - 1
-                } else if old_pos > 0 {
-                    old_pos - 1
-                } else {
-                    0
-                };
-                win.imp().selection.set_selected(new_pos);
-                win.restore_focus_to_selected();
-            }
-        });
+        win.reload_after_removal(from, |_, _| {});
         // The progress dialog already announced success/failure — don't
         // override it with a misleading "Deleted N" if rclone errored or
         // the user cancelled.
     }));
     wayfinder::rclone_ops::delete_with_progress(rclone_items, &parent, on_complete);
+}
+
+/// Where to put the selection after removing the item at `old_pos`, with
+/// `n_items` left: the item above it, or the new last item. `None` if
+/// nothing is left.
+fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
+    if n_items == 0 {
+        None
+    } else if old_pos == 0 {
+        Some(0)
+    } else {
+        Some((old_pos - 1).min(n_items - 1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::position_near_removed;
+
+    #[test]
+    fn selection_moves_to_the_item_above() {
+        assert_eq!(position_near_removed(5, 10), Some(4));
+    }
+
+    #[test]
+    fn removing_the_first_item_keeps_the_top() {
+        assert_eq!(position_near_removed(0, 10), Some(0));
+    }
+
+    #[test]
+    fn removing_from_the_end_selects_the_new_last_item() {
+        // Three removed from the end of ten: positions 7..9 gone.
+        assert_eq!(position_near_removed(9, 7), Some(6));
+    }
+
+    #[test]
+    fn nothing_left_selects_nothing() {
+        assert_eq!(position_near_removed(3, 0), None);
+    }
 }

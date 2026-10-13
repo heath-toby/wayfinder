@@ -13,7 +13,13 @@ cargo fmt                      # Format
 cargo run                      # Run main file manager
 ```
 
-Two binaries: `wayfinder` (main app) and `wayfinder-portal` (XDG Desktop Portal backend). No test suite.
+Two binaries: `wayfinder` (main app) and `wayfinder-portal` (XDG Desktop Portal backend).
+
+```bash
+cargo test                     # Unit tests (no display needed)
+```
+
+Unit tests cover logic that can run without GTK: path completion (`path_complete.rs`), location naming (`file_model::display_name`), selection after removal (`window/mod.rs`), and the suspend-time download retry (`offline/sleep.rs`). When fixing a bug in logic like this, move it into a plain function and add a test that fails without the fix.
 
 ## Architecture
 
@@ -49,7 +55,7 @@ GObject types (`gio::ListStore`, `gio::FileInfo`, `gtk::CustomSorter`) are **NOT
 
 This pattern appears in: directory loading, folder size calculation, FUSE async file monitor, D-Bus service, portal backend, custom action completion announcements, compress dialog.
 
-**Directory loading never blocks the main thread.** `DirectoryModel::load_directory(path, resolve, on_done)` lists on a worker thread and waits at most 100 ms (`SYNC_WAIT`) before returning; local folders finish within that, so `on_done` usually runs synchronously. Slower ones finish in the background: `is_loading()` is true meanwhile and the window shows/announces "Waiting for rclone to open X. Press Alt+Left to go back." Every navigation bumps `generation()`, and results of superseded loads are dropped (the blocked syscall can't be cancelled, only abandoned). Callers must not assume the store is populated after `load_directory` returns — put follow-up work in `on_done`. Reloads after file operations use `WayfinderWindow::reload_current(after)` → `DirectoryModel::refresh`, which updates the store in place (diff by path) so the selection survives. `DirectoryModel` is `Clone`; clones share state.
+**Directory loading never blocks the main thread.** `DirectoryModel::load_directory(path, resolve, on_done)` lists on a worker thread and waits at most 100 ms (`SYNC_WAIT`) before returning; local folders finish within that, so `on_done` usually runs synchronously. Slower ones finish in the background: `is_loading()` is true meanwhile and the window shows/announces "Waiting for rclone to open X. Press Alt+Left to go back." Every navigation bumps `generation()`, and results of superseded loads are dropped (the blocked syscall can't be cancelled, only abandoned). Callers must not assume the store is populated after `load_directory` returns — put follow-up work in `on_done`. Reloads after file operations use `WayfinderWindow::reload_current()` → `DirectoryModel::refresh(on_done)`, which updates the store in place (diff by path) so the selection survives. `refresh`'s `on_done` always runs, with `true` only if a fresh listing was applied; after removing files, use `reload_after_removal`, which re-selects near them. `DirectoryModel` is `Clone`; clones share state.
 
 **Thread-safe data extraction**: `FileInfoData` struct (plain `String`/`u64`/`i64`/`bool`) is extracted from `gio::FileInfo` on worker threads, sent through channels, then converted to `FileObject` on the main thread via `FileObject::from_data()`.
 

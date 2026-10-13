@@ -6,6 +6,7 @@ pub mod file_object;
 pub mod file_ops;
 pub mod navigation;
 pub mod offline;
+pub mod path_complete;
 pub mod rclone_ops;
 pub mod rclone_sync;
 pub mod search;

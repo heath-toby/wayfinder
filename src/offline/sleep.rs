@@ -21,6 +21,9 @@ static START: Once = Once::new();
 /// it: a child reading the mount when the session freezes would make the
 /// suspend fail just as an in-process read would.
 static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+/// Set when the child was killed for sleep, so its exit isn't taken for a
+/// failed download but for an interruption: it's run again after resume.
+static KILLED: AtomicBool = AtomicBool::new(false);
 
 /// Longest we hold up a suspend waiting for an in-flight step to finish.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
@@ -39,10 +42,38 @@ pub(super) fn io_step() -> MutexGuard<'static, ()> {
 }
 
 /// Run `cmd` to completion as one I/O step: it waits while sleep is
-/// pending, and is killed if sleep begins while it runs.
-pub(super) fn run_child(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
-    let _io = io_step();
-    *CHILD.lock().unwrap_or_else(|e| e.into_inner()) = Some(cmd.spawn()?);
+/// pending, and if sleep begins while it runs it's killed and run again
+/// after resume.
+pub(super) fn run_child(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        let _io = io_step();
+        let child = cmd.spawn()?;
+        {
+            let mut slot = CHILD.lock().unwrap_or_else(|e| e.into_inner());
+            KILLED.store(false, Ordering::SeqCst);
+            let child = slot.insert(child);
+            // Sleep may have begun since `io_step` looked, before the
+            // child was here for `pause` to find: stop it ourselves.
+            if PAUSED.load(Ordering::SeqCst) {
+                KILLED.store(true, Ordering::SeqCst);
+                let _ = child.kill();
+            }
+        }
+        let status = wait_child()?;
+        // A child that finished just before it was killed keeps its
+        // result: a killed one can't have succeeded.
+        if KILLED.swap(false, Ordering::SeqCst) && !status.success() {
+            continue;
+        }
+        return Ok(status);
+    }
+}
+
+/// Wait for the child in CHILD to exit, without holding the lock while it
+/// runs (so `pause` can get at it).
+fn wait_child() -> std::io::Result<std::process::ExitStatus> {
     loop {
         {
             let mut slot = CHILD.lock().unwrap_or_else(|e| e.into_inner());
@@ -56,6 +87,21 @@ pub(super) fn run_child(cmd: &mut std::process::Command) -> std::io::Result<std:
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Sleep is about to begin: hold off new I/O steps and stop a download in
+/// progress.
+fn pause() {
+    PAUSED.store(true, Ordering::SeqCst);
+    if let Some(child) = CHILD.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        KILLED.store(true, Ordering::SeqCst);
+        let _ = child.kill();
+    }
+}
+
+/// Back from sleep: let I/O steps continue.
+fn resume() {
+    PAUSED.store(false, Ordering::SeqCst);
 }
 
 /// Start watching logind for sleep, once per process.
@@ -113,11 +159,7 @@ async fn watch() -> zbus::Result<()> {
             continue;
         };
         if going_down {
-            PAUSED.store(true, Ordering::SeqCst);
-            // Stop a download in progress; it's fetched again next time.
-            if let Some(child) = CHILD.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                let _ = child.kill();
-            }
+            pause();
             // Wait for any in-flight step to finish. Once we get the lock,
             // the worker will see PAUSED before its next step.
             let deadline = Instant::now() + DRAIN_TIMEOUT;
@@ -126,7 +168,7 @@ async fn watch() -> zbus::Result<()> {
             }
             inhibitor = None;
         } else {
-            PAUSED.store(false, Ordering::SeqCst);
+            resume();
             if inhibitor.is_none() {
                 inhibitor = take_inhibitor(&conn).await.ok();
             }
@@ -134,4 +176,31 @@ async fn watch() -> zbus::Result<()> {
     }
     drop(inhibitor);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A download stopped for sleep is run again after resume, and its
+    /// caller just sees it succeed.
+    #[test]
+    fn child_killed_for_sleep_runs_again_after_resume() {
+        let started = Instant::now();
+        let sleeper = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            pause();
+            std::thread::sleep(Duration::from_millis(300));
+            resume();
+        });
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 0.5"]);
+        let status = run_child(&mut cmd).expect("run_child");
+        sleeper.join().unwrap();
+        assert!(status.success());
+        // Killed at 0.2 s, run again from 0.5 s for 0.5 s.
+        assert!(started.elapsed() >= Duration::from_millis(950));
+        assert!(!KILLED.load(Ordering::SeqCst));
+        assert!(CHILD.lock().unwrap().is_none());
+    }
 }

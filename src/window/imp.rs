@@ -934,27 +934,28 @@ impl WayfinderWindowInner {
                     let entry = entry_for_tab.clone();
                     let dlg = dlg_for_tab.clone();
                     let dlg_slow = dlg_for_tab.clone();
-                    let expanded = match (text.strip_prefix('~'), dirs::home_dir()) {
-                        (Some(rest), Some(home)) => format!("{}{rest}", home.to_string_lossy()),
-                        _ => text.clone(),
-                    };
-                    let waiting = wayfinder::background::waiting_message(&expanded);
+                    let waiting = wayfinder::background::waiting_message(
+                        &wayfinder::path_complete::expand_tilde(&text),
+                    );
                     let typed = text.clone();
                     wayfinder::background::run(
-                        move || complete_path(&typed),
+                        move || wayfinder::path_complete::complete(&typed),
                         move |completed| {
                             if entry.text() != text.as_str() {
                                 return;
                             }
                             if let Some(completed) = completed {
-                                let added = &completed[text.len()..];
+                                let added = wayfinder::path_complete::added_text(&text, &completed);
                                 entry.set_text(&completed);
                                 entry.set_position(-1);
                                 if !added.is_empty() {
                                     dlg.announce(added, AccessibleAnnouncementPriority::Medium);
                                 }
                             } else if text.contains('/') {
-                                dlg.announce("No completions", AccessibleAnnouncementPriority::Medium);
+                                dlg.announce(
+                                    "No completions",
+                                    AccessibleAnnouncementPriority::Medium,
+                                );
                             }
                         },
                         move || {
@@ -979,14 +980,7 @@ impl WayfinderWindowInner {
             let entry_clone = entry.clone();
             let w = window.clone();
             let do_go = move || {
-                let text = entry_clone.text().to_string();
-                let path = if text.starts_with('~') {
-                    dirs::home_dir()
-                        .map(|h| text.replacen('~', &h.to_string_lossy(), 1))
-                        .unwrap_or(text)
-                } else {
-                    text
-                };
+                let path = wayfinder::path_complete::expand_tilde(&entry_clone.text());
                 w.navigate_to_path(&path);
                 d.close();
             };
@@ -1601,96 +1595,4 @@ impl WayfinderWindowInner {
             }
         });
     }
-}
-
-fn complete_path(partial: &str) -> Option<String> {
-    let expanded = if partial.starts_with('~') {
-        let home = dirs::home_dir()?;
-        partial.replacen('~', &home.to_string_lossy(), 1)
-    } else {
-        partial.to_string()
-    };
-
-    let (dir_str, prefix) = if expanded.ends_with('/') {
-        (expanded.as_str(), "")
-    } else {
-        let p = std::path::Path::new(&expanded);
-        let dir = p.parent()?.to_str()?;
-        let prefix = p.file_name()?.to_str()?;
-        (dir, prefix)
-    };
-
-    let dir = if dir_str.is_empty() { "." } else { dir_str };
-    let entries = std::fs::read_dir(dir).ok()?;
-
-    let prefix_lower = prefix.to_lowercase();
-    let mut matches: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            // Skip hidden unless prefix starts with .
-            if name.starts_with('.') && !prefix.starts_with('.') {
-                return None;
-            }
-            if name.to_lowercase().starts_with(&prefix_lower) {
-                let full = if dir_str.ends_with('/') || dir_str.is_empty() {
-                    format!("{dir_str}{name}")
-                } else {
-                    format!("{dir_str}/{name}")
-                };
-                // Add trailing / for directories
-                let full = if e.file_type().ok()?.is_dir() {
-                    format!("{full}/")
-                } else {
-                    full
-                };
-                Some(full)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    matches.sort();
-
-    if matches.is_empty() {
-        return None;
-    }
-
-    if matches.len() == 1 {
-        let result = &matches[0];
-        // Convert back to ~ if applicable
-        if let Some(home) = dirs::home_dir() {
-            let home_str = home.to_string_lossy();
-            if result.starts_with(home_str.as_ref()) {
-                return Some(result.replacen(home_str.as_ref(), "~", 1));
-            }
-        }
-        return Some(result.clone());
-    }
-
-    // Multiple matches — find longest common prefix
-    let first = &matches[0];
-    let mut common_len = first.len();
-    for m in &matches[1..] {
-        common_len = first
-            .chars()
-            .zip(m.chars())
-            .take(common_len)
-            .take_while(|(a, b)| a == b)
-            .count();
-    }
-
-    let common = &first[..common_len];
-    if common.len() > expanded.len() {
-        if let Some(home) = dirs::home_dir() {
-            let home_str = home.to_string_lossy();
-            if common.starts_with(home_str.as_ref()) {
-                return Some(common.replacen(home_str.as_ref(), "~", 1));
-            }
-        }
-        return Some(common.to_string());
-    }
-
-    None
 }

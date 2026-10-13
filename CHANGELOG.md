@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.5.1
+
+### Fixed
+
+- **Crash in Go to Location** — pressing Tab after typing a full path inside your home folder (such as `/home/you/Docu`), or after a name with accented letters, could close Wayfinder. Completions now keep the form you typed: `~/…` stays `~/…`, and a full path stays a full path.
+- **`~` in Go to Location** — only `~` on its own or `~/…` stands for your home folder, so `~bob` is no longer turned into a path inside it, and a folder next to home such as `/home/youx` is no longer shown as `~x`.
+- **Selection after Move to Bin or Delete on a slow mount** — if you have gone to another folder by the time the mount answers, your selection there is left alone instead of jumping. "Folder is now empty" is only said when it's true, and "Moved to Bin" is still announced (after the new folder's "Opened" message rather than over it).
+- **Permanent delete after Move to Bin fails** — when a file on a mount can't go to the Bin and you delete it permanently, the selection lands near it instead of at the top of the list, and the selection no longer moves while the "Delete permanently?" question is open.
+- **Suspend during an offline refresh** — a download stopped for sleep is fetched again after resume, and the rest of the pinned folder carries on, instead of the refresh stopping there or falling back to copying through the mount. A download that had already finished is kept.
+- **Waiting messages** — opening the Bin or Recent Files slowly now says "Waiting for the Bin to open" rather than "trash:".
+
+### Development
+
+- **Unit tests** — `cargo test` now covers path completion, location naming, selection after removing files, and restarting an offline download after suspend.
+
 ## 2.5.0
 
 ### FUSE / rclone mount support
