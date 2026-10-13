@@ -222,6 +222,15 @@ pub(super) fn forget(path: &str) {
     });
 }
 
+/// Drop the cached listings of `path` and every location inside it.
+pub(super) fn forget_under(path: &str) {
+    let inside = format!("{}/", path.trim_end_matches('/'));
+    CACHE.with(|c| {
+        c.borrow_mut()
+            .retain(|location, _| location != path && !location.starts_with(&inside));
+    });
+}
+
 /// Fetch a FUSE folder's listing into the cache in the background, so
 /// opening it is instant. One prefetch at a time — until its thread really
 /// returns, so a mount that has stopped answering doesn't collect a stuck
@@ -283,6 +292,25 @@ mod tests {
         let path = "/nonexistent-wayfinder-test/Docs";
         store(&listing(path, path));
         assert!(cached(path).is_none());
+    }
+
+    #[test]
+    fn removing_a_folder_forgets_everything_inside_it() {
+        let cached_at = |p: &str| CACHE.with(|c| c.borrow().contains_key(p));
+        for p in [
+            "/t-wf/Docs/Old",
+            "/t-wf/Docs/Old/Sub",
+            "/t-wf/Docs/Older",
+            "/t-wf/Docs",
+        ] {
+            store(&listing(p, p));
+        }
+        forget_under("/t-wf/Docs/Old");
+        assert!(!cached_at("/t-wf/Docs/Old"));
+        assert!(!cached_at("/t-wf/Docs/Old/Sub"));
+        // A sibling whose name merely starts the same, and the parent, stay.
+        assert!(cached_at("/t-wf/Docs/Older"));
+        assert!(cached_at("/t-wf/Docs"));
     }
 
     #[test]

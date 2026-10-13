@@ -15,8 +15,11 @@
 - **Offline copy after unmounting** — going back to a folder on a mount that has since been unmounted shows its "Keep Available Offline" copy again, rather than the folder as last seen and then an empty list.
 - **Folders deleted elsewhere** — reopening a recently seen folder on a mount that was deleted on another machine now says it can't be opened (or shows the offline copy), rather than quietly switching to its parent while the location bar still showed the old name.
 - **File chooser** — when a recently seen folder turns out to be gone, the file chooser now says so, and keeps its item count up to date when a folder changes.
-- **Status bar after a failed refresh** — the item count is brought up to date again, as before 2.5.0.
-- **`~` with an unusual home setting** — Tab completion of `~/…` works when `$HOME` ends in `/`.
+- **Status bar after a failed refresh** — the item count is brought up to date again, as before 2.5.0, while "Waiting for rclone… Press Alt+Left to go back" stays up for as long as a folder is still opening.
+- **Deleted folders reappearing** — going Forward into a folder you've just deleted no longer lists its old contents, and undoing a move to the Bin shows the restored files in their folders straight away.
+- **Cancelled deletes** — cancelling a permanent delete on a mount (or one where nothing could be deleted) no longer moves the selection.
+- **File chooser memory** — each file chooser dialog is freed when it closes; the portal no longer grows with every Open or Save dialog.
+- **`~` with an unusual home setting** — Tab completion of `~/…` works when `$HOME` ends in `/`, or is `/` itself.
 
 ### Development
 

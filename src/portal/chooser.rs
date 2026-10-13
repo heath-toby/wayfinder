@@ -180,16 +180,23 @@ pub fn show_chooser(
     // A cached folder's background check changed it, or found it can no
     // longer be listed (the list has been emptied): say so, as the main
     // window does.
+    // Weak references: the model holds these callbacks, so strong ones
+    // would keep the model and dialog alive after the dialog closes.
     {
-        let m = model.clone();
-        let sl = status_label.clone();
+        let m = Rc::downgrade(&model);
+        let sl = status_label.downgrade();
         model.set_on_background_update(move || {
-            sl.set_text(&format!("{} items", m.item_count()));
+            if let (Some(m), Some(sl)) = (m.upgrade(), sl.upgrade()) {
+                sl.set_text(&format!("{} items", m.item_count()));
+            }
         });
-        let sl = status_label.clone();
-        let window = dlg.clone();
+        let sl = status_label.downgrade();
+        let window = dlg.downgrade();
         model.set_on_background_error(move |location, e| {
             log::error!("Failed to refresh {location}: {e}");
+            let (Some(sl), Some(window)) = (sl.upgrade(), window.upgrade()) else {
+                return;
+            };
             sl.set_text("");
             window.announce(
                 &format!(

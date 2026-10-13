@@ -386,16 +386,13 @@ impl WayfinderWindow {
     }
 
     /// After files changed in `folders` (pasted into, moved out of, renamed
-    /// in): reload the current folder, and drop the cached listing of any
-    /// other one, so the user isn't shown it out of date if they went
-    /// elsewhere while a slow mount answered.
+    /// in): drop their cached listings, so none is shown out of date — if
+    /// the user went elsewhere while a slow mount answered, or the reload
+    /// is cut short — and reload the current folder.
     pub fn reload_after_change(&self, folders: &[String]) {
         let model = &self.imp().model;
-        let current = model.current_path();
         for folder in folders {
-            if *folder != current {
-                model.forget_cached(folder);
-            }
+            model.forget_cached(folder);
         }
         self.reload_current();
     }
@@ -429,6 +426,11 @@ impl WayfinderWindow {
 
     pub fn update_status(&self) {
         let imp = self.imp();
+        if imp.model.is_loading() {
+            // The status bar says what we're waiting for, and how to back
+            // out; there's no count to give yet.
+            return;
+        }
         let count = imp.model.item_count();
         let sel_count = imp.file_selection.borrow().count();
         let mut parts = vec![format!("{} items", count)];
@@ -1255,10 +1257,14 @@ impl WayfinderWindow {
     /// navigation gets in before the listing; `after` runs either way.
     fn reload_after_removal(&self, from: RemovedFrom, after: impl FnOnce(&Self, bool) + 'static) {
         let model = &self.imp().model;
+        // Cached listings still hold the removed items (and a removed
+        // folder's own contents); don't show them again, whether the user
+        // went elsewhere or the reload below is cut short.
+        model.forget_cached(&from.folder);
+        for path in &from.removed {
+            model.forget_cached_under(path);
+        }
         if model.current_path() != from.folder {
-            // Its cached listing still holds the removed items; don't show
-            // them when the user goes back.
-            model.forget_cached(&from.folder);
             after(self, false);
             return;
         }
@@ -2046,8 +2052,15 @@ impl WayfinderWindow {
         self.imp().last_trashed.borrow_mut().clear();
 
         if restored > 0 {
-            // Reload directory to show restored files
-            self.reload_current();
+            // Reload directory to show restored files, and drop the cached
+            // listings of the folders they went back to.
+            let mut folders: Vec<String> = Vec::new();
+            for parent in paths.iter().filter_map(|p| parent_dir(p)) {
+                if !folders.contains(&parent) {
+                    folders.push(parent);
+                }
+            }
+            self.reload_after_change(&folders);
 
             if restored == 1 {
                 self.announce(
@@ -2457,6 +2470,8 @@ struct RemovedFrom {
     generation: u64,
     /// The position selected then.
     old_pos: u32,
+    /// The items selected for removal.
+    removed: Vec<String>,
 }
 
 impl RemovedFrom {
@@ -2466,6 +2481,11 @@ impl RemovedFrom {
             folder: imp.model.current_path(),
             generation: imp.model.generation(),
             old_pos: imp.selection.selected(),
+            removed: window
+                .get_selected_files()
+                .iter()
+                .map(|f| f.path())
+                .collect(),
         }
     }
 }
@@ -2485,8 +2505,11 @@ fn run_threaded_delete(
     let on_complete: Option<Box<dyn FnOnce(usize, usize) + 'static>> =
         Some(Box::new(move |success, failed| {
             // Reload so the UI reflects the deletions, then restore focus
-            // near the previous position.
-            win.reload_after_removal(from, |_, _| {});
+            // near the previous position — unless nothing was deleted
+            // (cancelled, or every delete failed).
+            if success > 0 {
+                win.reload_after_removal(from, |_, _| {});
+            }
 
             // Announce outcome
             if failed == 0 && success > 0 {

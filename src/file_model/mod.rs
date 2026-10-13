@@ -221,7 +221,8 @@ impl DirectoryModel {
                 job,
                 Apply::Revalidate,
                 Box::new(move |outcome| {
-                    if outcome.is_none() {
+                    // Superseded, or failed (reported as an error instead).
+                    if !matches!(outcome, Some(Ok(_))) {
                         return;
                     }
                     if let Some(cb) = model.on_background_update.borrow().as_ref() {
@@ -320,6 +321,12 @@ impl DirectoryModel {
     /// while the user was elsewhere), so it isn't shown out of date.
     pub fn forget_cached(&self, path: &str) {
         loader::forget(path);
+    }
+
+    /// Drop the cached listings of `path` and every folder inside it (it
+    /// was removed or moved away).
+    pub fn forget_cached_under(&self, path: &str) {
+        loader::forget_under(path);
     }
 
     /// Changes with every navigation; lets callers tell whether the load

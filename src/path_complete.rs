@@ -28,19 +28,20 @@ pub fn added_text<'a>(typed: &str, completed: &'a str) -> &'a str {
     &completed[start..]
 }
 
-/// The home folder as text, without a trailing `/` (`$HOME` may have one).
+/// The home folder as text, without a trailing `/` (`$HOME` may have one):
+/// empty for `/` itself, so `~/x` becomes `/x`.
 fn home_text(home: &Path) -> String {
-    let home = home.to_string_lossy();
-    match home.trim_end_matches('/') {
-        "" => "/".to_string(),
-        trimmed => trimmed.to_string(),
-    }
+    home.to_string_lossy().trim_end_matches('/').to_string()
 }
 
 fn expand_with(text: &str, home: Option<&Path>) -> String {
     match (text.strip_prefix('~'), home) {
         (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-            format!("{}{rest}", home_text(home))
+            match format!("{}{rest}", home_text(home)) {
+                // `~` alone, with home at `/`.
+                expanded if expanded.is_empty() => "/".to_string(),
+                expanded => expanded,
+            }
         }
         _ => text.to_string(),
     }
@@ -49,6 +50,9 @@ fn expand_with(text: &str, home: Option<&Path>) -> String {
 /// Write `path` with `~` for the home folder, if it's in it.
 fn contract_with(path: &str, home: &Path) -> String {
     let home = home_text(home);
+    if path == "/" && home.is_empty() {
+        return "~".to_string();
+    }
     match path.strip_prefix(home.as_str()) {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
         _ => path.to_string(),
@@ -188,6 +192,15 @@ mod tests {
         let home = format!("{}/", f.home().display());
         let completed = complete_with("~/Dev", Some(Path::new(&home))).unwrap();
         assert_eq!(completed, "~/Development/");
+    }
+
+    #[test]
+    fn home_at_root() {
+        let home = Path::new("/");
+        assert_eq!(expand_with("~", Some(home)), "/");
+        assert_eq!(expand_with("~/Dev", Some(home)), "/Dev");
+        assert_eq!(contract_with("/Development/", home), "~/Development/");
+        assert_eq!(contract_with("/", home), "~");
     }
 
     #[test]
