@@ -477,6 +477,14 @@ pub fn show_chooser(
             if let Some(item) = sel_for_space.selected_item() {
                 if let Some(file) = item.downcast_ref::<FileObject>() {
                     // Choosing folders: only a folder; files: only a file.
+                    if file.is_directory() != directory_mode {
+                        let hint = if directory_mode {
+                            "Not a folder: choose a folder"
+                        } else {
+                            "That's a folder: press Enter to open it, Space on a file to choose it"
+                        };
+                        d.announce(hint, AccessibleAnnouncementPriority::Medium);
+                    }
                     if file.is_directory() == directory_mode {
                         *sf.borrow_mut() = Some(file.path());
                         if let Some(ref entry) = fn_entry {
@@ -512,6 +520,14 @@ pub fn show_chooser(
             if let Some(item) = sel_for_space2.selected_item() {
                 if let Some(file) = item.downcast_ref::<FileObject>() {
                     // Choosing folders: only a folder; files: only a file.
+                    if file.is_directory() != directory_mode {
+                        let hint = if directory_mode {
+                            "Not a folder: choose a folder"
+                        } else {
+                            "That's a folder: press Enter to open it, Space on a file to choose it"
+                        };
+                        d2.announce(hint, AccessibleAnnouncementPriority::Medium);
+                    }
                     if file.is_directory() == directory_mode {
                         *sf2.borrow_mut() = Some(file.path());
                         if let Some(ref entry) = fn_entry2 {

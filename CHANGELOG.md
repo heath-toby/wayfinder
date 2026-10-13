@@ -16,7 +16,6 @@
 - **Overwriting on rclone mounts** — pasting onto an rclone mount where a file or folder of the same name already exists now asks Skip, Replace or Rename, as everywhere else, instead of silently overwriting it; renaming to a name that's taken, or a batch rename that would give two files the same name, is refused.
 - **rclone copies and moves** — empty folders are copied and moved too, and moving a folder no longer leaves an empty copy of its folder tree behind. When rclone fails, its error message is read out in full.
 - **rclone mounts started with flags** — mounts started with options such as `--daemon` or `-v` before the remote name are recognised, so they get the faster direct rclone operations.
-- **Copying folders with links** — a folder containing a link to another folder is copied, the link as a link, instead of the whole copy failing.
 - **Copy and move messages** — after "Rename (keep both)", the announcement names the copy's new name; a cancelled copy is recognised as cancelled whatever the system language; and "Waiting for rclone" is said if checking for a clash takes a moment.
 - **Responsiveness** — paste, delete and rename on many files no longer run `ps` once per file on the main thread, and emptying the Bin no longer freezes the window.
 - **Crash in Go to Location** — pressing Tab after typing a full path inside your home folder (such as `/home/you/Docu`), or after a name with accented letters, could close Wayfinder. Completions now keep the form you typed: `~/…` stays `~/…`, and a full path stays a full path.
@@ -48,9 +47,8 @@
 - **Compress** — file names beginning with `-` are no longer mistaken for options, and an existing archive of the same name is reported instead of being added to or replaced.
 - **File chooser (portal)** — Back, Forward and Up no longer crash it. The chosen file is passed to the app correctly when its name has spaces, `#`, `%` or accented letters (it could open the wrong file). Saving over an existing file asks first. A file chosen in one folder is no longer returned after moving to another, the selected file is shown and read out, and when choosing a folder, the folder being shown can be chosen. Enter in the file name field saves; Escape cancels.
 - **Dates** — Date Modified (and the date in Properties) is shown in local time; it was shown in UTC, off by the time zone.
-- **Links to folders** — are listed, sorted and opened as folders, rather than as files that opened in another app (without reading anything through a link onto a mount). Copying a link copies the link — or, onto drives that can't hold links (USB sticks, cloud drives), the file it points to.
+- **Copying links** — a link is copied as a link, so a folder holding a link to a folder copies instead of failing; onto drives that can't hold links (USB sticks, cloud drives), a link to a file is copied as the file.
 - **Right-clicking among marked files** — right-clicking a file that isn't marked acts on that file and clears the marks, instead of acting on the marked files.
-- **Custom actions on several files** — an action that takes one file now opens them all at once, instead of each waiting for the previous one to be closed.
 - **Bin names** — files moved to the Bin from another drive are shown and read out by their own names, not a long encoded path.
 - **Sorting** — sorting by Size puts folders in order once their sizes are worked out; folders stay above files in a descending sort; and sorting by clicking a column's own header keeps the sort buttons (and what Orca reads) and the saved sort in step.
 - **Folder sizes** — a folder created while you're looking at its parent gets its size worked out (it said "Calculating..." for good), and the last folder's size can no longer go missing.

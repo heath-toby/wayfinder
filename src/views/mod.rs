@@ -6,6 +6,16 @@ pub use list_view::WayfinderListView;
 
 use gtk::prelude::*;
 
+thread_local! {
+    static RIGHT_CLICKED_ITEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the right-click being handled landed on an item (and so
+/// selected it). Reading it resets it.
+pub fn take_right_clicked_item() -> bool {
+    RIGHT_CLICKED_ITEM.with(|c| c.replace(false))
+}
+
 /// Right-clicking an item selects it first, so the context menu (opened by
 /// the view's own right-click handler, which runs after this one) is for
 /// the item clicked, not whatever was selected before.
@@ -33,6 +43,7 @@ pub(crate) fn select_on_right_click(child: &impl IsA<gtk::Widget>, item: &gtk::L
             });
         if let Some(selection) = model.and_downcast::<gtk::SingleSelection>() {
             selection.set_selected(pos);
+            RIGHT_CLICKED_ITEM.with(|c| c.set(true));
         }
     });
     child.add_controller(gesture);

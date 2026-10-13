@@ -99,18 +99,6 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     found
 }
 
-/// Whether something is mounted exactly at `path` (from /proc/mounts).
-pub fn is_mountpoint(path: &str) -> bool {
-    let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
-        return false;
-    };
-    let path = path.trim_end_matches('/');
-    proc_mounts
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .any(|m| m.replace("\\040", " ") == path)
-}
-
 /// Filesystems mounted inside `path` (not at it): deleting `path` would
 /// reach into them — a whole remote drive, perhaps. By path, from
 /// /proc/mounts; no filesystem access.
@@ -184,7 +172,7 @@ fn parse_rclone_mount(line: &str, fuse_mounts: &[String]) -> Option<(String, Str
         .iter()
         .rev()
         .find(|&&i| !after_flag(i))
-        .or_else(|| candidates.last())
+        .or_else(|| candidates.first())
         .map(|&i| before[i])?;
     Some((args[mount_pos].to_string(), remote.to_string()))
 }

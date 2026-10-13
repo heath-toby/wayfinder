@@ -646,9 +646,9 @@ fn copy_directory_recursive(
 }
 
 /// Copy a file — a link as a link. Where the destination can't hold links
-/// (FAT drives, most cloud drives), copy what a link points to instead: a
-/// file; a link to a folder is left out (with a warning in the log) rather
-/// than failing the whole copy.
+/// (FAT drives, most cloud drives), a link to a file is copied as that
+/// file instead. A link to a folder that can't be made fails the copy, as
+/// any other error does: skipping it would let a move delete it.
 fn copy_keeping_links(
     src: &gio::File,
     dst: &gio::File,
@@ -669,21 +669,18 @@ fn copy_keeping_links(
         )
     };
     match copy(flags | gio::FileCopyFlags::NOFOLLOW_SYMLINKS) {
+        // Refused to make a link (not, say, a full disk or a name taken).
         Err(e)
-            if !e.matches(gio::IOErrorEnum::Cancelled)
+            if (e.matches(gio::IOErrorEnum::NotSupported)
+                || e.matches(gio::IOErrorEnum::PermissionDenied))
                 && src.query_file_type(
                     gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
                     Some(cancellable),
-                ) == gio::FileType::SymbolicLink =>
+                ) == gio::FileType::SymbolicLink
+                && src.query_file_type(gio::FileQueryInfoFlags::NONE, Some(cancellable))
+                    == gio::FileType::Regular =>
         {
-            if src.query_file_type(gio::FileQueryInfoFlags::NONE, Some(cancellable))
-                == gio::FileType::Directory
-            {
-                log::warn!("Not copied: {} is a link to a folder: {e}", src.uri());
-                Ok(())
-            } else {
-                copy(flags)
-            }
+            copy(flags)
         }
         other => other,
     }

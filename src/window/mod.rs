@@ -724,6 +724,11 @@ impl WayfinderWindow {
     /// menu's actions don't go to the marked files instead. (The Menu key
     /// keeps them: it's how the marked files get a menu.)
     pub fn drop_marks_unless_clicked_is_marked(&self) {
+        // Only when the click was on a file (it's selected by then); a
+        // click on empty space says nothing about the marks.
+        if !wayfinder::views::take_right_clicked_item() {
+            return;
+        }
         let Some(file) = self.get_selected_file() else {
             return;
         };
@@ -1481,14 +1486,15 @@ impl WayfinderWindow {
         // there too, and that one is meant to be changed.
         let current = std::path::PathBuf::from(self.imp().model.current_path());
         let in_cache = current.starts_with(wayfinder::offline::cache_root())
-            && !wayfinder::offline::in_sync_folder(&current);
-        if !self.imp().offline_view.get() && !in_cache {
+            && !wayfinder::offline::inside_sync_folder(&current);
+        let msg = if self.imp().offline_view.get() {
+            "This is the offline copy, shown while the drive can't be reached. It can't be changed here."
+        } else if in_cache {
+            "This is Wayfinder's store of offline copies. Changes here would be undone when they're next refreshed."
+        } else {
             return false;
-        }
-        self.announce(
-            "This is the offline copy, shown while the drive can't be reached. It can't be changed here.",
-            AccessibleAnnouncementPriority::High,
-        );
+        };
+        self.announce(msg, AccessibleAnnouncementPriority::High);
         true
     }
 
