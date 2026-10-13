@@ -138,7 +138,9 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Vec<String> {
         .iter()
         // Only a name, in the folder the user chose: an app's
         // "../.config/…" or "/home/u/.profile" mustn't reach elsewhere.
-        .filter_map(|name| plain_name(name))
+        // (One that's no name at all gets a stand-in: the list must stay in
+        // step with the app's.)
+        .map(|name| plain_name(name).unwrap_or_else(|| "file".to_string()))
         .map(|name| {
             let path = free_name(&dir, &name, |p| {
                 p.exists() || taken.contains(&p.to_path_buf())

@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- **Data loss on a mounted drive's own folder** — permanently deleting the folder a drive is mounted on (say `~/protonDrive`) emptied the whole drive; through rclone it ran `rclone purge` on the entire remote. Renaming or moving that folder moved everything off the cloud drive onto local disk, and Replace onto it deleted its contents. All of these are now refused, with the advice to unmount the drive first.
+- **Data loss on a mounted drive's own folder** — permanently deleting the folder a drive is mounted on (say `~/protonDrive`) emptied the whole drive; through rclone it ran `rclone purge` on the entire remote. Renaming or moving that folder moved everything off the cloud drive onto local disk, and Replace onto it deleted its contents. Moving a folder with a drive mounted inside it carried that drive's contents along. All of these are now refused, with the advice to unmount the drive first.
 - **File chooser could save outside the chosen folder** — a file name suggested by an app (for "Save" or saving several files) such as `../.config/autostart/x` was saved wherever it pointed, giving the app a way to write outside the folder you picked. Only the name is used now, and a typed name can't contain `/`.
 - **Offline edits** — an offline copy changed on this computer (opened from the offline copy and saved, say) is no longer overwritten by the older remote version at the next refresh. A file that has become a folder on the remote (or the reverse) no longer stops the offline refresh. The list of offline items is no longer lost or garbled when several things change it at once.
 - **Empty Bin** — folders in the Bin are emptied too; they were left behind while "Bin emptied" was announced.

@@ -1213,8 +1213,12 @@ impl WayfinderWindow {
         // Locations whose cached listings (and everything inside) are now
         // stale: what a move takes away, and what the paste lands on — a
         // folder of the same name may be merged into or replaced.
+        // Moving a drive's folder, or a folder with one mounted inside it,
+        // would carry the drive's contents along (through rclone, off the
+        // remote).
         if state.operation == ClipboardOperation::Cut
-            && self.refuse_mountpoints(&source_paths, "moved")
+            && (self.refuse_mountpoints(&source_paths, "moved")
+                || self.refuse_if_mounts_inside(&source_paths))
         {
             return;
         }
@@ -1727,9 +1731,9 @@ impl WayfinderWindow {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.clone());
                 let msg = if mount.trim_end_matches('/') == path.trim_end_matches('/') {
-                    format!("Not deleted: {name} is a mounted drive. Unmount it instead.")
+                    format!("{name} is a mounted drive. Unmount it first.")
                 } else {
-                    format!("Not deleted: {mount} is mounted inside {name}. Unmount it first.")
+                    format!("{mount} is mounted inside {name}. Unmount it first.")
                 };
                 self.announce(&msg, AccessibleAnnouncementPriority::High);
                 return true;
