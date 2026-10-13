@@ -69,121 +69,77 @@ pub fn rclone_for_path(local_path: &str) -> Option<RcloneTarget> {
 
 /// Return a list of (mountpoint, remote_root) pairs for currently-running
 /// rclone mounts. Reads /proc/mounts to find FUSE mounts, then `ps` to map
-/// each FUSE mountpoint back to its rclone remote spec.
+/// each FUSE mountpoint back to its rclone remote spec. `ps` is run at most
+/// every few seconds while the set of FUSE mounts stays the same: this is
+/// asked once per file for many actions, some on the main thread.
 fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
-    let mut results = Vec::new();
+    type Scan = (std::time::Instant, Vec<String>, Vec<(String, String)>);
+    static LAST: std::sync::Mutex<Option<Scan>> = std::sync::Mutex::new(None);
+    const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
-        return results;
-    };
-    let mut fuse_mounts: Vec<String> = Vec::new();
-    for line in proc_mounts.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let mountpoint = parts[1].replace("\\040", " ");
-        let fstype = parts[2];
-        if fstype.contains("fuse") {
-            fuse_mounts.push(mountpoint);
-        }
-    }
+    let fuse_mounts = fuse_mountpoints();
     if fuse_mounts.is_empty() {
-        return results;
+        return Vec::new();
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, mounts, found)) = last.as_ref() {
+        if *mounts == fuse_mounts && at.elapsed() < FRESH_FOR {
+            return found.clone();
+        }
     }
 
-    let output = match Command::new("ps").arg("-eo").arg("args=").output() {
-        Ok(o) => o,
-        Err(_) => return results,
+    let found = match Command::new("ps").arg("-eo").arg("args=").output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|line| parse_rclone_mount(line, &fuse_mounts))
+            .collect(),
+        Err(_) => Vec::new(),
     };
-    let ps_out = String::from_utf8_lossy(&output.stdout);
-    for line in ps_out.lines() {
-        let line = line.trim();
-        if !line.contains("rclone") {
-            continue;
-        }
-        let tokens: Vec<&str> = line.split_whitespace().collect();
+    *last = Some((std::time::Instant::now(), fuse_mounts, found.clone()));
+    found
+}
 
-        // Find the rclone binary token. We don't require `mount` to be the
-        // immediate next token because users (and systemd units) often pass
-        // global flags like `--vfs-cache-mode writes` before the subcommand.
-        let mut rclone_idx: Option<usize> = None;
-        for (i, tok) in tokens.iter().enumerate() {
-            if tok.ends_with("rclone") || *tok == "rclone" {
-                rclone_idx = Some(i);
-                break;
-            }
-        }
-        let Some(rclone_idx) = rclone_idx else {
-            continue;
-        };
+/// FUSE mountpoints from /proc/mounts.
+fn fuse_mountpoints() -> Vec<String> {
+    let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
+    proc_mounts
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let mountpoint = parts.nth(1)?;
+            let fstype = parts.next()?;
+            fstype
+                .contains("fuse")
+                .then(|| mountpoint.replace("\\040", " "))
+        })
+        .collect()
+}
 
-        // Walk the args after `rclone`, skipping flags (and their values for
-        // the unambiguous `--name value` form), until we find a positional
-        // subcommand. We only care about `mount`.
-        let mut subcommand: Option<usize> = None;
-        let mut skip_next = false;
-        for (i, tok) in tokens.iter().enumerate().skip(rclone_idx + 1) {
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-            if tok.starts_with("--") {
-                if !tok.contains('=') {
-                    skip_next = true;
-                }
-                continue;
-            }
-            if tok.starts_with('-') && tok.len() > 1 {
-                // Short flag — assume next token is its value (best-effort;
-                // rclone's short flags overwhelmingly take values).
-                skip_next = true;
-                continue;
-            }
-            // First positional token is the subcommand.
-            subcommand = Some(i);
-            break;
-        }
-        let Some(sub_idx) = subcommand else {
-            continue;
-        };
-        if tokens.get(sub_idx).copied() != Some("mount") {
-            continue;
-        }
-
-        // After `mount`, gather two positional args: remote spec and mountpoint.
-        let mut positional: Vec<&str> = Vec::new();
-        let mut skip_next = false;
-        for tok in tokens.iter().skip(sub_idx + 1) {
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-            if tok.starts_with("--") {
-                if !tok.contains('=') {
-                    skip_next = true;
-                }
-                continue;
-            }
-            if tok.starts_with('-') && tok.len() > 1 {
-                skip_next = true;
-                continue;
-            }
-            positional.push(tok);
-            if positional.len() >= 2 {
-                break;
-            }
-        }
-        if positional.len() < 2 {
-            continue;
-        }
-        let remote = positional[0].to_string();
-        let mount = positional[1].to_string();
-        if fuse_mounts.iter().any(|m| m == &mount) {
-            results.push((mount, remote));
-        }
-    }
-    results
+/// From one `ps` command line, the (mountpoint, remote) of an `rclone
+/// mount` serving one of `fuse_mounts`. Flags may come anywhere, with or
+/// without values (`--daemon`, `-v`, `--vfs-cache-mode writes`), so the
+/// mountpoint is found by name and the remote is the `name:` before it.
+fn parse_rclone_mount(line: &str, fuse_mounts: &[String]) -> Option<(String, String)> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let rclone_idx = tokens
+        .iter()
+        .position(|t| *t == "rclone" || t.ends_with("/rclone"))?;
+    let mount_idx = rclone_idx
+        + 1
+        + tokens[rclone_idx + 1..]
+            .iter()
+            .position(|t| *t == "mount")?;
+    let args = &tokens[mount_idx + 1..];
+    let mount_pos = args
+        .iter()
+        .position(|t| fuse_mounts.iter().any(|m| m == t))?;
+    let remote = args[..mount_pos]
+        .iter()
+        .rev()
+        .find(|t| !t.starts_with('-') && t.contains(':'))?;
+    Some((args[mount_pos].to_string(), remote.to_string()))
 }
 
 /// Whether rclone can be run. Checked once per process: it's asked before
@@ -270,7 +226,7 @@ pub fn run_streaming(args: &[String], tx: Sender<RcloneEvent>) -> Result<u32, St
 
     let tx_out = tx.clone();
     let stdout_collect = stdout_buf.clone();
-    std::thread::spawn(move || {
+    let stdout_reader = std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
             if let Ok(mut buf) = stdout_collect.lock() {
@@ -283,7 +239,7 @@ pub fn run_streaming(args: &[String], tx: Sender<RcloneEvent>) -> Result<u32, St
 
     let tx_err = tx.clone();
     let stderr_collect = stderr_buf.clone();
-    std::thread::spawn(move || {
+    let stderr_reader = std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
             if let Ok(mut buf) = stderr_collect.lock() {
@@ -296,6 +252,9 @@ pub fn run_streaming(args: &[String], tx: Sender<RcloneEvent>) -> Result<u32, St
 
     std::thread::spawn(move || {
         let status = child.wait();
+        // The last lines (usually the error) may still be on their way.
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
         let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
         let stderr = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
         let result = match status {
@@ -350,6 +309,8 @@ pub fn copyto_args(src_spec: &str, dst_spec: &str) -> Vec<String> {
         "copyto".to_string(),
         src_spec.to_string(),
         dst_spec.to_string(),
+        // Folders: copy empty subfolders too, as a file manager would.
+        "--create-empty-src-dirs".to_string(),
         "--verbose".to_string(),
         "--stats".to_string(),
         "5s".to_string(),
@@ -372,6 +333,10 @@ pub fn moveto_args(src_spec: &str, dst_spec: &str) -> Vec<String> {
         "moveto".to_string(),
         src_spec.to_string(),
         dst_spec.to_string(),
+        // Folders: bring empty subfolders along, and don't leave the
+        // emptied source tree behind.
+        "--create-empty-src-dirs".to_string(),
+        "--delete-empty-src-dirs".to_string(),
         "--verbose".to_string(),
         "--stats".to_string(),
         "5s".to_string(),
@@ -1018,5 +983,45 @@ mod fuse_type_tests {
     fn other_filesystems_are_not() {
         assert!(!is_daemon_fuse("ext4"));
         assert!(!is_daemon_fuse("fusectl"));
+    }
+}
+
+#[cfg(test)]
+mod mount_parse_tests {
+    use super::parse_rclone_mount;
+
+    fn mounts() -> Vec<String> {
+        vec!["/home/u/proton".to_string()]
+    }
+
+    #[test]
+    fn plain_mount() {
+        assert_eq!(
+            parse_rclone_mount("rclone mount Proton: /home/u/proton", &mounts()),
+            Some(("/home/u/proton".into(), "Proton:".into()))
+        );
+    }
+
+    /// Boolean flags used to swallow the remote, so the mount went unseen.
+    #[test]
+    fn flags_with_and_without_values() {
+        let line = "/usr/bin/rclone -v mount --daemon --vfs-cache-mode writes Proton:Docs /home/u/proton --allow-other";
+        assert_eq!(
+            parse_rclone_mount(line, &mounts()),
+            Some(("/home/u/proton".into(), "Proton:Docs".into()))
+        );
+    }
+
+    #[test]
+    fn other_commands_and_mounts_are_ignored() {
+        assert_eq!(
+            parse_rclone_mount("rclone copy Proton: /home/u/proton", &mounts()),
+            None
+        );
+        assert_eq!(
+            parse_rclone_mount("rclone mount Drive: /mnt/drive", &mounts()),
+            None
+        );
+        assert_eq!(parse_rclone_mount("vim notes.txt", &mounts()), None);
     }
 }

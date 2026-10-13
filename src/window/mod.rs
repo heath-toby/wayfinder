@@ -763,24 +763,30 @@ impl WayfinderWindow {
             move |result| {
                 if let Ok(choice) = result {
                     if choice == 1 {
-                        match wayfinder::file_ops::empty_trash() {
-                            Ok(count) => {
-                                window.announce(
-                                    &format!("Bin emptied, {count} items deleted"),
-                                    AccessibleAnnouncementPriority::Medium,
-                                );
-                                // Reload if we're viewing trash
-                                if window.is_in_trash() {
-                                    window.load_special_uri("trash:///");
+                        // A big Bin, or one on a slow mount, takes a while:
+                        // not on the main thread.
+                        window.run_blocking(
+                            "trash:///",
+                            || wayfinder::file_ops::empty_trash().map_err(|e| e.to_string()),
+                            |window, result| match result {
+                                Ok(count) => {
+                                    window.announce(
+                                        &format!("Bin emptied, {count} items deleted"),
+                                        AccessibleAnnouncementPriority::Medium,
+                                    );
+                                    // Reload if we're viewing trash
+                                    if window.is_in_trash() {
+                                        window.load_special_uri("trash:///");
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                window.announce(
-                                    &format!("Failed to empty bin: {e}"),
-                                    AccessibleAnnouncementPriority::High,
-                                );
-                            }
-                        }
+                                Err(e) => {
+                                    window.announce(
+                                        &format!("Failed to empty bin: {e}"),
+                                        AccessibleAnnouncementPriority::High,
+                                    );
+                                }
+                            },
+                        );
                     }
                 }
             },
@@ -941,8 +947,6 @@ impl WayfinderWindow {
         }
 
         let dest_dir_str = imp.model.current_path();
-        let dest_dir_gio = gio::File::for_path(&dest_dir_str);
-        let parent_window: gtk::Window = self.clone().upcast();
 
         // If any source or the destination is on a recognised rclone mount,
         // batch the whole paste through rclone-direct so we get server-side
@@ -970,8 +974,6 @@ impl WayfinderWindow {
         let mut moved: Vec<String> = landing_paths(&source_paths, &dest_dir_str);
         if state.operation == ClipboardOperation::Cut {
             moved.extend(source_paths.iter().cloned());
-        }
-        if state.operation == ClipboardOperation::Cut {
             for p in &source_paths {
                 if let Some(parent) = parent_dir(p) {
                     if !changed.contains(&parent) {
@@ -1013,66 +1015,32 @@ impl WayfinderWindow {
             }
         }
 
+        let plan = PastePlan {
+            files: state.files.clone(),
+            source_paths,
+            dest_dir: dest_dir_str,
+            is_move: state.operation == ClipboardOperation::Cut,
+            changed,
+            moved,
+        };
         if use_rclone {
-            let w = self.clone();
-            let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                // Move guard into the closure so it drops here on success.
-                let _g = guard;
-                w.forget_moved(&moved);
-                w.reload_after_change(&changed);
-            }));
-            match state.operation {
-                ClipboardOperation::Copy => {
-                    wayfinder::rclone_ops::copy_paths_with_progress(
-                        source_paths,
-                        dest_dir_str,
-                        &parent_window,
-                        reload,
-                    );
-                }
-                ClipboardOperation::Cut => {
-                    wayfinder::rclone_ops::move_paths_with_progress(
-                        source_paths,
-                        dest_dir_str,
-                        &parent_window,
-                        reload,
-                    );
-                }
-            }
+            // rclone overwrites (or merges into) whatever is in the way
+            // without asking. If anything is, go the per-file way, which
+            // asks Skip, Replace or Rename.
+            let landing = landing_paths(&plan.source_paths, &plan.dest_dir);
+            self.run_blocking(
+                &plan.dest_dir.clone(),
+                move || landing.iter().any(|p| std::path::Path::new(p).exists()),
+                move |w, clash| {
+                    if clash {
+                        w.paste_with_gio(plan, guard);
+                    } else {
+                        w.paste_with_rclone(plan, guard);
+                    }
+                },
+            );
         } else {
-            // Per-file GIO path: each reload callback holds a clone of the
-            // shared guard, which drops when the last one finishes (or all
-            // are dropped without running, e.g. due to panic).
-            let shared_guard = std::rc::Rc::new(guard);
-            for source in &state.files {
-                let w = self.clone();
-                let guard_held = shared_guard.clone();
-                let changed = changed.clone();
-                let moved = moved.clone();
-                let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                    let _g = guard_held;
-                    w.forget_moved(&moved);
-                    w.reload_after_change(&changed);
-                }));
-                match state.operation {
-                    ClipboardOperation::Copy => {
-                        wayfinder::file_ops::copy_with_progress(
-                            source,
-                            &dest_dir_gio,
-                            &parent_window,
-                            reload,
-                        );
-                    }
-                    ClipboardOperation::Cut => {
-                        wayfinder::file_ops::move_with_progress(
-                            source,
-                            &dest_dir_gio,
-                            &parent_window,
-                            reload,
-                        );
-                    }
-                }
-            }
+            self.paste_with_gio(plan, guard);
         }
 
         // Clear clipboard after cut
@@ -1095,6 +1063,71 @@ impl WayfinderWindow {
                         .clipboard()
                         .set_content(None::<&gtk::gdk::ContentProvider>);
                 }
+            }
+        }
+    }
+
+    /// Paste through rclone directly: one progress dialog, server-side
+    /// moves where possible. Only when nothing is in the way.
+    fn paste_with_rclone(&self, plan: PastePlan, guard: PastingGuard) {
+        let parent_window: gtk::Window = self.clone().upcast();
+        let w = self.clone();
+        let (changed, moved) = (plan.changed, plan.moved);
+        let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+            // Move guard into the closure so it drops here on success.
+            let _g = guard;
+            w.forget_moved(&moved);
+            w.reload_after_change(&changed);
+        }));
+        if plan.is_move {
+            wayfinder::rclone_ops::move_paths_with_progress(
+                plan.source_paths,
+                plan.dest_dir,
+                &parent_window,
+                reload,
+            );
+        } else {
+            wayfinder::rclone_ops::copy_paths_with_progress(
+                plan.source_paths,
+                plan.dest_dir,
+                &parent_window,
+                reload,
+            );
+        }
+    }
+
+    /// Paste file by file through GIO, asking about each clash.
+    fn paste_with_gio(&self, plan: PastePlan, guard: PastingGuard) {
+        let parent_window: gtk::Window = self.clone().upcast();
+        let dest_dir_gio = gio::File::for_path(&plan.dest_dir);
+        // Each reload callback holds a clone of the shared guard, which
+        // drops when the last one finishes (or all are dropped without
+        // running, e.g. due to panic).
+        let shared_guard = std::rc::Rc::new(guard);
+        for source in &plan.files {
+            let w = self.clone();
+            let guard_held = shared_guard.clone();
+            let changed = plan.changed.clone();
+            let moved = plan.moved.clone();
+            let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+                let _g = guard_held;
+                w.forget_moved(&moved);
+                w.reload_after_change(&changed);
+            }));
+            if plan.is_move {
+                wayfinder::file_ops::move_with_progress(
+                    source,
+                    &dest_dir_gio,
+                    &parent_window,
+                    reload,
+                );
+            } else {
+                wayfinder::file_ops::copy_with_progress(
+                    source,
+                    &dest_dir_gio,
+                    &parent_window,
+                    reload,
+                );
             }
         }
     }
@@ -1581,20 +1614,39 @@ impl WayfinderWindow {
                     .parent()
                     .map(|p| p.join(&new_name).to_string_lossy().to_string())
                     .unwrap_or_else(|| new_name.clone());
-                let w_done = w.clone();
                 let changed: Vec<String> = parent_dir(&file_path).into_iter().collect();
                 let moved = vec![file_path.clone()];
-                let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                    w_done.forget_moved(&moved);
-                    w_done.reload_after_change(&changed);
-                }));
-                wayfinder::rclone_ops::rename_with_progress(
-                    file_path.clone(),
-                    new_path,
-                    &parent,
-                    on_complete,
-                );
+                let old_path = file_path.clone();
+                let target = new_path.clone();
+                let only_case = new_name.to_lowercase() == file.name().to_lowercase();
                 d.close();
+                // rclone would overwrite whatever has the new name; GIO's
+                // rename refuses, and so do we.
+                w.run_blocking(
+                    &file_path,
+                    move || std::path::Path::new(&target).exists() && !only_case,
+                    move |w, clash| {
+                        if clash {
+                            w.announce(
+                                &format!("Could not rename: {new_name} already exists"),
+                                AccessibleAnnouncementPriority::High,
+                            );
+                            return;
+                        }
+                        let w_done = w.clone();
+                        let on_complete: Option<Box<dyn FnOnce() + 'static>> =
+                            Some(Box::new(move || {
+                                w_done.forget_moved(&moved);
+                                w_done.reload_after_change(&changed);
+                            }));
+                        wayfinder::rclone_ops::rename_with_progress(
+                            old_path,
+                            new_path,
+                            &parent,
+                            on_complete,
+                        );
+                    },
+                );
                 return;
             }
 
@@ -1845,6 +1897,16 @@ impl WayfinderWindow {
                 return;
             }
 
+            // Two files given the same new name: the second would replace
+            // the first.
+            if let Some(name) = duplicate_target(&pairs) {
+                w.announce(
+                    &format!("Not renamed: more than one file would be called {name}"),
+                    AccessibleAnnouncementPriority::High,
+                );
+                return;
+            }
+
             // If every old path lives on a recognised rclone mount, batch
             // through rclone-direct. Mixed-batch falls back to per-file GIO
             // (existing behaviour).
@@ -1855,19 +1917,48 @@ impl WayfinderWindow {
 
             if all_rclone {
                 let parent: gtk::Window = w.clone().upcast();
-                let w_done = w.clone();
-                let pair_count = pairs.len();
                 let changed = vec![w.imp().model.current_path()];
                 let moved: Vec<String> = pairs.iter().map(|(old, _)| old.clone()).collect();
-                let on_complete: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                    w_done.forget_moved(&moved);
-                    w_done.reload_after_change(&changed);
-                    w_done.announce(
-                        &format!("Renamed {pair_count} files"),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                }));
-                wayfinder::rclone_ops::batch_rename_with_progress(pairs, &parent, on_complete);
+                d.close();
+                // rclone would overwrite a file that already has a new name;
+                // GIO's rename refuses, and so do we. (Changing only the
+                // case of a name is the same file.)
+                let check: Vec<(String, String)> = pairs.clone();
+                w.run_blocking(
+                    &changed[0].clone(),
+                    move || {
+                        check.iter().find_map(|(old, new)| {
+                            let only_case = old.to_lowercase() == new.to_lowercase();
+                            (!only_case && std::path::Path::new(new).exists()).then(|| {
+                                std::path::Path::new(new)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            })
+                        })
+                    },
+                    move |w, existing| {
+                        if let Some(name) = existing {
+                            w.announce(
+                                &format!("Not renamed: {name} already exists"),
+                                AccessibleAnnouncementPriority::High,
+                            );
+                            return;
+                        }
+                        // The progress dialog announces the outcome.
+                        let w_done = w.clone();
+                        let on_complete: Option<Box<dyn FnOnce() + 'static>> =
+                            Some(Box::new(move || {
+                                w_done.forget_moved(&moved);
+                                w_done.reload_after_change(&changed);
+                            }));
+                        wayfinder::rclone_ops::batch_rename_with_progress(
+                            pairs,
+                            &parent,
+                            on_complete,
+                        );
+                    },
+                );
                 d.close();
                 return;
             }
@@ -2561,6 +2652,18 @@ fn is_fuse_mount(path: &str) -> bool {
     wayfinder::rclone_ops::is_fuse_path(path)
 }
 
+/// What a paste copies or moves, and where.
+struct PastePlan {
+    files: Vec<gio::File>,
+    source_paths: Vec<String>,
+    dest_dir: String,
+    is_move: bool,
+    /// Folders to reload (see `reload_after_change`).
+    changed: Vec<String>,
+    /// Locations whose cached listings are stale (see `forget_moved`).
+    moved: Vec<String>,
+}
+
 /// Work put off until something is answered.
 type Deferred = std::rc::Rc<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>;
 
@@ -2704,6 +2807,19 @@ fn landing_paths(sources: &[String], dest_dir: &str) -> Vec<String> {
         .collect()
 }
 
+/// The new name given to more than one file, if any, in rename `pairs`.
+fn duplicate_target(pairs: &[(String, String)]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    pairs.iter().find_map(|(_, new)| {
+        (!seen.insert(new.as_str())).then(|| {
+            std::path::Path::new(new)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+    })
+}
+
 /// The folder holding `path`.
 fn parent_dir(path: &str) -> Option<String> {
     std::path::Path::new(path)
@@ -2726,7 +2842,18 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dropped_paths, landing_paths, position_near_removed};
+    use super::{dropped_paths, duplicate_target, landing_paths, position_near_removed};
+
+    #[test]
+    fn batch_rename_to_one_name_is_caught() {
+        let pairs = vec![
+            ("/d/doc v1.txt".to_string(), "/d/doc .txt".to_string()),
+            ("/d/doc .txt".to_string(), "/d/doc .txt".to_string()),
+            ("/d/other.txt".to_string(), "/d/x.txt".to_string()),
+        ];
+        assert_eq!(duplicate_target(&pairs), Some("doc .txt".to_string()));
+        assert_eq!(duplicate_target(&pairs[2..]), None);
+    }
 
     #[test]
     fn pasted_items_land_in_the_destination_under_their_names() {
