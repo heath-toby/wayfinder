@@ -94,7 +94,7 @@ Sidebar and breadcrumb bar have paired toggle buttons + actions. The button stor
 
 ### State Persistence
 
-`~/.config/wayfinder/state` — simple `key=value` text file. `state.rs` provides `save_*`/`load_*` pairs for directory, view mode, hidden files, sidebar, window size, sort state, zoom level, file app associations. `~/.config/wayfinder/windows` stores multi-window session directories (one path per line) for session restore on next launch. Session is saved in `ApplicationImpl::shutdown()` and restored in `activate()`. The `app/imp.rs` collects all open window directories on shutdown and recreates them on next launch.
+`~/.config/wayfinder/state` — simple `key=value` text file. `state.rs` provides `save_*`/`load_*` pairs for directory, view mode, hidden files, sidebar, window size, sort state, zoom level, file app associations. `~/.config/wayfinder/windows` stores the session's window locations (one per line). Each window joins the session when created (`join_session`) and its entry is updated and written whenever it opens a location (`note_session_location`); closed windows stay in it, and it's written as it changes because at shutdown the windows are already gone. `activate()` reopens them all unless the "Reopen All Windows at Startup" setting (sidebar menu, `state::load_reopen_windows`) is off.
 
 ### Portal Binary
 

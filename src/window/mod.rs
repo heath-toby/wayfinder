@@ -222,6 +222,7 @@ impl WayfinderWindow {
                 let at_root = path == "/";
                 imp.up_button.set_sensitive(!at_root);
                 wayfinder::state::save_last_directory(path);
+                w.note_session_location(path);
                 w.update_status();
 
                 let dir_name = PathBuf::from(path)
@@ -259,6 +260,7 @@ impl WayfinderWindow {
                 imp.up_button.set_sensitive(!at_root);
 
                 wayfinder::state::save_last_directory(path);
+                self.note_session_location(path);
 
                 self.update_status();
 
@@ -352,6 +354,7 @@ impl WayfinderWindow {
 
         match result {
             Ok(_count) => {
+                self.note_session_location(uri);
                 imp.location_entry.set_text(uri);
                 self.update_breadcrumb(uri);
                 imp.back_button
@@ -798,6 +801,36 @@ impl WayfinderWindow {
         if dropped {
             self.update_status();
         }
+    }
+
+    /// Join the session (the windows opened again at the next start).
+    pub fn join_session(&self) {
+        let id = SESSION.with(|(next, windows)| {
+            let id = next.get();
+            next.set(id + 1);
+            windows.borrow_mut().push((id, String::new()));
+            id
+        });
+        self.imp().session_id.set(id);
+    }
+
+    /// This window now shows `location`: remember it for the next start.
+    /// Every window of the session is kept, closed or not, and written
+    /// out at once (at exit the windows are already gone).
+    fn note_session_location(&self, location: &str) {
+        let id = self.imp().session_id.get();
+        let locations: Vec<String> = SESSION.with(|(_, windows)| {
+            let mut windows = windows.borrow_mut();
+            if let Some(entry) = windows.iter_mut().find(|(w, _)| *w == id) {
+                entry.1 = location.to_string();
+            }
+            windows
+                .iter()
+                .filter(|(_, l)| !l.is_empty())
+                .map(|(_, l)| l.clone())
+                .collect()
+        });
+        wayfinder::state::save_window_session(&locations);
     }
 
     /// Select `name` the next time `folder` is opened.
@@ -3161,6 +3194,12 @@ fn restore_newest(paths: &[String]) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+thread_local! {
+    /// This session's windows, in the order opened: (id, location shown).
+    static SESSION: (std::cell::Cell<u64>, std::cell::RefCell<Vec<(u64, String)>>) =
+        const { (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new())) };
 }
 
 /// A file object for the file at `real` (a link's target), its type

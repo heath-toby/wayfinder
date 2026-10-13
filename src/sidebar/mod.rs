@@ -136,6 +136,36 @@ fn remove_bookmark_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
     );
 }
 
+/// `item` and, below it, Wayfinder's settings: the sidebar's menu is
+/// where they live.
+fn with_settings(item: &gtk::Widget) -> gtk::Box {
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    vbox.add_css_class("menu");
+    vbox.append(item);
+    vbox.append(&settings_check());
+    vbox
+}
+
+/// "Reopen All Windows at Startup", on or off. A check box, so Orca says
+/// which; changing it is saved and said at once.
+fn settings_check() -> gtk::CheckButton {
+    let check = gtk::CheckButton::with_label("Reopen All Windows at Startup");
+    check.set_active(crate::state::load_reopen_windows());
+    check.connect_toggled(|check| {
+        let on = check.is_active();
+        crate::state::save_reopen_windows(on);
+        check.announce(
+            if on {
+                "All windows will be reopened at startup"
+            } else {
+                "Only one window will open at startup"
+            },
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
+    });
+    check
+}
+
 /// The menu for a bookmark row: Remove Bookmark, Edit Sidebar.
 fn show_bookmark_menu(
     sidebar: &WayfinderSidebar,
@@ -171,6 +201,7 @@ fn show_bookmark_menu(
         s.show_edit_dialog(&p);
     });
     vbox.append(&edit_btn);
+    vbox.append(&settings_check());
 
     popover.set_child(Some(&vbox));
     popover.connect_closed(|pop| pop.unparent());
@@ -789,7 +820,7 @@ impl WayfinderSidebar {
                 s.show_edit_dialog(&p);
             });
 
-            popover.set_child(Some(&btn));
+            popover.set_child(Some(&with_settings(btn.upcast_ref())));
             popover.connect_closed(|pop| pop.unparent());
             popover.popup();
         });
@@ -839,7 +870,7 @@ impl WayfinderSidebar {
                 s.show_edit_dialog(&p);
             });
 
-            popover.set_child(Some(&btn));
+            popover.set_child(Some(&with_settings(btn.upcast_ref())));
             popover.connect_closed(|pop| pop.unparent());
             popover.popup();
             glib::Propagation::Stop

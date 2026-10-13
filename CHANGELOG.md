@@ -2,6 +2,10 @@
 
 ## 2.5.1
 
+### New
+
+- **Reopen All Windows at Startup** — every window of your last session is opened again, each at the folder it last showed, including windows you closed along the way. (Before, this only worked if all the windows were closed at once, and in practice never.) It's a setting, on by default, in the sidebar's menu: press the Menu key or Shift+F10 on any place, or right-click one.
+
 ### Fixed
 
 - **Data loss when pasting a folder onto itself** — pasting a folder into the folder it's already in and choosing Replace deleted it (or left it empty). Replacing something with itself, or with the folder that holds it, is now refused, and so is moving something to where it already is.

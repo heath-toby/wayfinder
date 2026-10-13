@@ -42,13 +42,19 @@ impl ApplicationImpl for WayfinderApplicationInner {
     fn activate(&self) {
         let app = self.obj();
 
-        // Restore previous session windows
+        // Open every window of the last session again (unless that's
+        // turned off in the sidebar's menu).
         let session = wayfinder::state::load_window_session();
-        if session.len() > 1 {
+        if wayfinder::state::load_reopen_windows() && session.len() > 1 {
             wayfinder::state::clear_window_session();
             for dir in &session {
                 let window = WayfinderWindow::new(app.upcast_ref());
-                window.navigate_to_path(&dir.to_string_lossy());
+                let location = dir.to_string_lossy();
+                if location.contains("://") {
+                    window.load_special_uri(&location);
+                } else {
+                    window.navigate_to_path(&location);
+                }
                 window.present();
             }
         } else {
@@ -102,20 +108,8 @@ impl ApplicationImpl for WayfinderApplicationInner {
     }
 
     fn shutdown(&self) {
-        // Save all open window directories for session restore
-        let app = self.obj();
-        let mut dirs = Vec::new();
-        for window in app.windows() {
-            if let Ok(wf) = window.downcast::<WayfinderWindow>() {
-                let path = wf.imp().model.current_path();
-                if !path.is_empty() {
-                    dirs.push(path);
-                }
-            }
-        }
-        if !dirs.is_empty() {
-            wayfinder::state::save_window_session(&dirs);
-        }
+        // (The session is written as windows change: see
+        // WayfinderWindow::note_session_location.)
         self.parent_shutdown();
     }
 }

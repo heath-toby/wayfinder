@@ -80,6 +80,8 @@ pub struct WayfinderWindowInner {
     pub offline_view: Cell<bool>,
     /// A restore from the Bin is under way.
     pub restoring: Cell<bool>,
+    /// This window's place in the session (see join_session).
+    pub session_id: Cell<u64>,
     pub current_view: Cell<ViewMode>,
     pub file_selection: RefCell<SelectionState>,
     pub type_ahead_buffer: Rc<RefCell<String>>,
@@ -213,6 +215,7 @@ impl Default for WayfinderWindowInner {
             pasting: Cell::new(false),
             offline_view: Cell::new(false),
             restoring: Cell::new(false),
+            session_id: Cell::new(0),
             current_view: Cell::new(ViewMode::List),
             file_selection: RefCell::new(SelectionState::new()),
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),
@@ -244,6 +247,7 @@ impl ObjectSubclass for WayfinderWindowInner {
 impl ObjectImpl for WayfinderWindowInner {
     fn constructed(&self) {
         self.parent_constructed();
+        self.obj().join_session();
         let window = self.obj();
 
         window.set_title(Some("Wayfinder"));

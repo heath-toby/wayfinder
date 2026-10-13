@@ -151,6 +151,18 @@ pub fn load_breadcrumb_visible() -> bool {
         .unwrap_or(true) // default: visible
 }
 
+/// Whether every window of the last session is opened again at startup
+/// (on unless turned off).
+pub fn save_reopen_windows(reopen: bool) {
+    set_value("reopen_windows", if reopen { "true" } else { "false" });
+}
+
+pub fn load_reopen_windows() -> bool {
+    get_value("reopen_windows")
+        .map(|v| v == "true")
+        .unwrap_or(true)
+}
+
 // -- Window session (multi-window restore) --
 // Stored in ~/.config/wayfinder/windows as one directory path per line.
 
