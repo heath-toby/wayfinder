@@ -1179,6 +1179,11 @@ impl WayfinderWindow {
         // Locations whose cached listings (and everything inside) are now
         // stale: what a move takes away, and what the paste lands on — a
         // folder of the same name may be merged into or replaced.
+        if state.operation == ClipboardOperation::Cut
+            && self.refuse_mountpoints(&source_paths, "moved")
+        {
+            return;
+        }
         let mut moved: Vec<String> = landing_paths(&source_paths, &dest_dir_str);
         if state.operation == ClipboardOperation::Cut {
             moved.extend(source_paths.iter().cloned());
@@ -1680,14 +1685,37 @@ impl WayfinderWindow {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.clone());
-                self.announce(
-                    &format!("Not deleted: {mount} is mounted inside {name}. Unmount it first."),
-                    AccessibleAnnouncementPriority::High,
-                );
+                let msg = if mount.trim_end_matches('/') == path.trim_end_matches('/') {
+                    format!("Not deleted: {name} is a mounted drive. Unmount it instead.")
+                } else {
+                    format!("Not deleted: {mount} is mounted inside {name}. Unmount it first.")
+                };
+                self.announce(&msg, AccessibleAnnouncementPriority::High);
                 return true;
             }
         }
         false
+    }
+
+    /// If any of `paths` is where a drive is mounted, say so and return
+    /// true: renaming or moving it would move the drive's contents (through
+    /// rclone, off the remote), not the folder.
+    fn refuse_mountpoints(&self, paths: &[String], what: &str) -> bool {
+        let Some(path) = paths
+            .iter()
+            .find(|p| wayfinder::rclone_ops::is_mountpoint(p))
+        else {
+            return false;
+        };
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        self.announce(
+            &format!("{name} is a mounted drive and can't be {what}. Unmount it first."),
+            AccessibleAnnouncementPriority::High,
+        );
+        true
     }
 
     /// Select the item above one removed from `old_pos`, or the new last
@@ -1910,6 +1938,9 @@ impl WayfinderWindow {
         let Some(file) = self.get_selected_file() else {
             return;
         };
+        if self.refuse_mountpoints(&[file.path()], "renamed") {
+            return;
+        }
 
         let window = self.clone();
 
@@ -2112,6 +2143,10 @@ impl WayfinderWindow {
             return;
         }
         let files = self.get_selected_files();
+        let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
+        if self.refuse_mountpoints(&paths, "renamed") {
+            return;
+        }
         if files.len() < 2 {
             self.announce(
                 "Select multiple files to batch rename",

@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- **Data loss on a mounted drive's own folder** — permanently deleting the folder a drive is mounted on (say `~/protonDrive`) emptied the whole drive; through rclone it ran `rclone purge` on the entire remote. Renaming or moving that folder moved everything off the cloud drive onto local disk, and Replace onto it deleted its contents. All of these are now refused, with the advice to unmount the drive first.
+
 - **Data loss when pasting a folder onto itself** — pasting a folder into the folder it's already in and choosing Replace deleted it (or left it empty). Replacing something with itself, or with the folder that holds it, is now refused, and so is moving something to where it already is.
 - **Deleting a folder with a drive mounted inside it** — a permanent delete would have gone on into the mounted drive and deleted what's on it (a whole remote drive, say). It's now refused until the drive is unmounted. Permanent deletes of local files also no longer freeze the window while they run.
 - **The offline copy** — while a folder's offline copy is shown (its drive can't be reached), deleting, renaming, pasting or creating files there — or in folders opened from it — is refused: it changed the copy, not the drive the location bar names. If the offline copy can't be opened, that's now said.

@@ -138,7 +138,19 @@ pub fn resolve_links_outside_mounts(path: &Path) -> std::path::PathBuf {
     out
 }
 
-/// Filesystems mounted inside `path` (not at it): deleting `path` would
+/// Whether something is mounted exactly at `path` (from /proc/mounts).
+pub fn is_mountpoint(path: &str) -> bool {
+    let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    let path = path.trim_end_matches('/');
+    proc_mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|m| decode_mount_path(m) == path)
+}
+
+/// Filesystems mounted at or inside `path`: deleting `path` would
 /// reach into them — a whole remote drive, perhaps. By path, from
 /// /proc/mounts; no filesystem access.
 pub fn mountpoints_inside(path: &str) -> Vec<String> {
@@ -149,12 +161,15 @@ pub fn mountpoints_inside(path: &str) -> Vec<String> {
 }
 
 fn mountpoints_inside_of(proc_mounts: &str, path: &str) -> Vec<String> {
-    let inside = format!("{}/", path.trim_end_matches('/'));
+    let at = path.trim_end_matches('/');
+    let inside = format!("{at}/");
     proc_mounts
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
         .map(decode_mount_path)
-        .filter(|m| m.starts_with(&inside))
+        // At it too: a recursive delete of a mountpoint empties the drive
+        // before the last step (removing the mountpoint) fails.
+        .filter(|m| m == at || m.starts_with(&inside))
         .collect()
 }
 
@@ -767,6 +782,18 @@ pub fn delete_with_progress(
     let mut resolved: Vec<(String, RcloneTarget, bool)> = Vec::with_capacity(paths.len());
     let mut on_complete = on_complete;
     for (local, is_dir) in &paths {
+        // Never the mount itself: that's `rclone purge <remote>:`, the whole
+        // drive.
+        if is_mountpoint(local) {
+            parent_window.announce(
+                &format!("Not deleted: {local} is a mounted drive. Unmount it instead."),
+                gtk::AccessibleAnnouncementPriority::High,
+            );
+            if let Some(cb) = on_complete.take() {
+                cb(false);
+            }
+            return;
+        }
         match rclone_for_path(local) {
             Some(t) => resolved.push((local.clone(), t, *is_dir)),
             None => {
@@ -1148,8 +1175,11 @@ mod mount_parse_tests {
             mountpoints_inside_of(mounts, "/home/u"),
             vec!["/home/u/mnt/gdrive", "/home/u/mnt2", "/home/u/My Disk"]
         );
-        // Mounted at it, not inside: deleting it fails rather than reaching in.
-        assert!(mountpoints_inside_of(mounts, "/home/u/mnt2").is_empty());
+        // Mounted at it counts too: a recursive delete would empty it.
+        assert_eq!(
+            mountpoints_inside_of(mounts, "/home/u/mnt2"),
+            vec!["/home/u/mnt2"]
+        );
     }
 
     fn mounts() -> Vec<String> {
