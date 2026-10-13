@@ -40,6 +40,7 @@
 - **Custom actions** — with several files selected, an action that takes one file (such as Extract Here or Checksum) now runs on each of them, not just the first; actions are only offered when they suit every selected file; file names containing `%c`, `%i` or `%k`, and URIs with spaces or `#`, are passed correctly; the progress window can be put away with "Continue in background" or Escape (it used to stay up, blocking the window, for as long as the program ran — a terminal, say).
 - **Compress** — file names beginning with `-` are no longer mistaken for options, and an existing archive of the same name is reported instead of being added to or replaced.
 - **Open With** — pressing Enter on "Open With" moves focus into the submenu.
+- **Right-click** — right-clicking a file opens the menu for that file; it used to act on whichever file was selected before.
 
 ### Development
 

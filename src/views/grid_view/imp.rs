@@ -118,6 +118,7 @@ fn setup_factory(factory: &SignalListItemFactory) {
             gtk::PropertyExpression::new(FileObject::static_type(), Some(&entry_expr), "name");
         name_expr.bind(&label, "label", gtk::Widget::NONE);
 
+        crate::views::select_on_right_click(&vbox, item);
         item.set_child(Some(&vbox));
 
         // Accessible label binding — use the exact Nautilus pattern:

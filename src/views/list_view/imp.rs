@@ -329,6 +329,7 @@ fn setup_name_factory(factory: &SignalListItemFactory) {
         );
         a11y_name_expr.bind(item, "accessible-label", Some(item));
 
+        crate::views::select_on_right_click(&row, item);
         item.set_child(Some(&row));
     });
 
@@ -397,6 +398,7 @@ fn setup_label_factory(factory: &SignalListItemFactory, property: &'static str) 
             gtk::PropertyExpression::new(FileObject::static_type(), Some(&entry_expr), property);
         prop_expr.bind(&label, "label", gtk::Widget::NONE);
 
+        crate::views::select_on_right_click(&label, item);
         item.set_child(Some(&label));
     });
 }
