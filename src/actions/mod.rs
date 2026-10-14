@@ -176,6 +176,9 @@ fn parse_desktop_action(path: &Path, base_dir: &Path) -> Option<CustomAction> {
         if let Some(val) = line.strip_prefix("Name=") {
             name = Some(val.to_string());
         } else if let Some(val) = line.strip_prefix("Exec=") {
+            // As a key file's value is read (`\\` a backslash, `\s` a
+            // space…), before it's split into arguments.
+            let val = &unescape_value(val);
             // Resolve a leading ./ in the first token against the
             // action's own directory so folder-based actions can ship
             // their script alongside the .desktop file.
@@ -774,6 +777,32 @@ fn file_uri(path: &str) -> String {
     gtk::gio::File::for_path(path).uri().to_string()
 }
 
+/// A key file's string value, its escapes read: `\s` space, `\n` `\t` `\r`,
+/// `\\` a backslash (any other `\` kept, for `split_exec`).
+fn unescape_value(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('s') => out.push(' '),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            _ => {
+                out.push('\\');
+                continue;
+            }
+        }
+        chars.next();
+    }
+    out
+}
+
 /// `Exec=` split into its arguments, as GLib reads it: separated by
 /// spaces; in double quotes, spaces are kept and `\` escapes `"`, `` ` ``,
 /// `$` and `\`; in single quotes everything is kept as it is (so an
@@ -832,12 +861,17 @@ fn split_exec(exec: &str) -> Vec<String> {
     args
 }
 
-/// `s` as one `Exec=` argument (quoted, as `split_exec` reads it).
+/// `s` as one `Exec=` argument (quoted, as `split_exec` reads it, and
+/// with no field codes).
 fn exec_quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         if matches!(c, '"' | '`' | '$' | '\\') {
             out.push('\\');
+        }
+        // (`%%`: a `%` in a folder's name isn't a field code.)
+        if c == '%' {
+            out.push('%');
         }
         out.push(c);
     }
@@ -853,20 +887,35 @@ fn exec_quote(s: &str) -> String {
 /// only ever data (one with `$(…)` in it runs nothing), quoted or not.
 /// Other field codes are dropped; a `%c` in a file name stays.
 fn desktop_commands(exec: &str, files: &[String]) -> Vec<Vec<String>> {
-    // Field codes, without the ones that take no file.
-    let fill = |arg: &str, file: Option<&str>, uri: Option<&str>| -> String {
+    let args = split_exec(exec);
+    // A shell's `-c` script (`sh -c '…' _ %f`) is never written into: a
+    // file's name put in it would be read as shell — `$(…)` in a name
+    // would run. It's kept as written (`%` and all: `${name%.tar.gz}`);
+    // the files reach it as arguments ("$1").
+    let script = args.first().and_then(|program| {
+        let shell = std::path::Path::new(program)
+            .file_name()
+            .is_some_and(|n| matches!(n.to_str(), Some("sh" | "bash" | "dash" | "zsh" | "ksh")));
+        let c = args.iter().position(|a| a == "-c")?;
+        (shell && c + 1 < args.len()).then_some(c + 1)
+    });
+    // Field codes in one argument: `%f`/`%u` the file, `%%` a `%`, `%i`
+    // `%c` `%k` dropped; any other `%` as written.
+    let fill = |i: usize, arg: &str, file: Option<&str>, uri: Option<&str>| -> String {
+        if Some(i) == script {
+            return arg.to_string();
+        }
         let mut out = String::new();
-        let mut chars = arg.chars();
+        let mut chars = arg.chars().peekable();
         while let Some(c) = chars.next() {
             if c != '%' {
                 out.push(c);
                 continue;
             }
-            // (Only the codes that stand for files, or take none; any other
-            // `%` is left as written — a script's `${name%.tar.gz}`.)
-            match chars.clone().next() {
+            match chars.peek() {
                 Some('f') => out.push_str(file.unwrap_or("")),
                 Some('u') => out.push_str(uri.unwrap_or("")),
+                Some('%') => out.push('%'),
                 Some('i' | 'c' | 'k') => {}
                 _ => {
                     out.push('%');
@@ -877,25 +926,30 @@ fn desktop_commands(exec: &str, files: &[String]) -> Vec<Vec<String>> {
         }
         out
     };
-    let args = split_exec(exec);
     let uris: Vec<String> = files.iter().map(|f| file_uri(f)).collect();
-    let has = |code: &str| args.iter().any(|a| a.contains(code));
-    let drop_empty = |argv: Vec<String>, template: &[String]| -> Vec<String> {
+    // (Codes counted only where they're filled in: not in a script.)
+    let filled_args = || args.iter().enumerate().filter(|(i, _)| Some(*i) != script);
+    let many = filled_args().any(|(_, a)| a == "%F" || a == "%U");
+    let one = filled_args().any(|(_, a)| {
+        let a = a.replace("%%", "");
+        a.contains("%f") || a.contains("%u")
+    });
+    let drop_empty = |argv: Vec<String>| -> Vec<String> {
         // An argument that was only a dropped code (`%i`) goes.
         argv.into_iter()
-            .zip(template)
+            .zip(&args)
             .filter(|(a, t)| !a.is_empty() || t.is_empty())
             .map(|(a, _)| a)
             .collect()
     };
-    if has("%F") || has("%U") {
+    if many {
         let mut argv = Vec::new();
-        for a in &args {
+        for (i, a) in args.iter().enumerate() {
             match a.as_str() {
-                "%F" => argv.extend(files.iter().cloned()),
-                "%U" => argv.extend(uris.iter().cloned()),
+                "%F" if Some(i) != script => argv.extend(files.iter().cloned()),
+                "%U" if Some(i) != script => argv.extend(uris.iter().cloned()),
                 _ => {
-                    let filled = fill(a, None, None);
+                    let filled = fill(i, a, None, None);
                     if !filled.is_empty() || a.is_empty() {
                         argv.push(filled);
                     }
@@ -903,18 +957,27 @@ fn desktop_commands(exec: &str, files: &[String]) -> Vec<Vec<String>> {
             }
         }
         vec![argv]
-    } else if has("%f") || has("%u") {
+    } else if one {
         files
             .iter()
             .zip(&uris)
             .map(|(f, u)| {
-                let argv = args.iter().map(|a| fill(a, Some(f), Some(u))).collect();
-                drop_empty(argv, &args)
+                drop_empty(
+                    args.iter()
+                        .enumerate()
+                        .map(|(i, a)| fill(i, a, Some(f), Some(u)))
+                        .collect(),
+                )
             })
             .collect()
     } else {
         // No placeholder: the files after it.
-        let mut argv = drop_empty(args.iter().map(|a| fill(a, None, None)).collect(), &args);
+        let mut argv = drop_empty(
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| fill(i, a, None, None))
+                .collect(),
+        );
         argv.extend(files.iter().cloned());
         vec![argv]
     }
@@ -1077,6 +1140,44 @@ mod tests {
                 assert_eq!(argv.len(), 5, "{name:?}: {argv:?}");
             }
         }
+    }
+
+    /// A file's name never goes into a shell script's text, even where the
+    /// script names a field code; `%F` in a script isn't one.
+    #[test]
+    fn scripts_are_never_written_into() {
+        let cmds = desktop_commands("sh -c 'cat \"%f\"'", &files(&["/d/$(touch PWNED).txt"]));
+        assert_eq!(
+            cmds,
+            vec![argv(&["sh", "-c", "cat \"%f\"", "/d/$(touch PWNED).txt"])]
+        );
+        let exec = "sh -c 'cp \"$1\" \"$1.$(date +%F)\"' _ %f";
+        let cmds = desktop_commands(exec, &files(&["/d/a"]));
+        assert_eq!(
+            cmds,
+            vec![argv(&[
+                "sh",
+                "-c",
+                "cp \"$1\" \"$1.$(date +%F)\"",
+                "_",
+                "/d/a"
+            ])]
+        );
+    }
+
+    #[test]
+    fn key_file_escapes_are_read_first() {
+        let exec = super::unescape_value("sh -c \"echo \\\\\"$1\\\\\"\" _ %f");
+        assert_eq!(
+            split_exec(&exec),
+            argv(&["sh", "-c", "echo \"$1\"", "_", "%f"])
+        );
+        // A folder with a % in its name, quoted as the parser quotes it.
+        let cmds = desktop_commands(
+            &format!("{} %f", exec_quote("/a/50%cool/run.sh")),
+            &files(&["/x"]),
+        );
+        assert_eq!(cmds, vec![argv(&["/a/50%cool/run.sh", "/x"])]);
     }
 
     /// The bundled actions: an `sh -c '…'` script, `%` in it kept.

@@ -318,8 +318,17 @@ impl WayfinderWindow {
                             .and_downcast::<FileObject>()
                             .is_some_and(|f| f.name() == *name)
                     });
-                    // Asked for, but not shown: say why (a hidden file).
-                    if !listed && name.starts_with('.') {
+                    // Asked for, but not shown: say why (a hidden file —
+                    // a dotfile, a backup~, one in .hidden: here, but
+                    // filtered out).
+                    let here = (0..imp.model.store.n_items()).any(|i| {
+                        imp.model
+                            .store
+                            .item(i)
+                            .and_downcast::<FileObject>()
+                            .is_some_and(|f| f.name() == *name)
+                    });
+                    if !listed && here {
                         self.announce_after_navigation(format!(
                             "{name} is hidden. Press Ctrl+H to show hidden files."
                         ));
@@ -1450,10 +1459,7 @@ impl WayfinderWindow {
                     // can't be looked at counts too: only "not found" is
                     // free, or rclone would go over it unasked.)
                     landing.iter().any(|p| {
-                        !matches!(
-                            std::path::Path::new(p).symlink_metadata(),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-                        )
+                        !wayfinder::file_ops::name_free(std::path::Path::new(p)).unwrap_or(false)
                     }) || has_duplicate(&landing)
                         || sources.iter().any(|p| {
                             !wayfinder::rclone_ops::is_fuse_path(p)
@@ -2242,13 +2248,19 @@ impl WayfinderWindow {
                 // rename refuses, and so do we.
                 w.run_blocking(
                     &file_path,
-                    move || rename_clash(&old_check, &target),
+                    move || rename_check(&old_check, &target),
                     move |w, clash| {
-                        if clash {
-                            w.announce(
-                                &format!("Could not rename: {new_name} already exists"),
-                                AccessibleAnnouncementPriority::High,
-                            );
+                        let refusal = match clash {
+                            Ok(false) => None,
+                            Ok(true) => {
+                                Some(format!("Could not rename: {new_name} already exists"))
+                            }
+                            Err(e) => Some(format!(
+                                "Could not rename: {new_name} couldn't be checked ({e})"
+                            )),
+                        };
+                        if let Some(msg) = refusal {
+                            w.announce(&msg, AccessibleAnnouncementPriority::High);
                             return;
                         }
                         let w_done = w.clone();
@@ -2591,20 +2603,22 @@ impl WayfinderWindow {
                     &changed[0].clone(),
                     move || {
                         check.iter().find_map(|(old, new)| {
-                            rename_clash(old, new).then(|| {
-                                std::path::Path::new(new)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_default()
-                            })
+                            let name = std::path::Path::new(new)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            match rename_check(old, new) {
+                                Ok(false) => None,
+                                Ok(true) => Some(format!("Not renamed: {name} already exists")),
+                                Err(e) => {
+                                    Some(format!("Not renamed: {name} couldn't be checked ({e})"))
+                                }
+                            }
                         })
                     },
-                    move |w, existing| {
-                        if let Some(name) = existing {
-                            w.announce(
-                                &format!("Not renamed: {name} already exists"),
-                                AccessibleAnnouncementPriority::High,
-                            );
+                    move |w, refusal| {
+                        if let Some(msg) = refusal {
+                            w.announce(&msg, AccessibleAnnouncementPriority::High);
                             return;
                         }
                         // The progress dialog announces the outcome.
@@ -3660,7 +3674,14 @@ fn landing_paths(sources: &[String], dest_dir: &str) -> Vec<String> {
 /// but on a case-sensitive one it's another file: so, whether the folder
 /// holds something spelled exactly so (inode numbers may differ by
 /// spelling); if it can't be listed, whether the two are the same file.
+#[cfg(test)]
 fn rename_clash(old: &str, new: &str) -> bool {
+    rename_check(old, new).unwrap_or(true)
+}
+
+/// `rename_clash`, with why it couldn't be told (an error) apart from a
+/// name taken.
+fn rename_check(old: &str, new: &str) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
     // Only the case changing: taken only if the folder holds something
     // spelled exactly so (on a drive that ignores case the old name
@@ -3681,7 +3702,7 @@ fn rename_clash(old: &str, new: &str) -> bool {
             if let Ok(entries) =
                 std::fs::read_dir(dir).and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
             {
-                return entries.iter().any(|e| e.file_name() == new_name);
+                return Ok(entries.iter().any(|e| e.file_name() == new_name));
             }
         }
     }
@@ -3689,13 +3710,13 @@ fn rename_clash(old: &str, new: &str) -> bool {
     // or rclone would write over what's there.)
     let new_meta = match std::fs::symlink_metadata(new) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.to_string()),
     };
-    match std::fs::symlink_metadata(old) {
+    Ok(match std::fs::symlink_metadata(old) {
         Ok(old_meta) => (old_meta.dev(), old_meta.ino()) != (new_meta.dev(), new_meta.ino()),
         Err(_) => true,
-    }
+    })
 }
 
 /// The new name given to more than one file, if any, in rename `pairs`.

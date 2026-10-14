@@ -145,10 +145,8 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Vec<String> {
             // (Taken: anything there, a link leading nowhere included, or
             // that can't be looked at — only "not found" is free.)
             let path = free_name(&dir, &name, |p| {
-                !matches!(
-                    std::fs::symlink_metadata(p),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
-                ) || taken.contains(&p.to_path_buf())
+                !wayfinder::file_ops::name_free(p).unwrap_or(false)
+                    || taken.contains(&p.to_path_buf())
             });
             taken.push(path.clone());
             gtk::gio::File::for_path(&path).uri().to_string()
@@ -175,7 +173,9 @@ fn free_name(
     if !taken(&first) {
         return first;
     }
-    (2..)
+    // (Not forever: if every name is "taken" — the folder can't be looked
+    // in — the first is used, and saving there says why it fails.)
+    (2..1000)
         .map(|n| dir.join(wayfinder::file_ops::numbered_name(name, n)))
         .find(|p| !taken(p))
         .unwrap_or(first)

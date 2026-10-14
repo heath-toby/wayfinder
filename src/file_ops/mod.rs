@@ -853,10 +853,10 @@ fn copy_directory_recursive(
                 replace,
                 moving,
             )?;
-        } else if info.file_type() == gio::FileType::Special {
+        } else if info.file_type() == gio::FileType::Special && !moving {
             // A socket or pipe can't be copied (GIO refuses, which would
-            // stop the whole folder partway): left out. (For a move, the
-            // source folder then isn't empty, so it stays.)
+            // stop the whole folder partway): a copy leaves it out. (A move
+            // stops instead: deleting the source after would lose it.)
             log::warn!("Left out {}: not a file to copy", child_source.uri());
         } else {
             copy_keeping_links(&child_source, &child_dest, flags, cancellable, progress)?;
@@ -1293,6 +1293,18 @@ fn clear_before_replace(src: gio::FileType, dst: gio::FileType, is_move: bool) -
 /// Whether renaming `old` to `new` changes only the case of its letters.
 pub fn is_case_only_change(old: &str, new: &str) -> bool {
     old != new && old.to_lowercase() == new.to_lowercase()
+}
+
+/// Whether nothing is at `path` (a link leading nowhere is something):
+/// `Ok(true)` only when it's not found. An error if it can't be told — a
+/// name that can't be checked isn't taken to be free, or what's there
+/// would be written over unasked.
+pub fn name_free(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether something is at `file` — a link too, even one leading nowhere
