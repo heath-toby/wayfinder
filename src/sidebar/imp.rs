@@ -8,9 +8,6 @@ pub struct SidebarInner {
     pub container: gtk::Box,
     /// Keep VolumeMonitor alive so its signals continue to fire.
     pub volume_monitor: gio::VolumeMonitor,
-    /// What right-clicking the Bin row does; kept to wire up the row again
-    /// when the sidebar is rebuilt.
-    pub trash_menu: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>,
 }
 
 impl Default for SidebarInner {
@@ -36,7 +33,6 @@ impl Default for SidebarInner {
             places_list,
             container,
             volume_monitor: gio::VolumeMonitor::get(),
-            trash_menu: Default::default(),
         }
     }
 }

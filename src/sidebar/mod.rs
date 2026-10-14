@@ -358,12 +358,30 @@ fn with_settings(item: &gtk::Widget) -> gtk::Box {
 
 /// "Reopen All Windows at Startup", on or off. A check box, so Orca says
 /// which; changing it is saved at once.
-fn settings_check() -> gtk::CheckButton {
+pub fn settings_check() -> gtk::CheckButton {
     let check = gtk::CheckButton::with_label("Reopen All Windows at Startup");
     check.set_active(crate::state::load_reopen_windows());
     // (Orca reads the box ticked or not; nothing more to say.)
     check.connect_toggled(|check| crate::state::save_reopen_windows(check.is_active()));
     check
+}
+
+/// Focus the first item of `popover`'s menu once it's on screen (not when
+/// it's "shown": it isn't yet, and focus would stay behind it).
+fn focus_first_when_shown(popover: &gtk::Popover) {
+    popover.connect_map(|pop| {
+        let pop = pop.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(first) = pop
+                .upgrade()
+                .filter(|p| p.is_visible())
+                .and_then(|p| p.child())
+                .and_then(|menu| menu.first_child())
+            {
+                first.grab_focus();
+            }
+        });
+    });
 }
 
 /// The menu for a bookmark row: Remove Bookmark, Edit Sidebar.
@@ -405,6 +423,49 @@ fn show_bookmark_menu(
 
     popover.set_child(Some(&vbox));
     popover.connect_closed(|pop| pop.unparent());
+    focus_first_when_shown(&popover);
+    popover.popup();
+}
+
+/// The menu for the Bin's row: Open Bin, Empty Bin, Edit Sidebar — on the
+/// row, as the other rows' menus are.
+fn show_trash_menu(sidebar: &WayfinderSidebar, parent: &gtk::Window, row: &gtk::ListBoxRow) {
+    let popover = gtk::Popover::new();
+    popover.set_parent(row);
+    popover.set_has_arrow(false);
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    vbox.add_css_class("menu");
+    for (label, action) in [
+        ("Open Bin", "win.open-trash"),
+        ("Empty Bin…", "win.empty-trash"),
+    ] {
+        let btn = gtk::Button::with_label(label);
+        btn.add_css_class("flat");
+        let pop = popover.clone();
+        let p = parent.clone();
+        btn.connect_clicked(move |_| {
+            pop.popdown();
+            let _ = p.activate_action(action, None);
+        });
+        vbox.append(&btn);
+    }
+
+    let edit_btn = gtk::Button::with_label("Edit Sidebar");
+    edit_btn.add_css_class("flat");
+    let s = sidebar.clone();
+    let p = parent.clone();
+    let pop = popover.clone();
+    edit_btn.connect_clicked(move |_| {
+        pop.popdown();
+        s.show_edit_dialog(&p);
+    });
+    vbox.append(&edit_btn);
+    vbox.append(&settings_check());
+
+    popover.set_child(Some(&vbox));
+    popover.connect_closed(|pop| pop.unparent());
+    focus_first_when_shown(&popover);
     popover.popup();
 }
 
@@ -964,42 +1025,12 @@ impl WayfinderSidebar {
         vm.connect_volume_removed(move |_, _| f());
     }
 
-    pub fn connect_trash_right_click<F: Fn() + 'static>(&self, callback: F) {
-        *self.imp().trash_menu.borrow_mut() = Some(std::rc::Rc::new(callback));
-        self.wire_trash_right_click();
-    }
-
-    /// Give the Bin row its right-click menu.
-    fn wire_trash_right_click(&self) {
-        let Some(callback) = self.imp().trash_menu.borrow().clone() else {
-            return;
-        };
-        // Walk through rows to find the trash row and add a right-click controller
-        let mut child = self.imp().places_list.first_child();
-        while let Some(widget) = child {
-            if widget.widget_name() == "place:trash:///" {
-                let click = gtk::GestureClick::new();
-                click.set_button(3);
-                let cb = callback.clone();
-                click.connect_pressed(move |gesture, _n, _x, _y| {
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                    cb();
-                });
-                widget.add_controller(click);
-                break;
-            }
-            child = widget.next_sibling();
-        }
-    }
-
     pub fn rebuild(&self) {
         let list = &self.imp().places_list;
         while let Some(child) = list.first_child() {
             list.remove(&child);
         }
         self.populate_places();
-        // The new Bin row needs its menu again.
-        self.wire_trash_right_click();
     }
 
     pub fn connect_sidebar_edit_menu(&self, parent_window: &gtk::Window) {
@@ -1013,6 +1044,8 @@ impl WayfinderSidebar {
             if let Some(row) = list.row_at_y(y as i32) {
                 let name = row.widget_name().to_string();
                 if name == "place:trash:///" {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    show_trash_menu(&sidebar, &parent, &row);
                     return;
                 }
                 if name.starts_with("bookmark:") {
@@ -1050,6 +1083,7 @@ impl WayfinderSidebar {
             }
             popover.set_child(Some(&menu));
             popover.connect_closed(|pop| pop.unparent());
+            focus_first_when_shown(&popover);
             popover.popup();
         });
         self.imp().places_list.add_controller(click);
@@ -1077,10 +1111,8 @@ impl WayfinderSidebar {
                 }
                 // The Bin's own menu, as right-click gives (Empty Bin).
                 if name == "place:trash:///" {
-                    if let Some(menu) = sidebar2.imp().trash_menu.borrow().clone() {
-                        menu();
-                        return glib::Propagation::Stop;
-                    }
+                    show_trash_menu(&sidebar2, &parent2, &row);
+                    return glib::Propagation::Stop;
                 }
             }
 
@@ -1114,6 +1146,7 @@ impl WayfinderSidebar {
             }
             popover.set_child(Some(&menu));
             popover.connect_closed(|pop| pop.unparent());
+            focus_first_when_shown(&popover);
             popover.popup();
             glib::Propagation::Stop
         });
@@ -1143,357 +1176,7 @@ impl WayfinderSidebar {
         dlg.add_controller(key_ctrl);
         dlg.update_property(&[gtk::accessible::Property::Label("Edit sidebar places")]);
 
-        // Load current config
-        let config = crate::state::load_sidebar_config();
-
-        // All available default places with their paths
-        let mut all_places: Vec<(&str, &str, String)> = Vec::new();
-        for place in PLACES {
-            if let Some(path) = (place.dir_fn)() {
-                all_places.push((place.name, place.icon, path.to_string_lossy().to_string()));
-            }
-        }
-        all_places.push(("File System", "drive-harddisk-symbolic", "/".to_string()));
-
-        // Determine order and visibility
-        struct EditRow {
-            id: String,
-            icon: String,
-            visible: bool,
-        }
-
-        let rows: Vec<EditRow> = if let Some(ref config) = config {
-            let mut result: Vec<EditRow> = Vec::new();
-            for entry in config {
-                if let Some((_name, icon, _path)) =
-                    all_places.iter().find(|(n, _, _)| *n == entry.id)
-                {
-                    result.push(EditRow {
-                        id: entry.id.clone(),
-                        icon: icon.to_string(),
-                        visible: entry.visible,
-                    });
-                }
-            }
-            // Add any places not in config
-            for (name, icon, _) in &all_places {
-                if !result.iter().any(|r| r.id == *name) {
-                    result.push(EditRow {
-                        id: name.to_string(),
-                        icon: icon.to_string(),
-                        visible: true,
-                    });
-                }
-            }
-            result
-        } else {
-            all_places
-                .iter()
-                .map(|(name, icon, _)| EditRow {
-                    id: name.to_string(),
-                    icon: icon.to_string(),
-                    visible: true,
-                })
-                .collect()
-        };
-
-        // Build the dialog UI
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        vbox.set_margin_top(12);
-        vbox.set_margin_bottom(12);
-        vbox.set_margin_start(12);
-        vbox.set_margin_end(12);
-
-        let instructions = gtk::Label::builder()
-            .label("Toggle places on or off. Use Ctrl+Up/Down to reorder.")
-            .xalign(0.0)
-            .wrap(true)
-            .build();
-        vbox.append(&instructions);
-
-        let scrolled = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .vexpand(true)
-            .build();
-
-        let edit_list = gtk::ListBox::new();
-        edit_list.set_selection_mode(gtk::SelectionMode::Single);
-        edit_list.update_property(&[gtk::accessible::Property::Label("Sidebar places")]);
-
-        let row_data: std::rc::Rc<std::cell::RefCell<Vec<(String, bool)>>> = std::rc::Rc::new(
-            std::cell::RefCell::new(rows.iter().map(|r| (r.id.clone(), r.visible)).collect()),
-        );
-
-        for row_info in &rows {
-            let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            hbox.set_margin_top(4);
-            hbox.set_margin_bottom(4);
-            hbox.set_margin_start(8);
-            hbox.set_margin_end(8);
-
-            let check = gtk::CheckButton::new();
-            check.set_active(row_info.visible);
-            check.update_property(&[gtk::accessible::Property::Label(&format!(
-                "Show {}",
-                row_info.id
-            ))]);
-
-            let icon = gtk::Image::from_icon_name(&row_info.icon);
-            icon.set_pixel_size(16);
-
-            let label = gtk::Label::builder()
-                .label(&row_info.id)
-                .xalign(0.0)
-                .hexpand(true)
-                .build();
-
-            hbox.append(&check);
-            hbox.append(&icon);
-            hbox.append(&label);
-
-            let list_row = gtk::ListBoxRow::new();
-            list_row.set_child(Some(&hbox));
-            list_row.set_widget_name(&row_info.id);
-            // The row is what has focus, so it says whether it's shown.
-            let row_label =
-                |id: &str, shown: bool| format!("{id}, {}", if shown { "shown" } else { "hidden" });
-            list_row.update_property(&[gtk::accessible::Property::Label(&row_label(
-                &row_info.id,
-                row_info.visible,
-            ))]);
-
-            // Sync checkbox with data
-            let data = row_data.clone();
-            let id = row_info.id.clone();
-            let row_for_label = list_row.clone();
-            let dlg_for_toggle = dlg.clone();
-            check.connect_toggled(move |cb| {
-                let mut d = data.borrow_mut();
-                if let Some(entry) = d.iter_mut().find(|(name, _)| name == &id) {
-                    entry.1 = cb.is_active();
-                }
-                let text = row_label(&id, cb.is_active());
-                row_for_label.update_property(&[gtk::accessible::Property::Label(&text)]);
-                dlg_for_toggle.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
-            });
-
-            edit_list.append(&list_row);
-        }
-
-        // Enter or Space on a row ticks or unticks it.
-        edit_list.connect_row_activated(|_, row| {
-            if let Some(check) = row
-                .child()
-                .and_then(|hbox| hbox.first_child())
-                .and_downcast::<gtk::CheckButton>()
-            {
-                check.set_active(!check.is_active());
-            }
-        });
-
-        scrolled.set_child(Some(&edit_list));
-        vbox.append(&scrolled);
-
-        // Keyboard controller for reordering with announcements
-        let key_ctrl = gtk::EventControllerKey::new();
-        // Capture: the ListBox's own Ctrl+arrow bindings would take the keys.
-        key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let list_for_keys = edit_list.clone();
-        let data_for_keys = row_data.clone();
-        let dlg_for_keys = dlg.clone();
-        key_ctrl.connect_key_pressed(move |_, key, _, mods| {
-            use gtk::gdk;
-            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
-            let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
-
-            if !ctrl {
-                return glib::Propagation::Proceed;
-            }
-
-            let is_move = matches!(
-                (key, shift),
-                (gdk::Key::Up | gdk::Key::Down, false) | (gdk::Key::Home | gdk::Key::End, true)
-            );
-            if !is_move {
-                return glib::Propagation::Proceed;
-            }
-
-            let Some(selected) = list_for_keys.selected_row() else {
-                return glib::Propagation::Proceed;
-            };
-            let idx = selected.index();
-            let n = data_for_keys.borrow().len() as i32;
-
-            // Check boundaries and announce if can't move
-            match (key, shift) {
-                (gdk::Key::Up, false) if idx == 0 => {
-                    dlg_for_keys.announce(
-                        "Already at top",
-                        gtk::AccessibleAnnouncementPriority::Medium,
-                    );
-                    return glib::Propagation::Stop;
-                }
-                (gdk::Key::Down, false) if idx >= n - 1 => {
-                    dlg_for_keys.announce(
-                        "Already at bottom",
-                        gtk::AccessibleAnnouncementPriority::Medium,
-                    );
-                    return glib::Propagation::Stop;
-                }
-                (gdk::Key::Home, true) if idx == 0 => {
-                    dlg_for_keys.announce(
-                        "Already at top",
-                        gtk::AccessibleAnnouncementPriority::Medium,
-                    );
-                    return glib::Propagation::Stop;
-                }
-                (gdk::Key::End, true) if idx >= n - 1 => {
-                    dlg_for_keys.announce(
-                        "Already at bottom",
-                        gtk::AccessibleAnnouncementPriority::Medium,
-                    );
-                    return glib::Propagation::Stop;
-                }
-                _ => {}
-            }
-
-            let new_idx = match (key, shift) {
-                (gdk::Key::Up, false) => idx - 1,
-                (gdk::Key::Down, false) => idx + 1,
-                (gdk::Key::Home, true) => 0,
-                (gdk::Key::End, true) => n - 1,
-                _ => unreachable!(),
-            };
-
-            // Compute the announcement before rebuilding
-            let announcement = {
-                let d = data_for_keys.borrow();
-                let neighbour_name = if key == gdk::Key::Up || (key == gdk::Key::Home && shift) {
-                    // Will move above — neighbour is the one currently at new_idx
-                    d.get(new_idx as usize)
-                        .map(|(name, _)| name.clone())
-                        .unwrap_or_default()
-                } else {
-                    // Will move below — neighbour is the one currently at new_idx
-                    d.get(new_idx as usize)
-                        .map(|(name, _)| name.clone())
-                        .unwrap_or_default()
-                };
-                match (key, shift) {
-                    (gdk::Key::Home, true) => "Moved to top".to_string(),
-                    (gdk::Key::End, true) => "Moved to bottom".to_string(),
-                    (gdk::Key::Up, _) => format!("Moved above {neighbour_name}"),
-                    (gdk::Key::Down, _) => format!("Moved below {neighbour_name}"),
-                    _ => String::new(),
-                }
-            };
-
-            // Move in data: remove from old position, insert at new
-            {
-                let mut d = data_for_keys.borrow_mut();
-                let item = d.remove(idx as usize);
-                d.insert(new_idx as usize, item);
-            }
-
-            // Rebuild the list visually to keep everything in sync
-            while let Some(child) = list_for_keys.first_child() {
-                list_for_keys.remove(&child);
-            }
-            let data = data_for_keys.borrow();
-            for (i, (id, vis)) in data.iter().enumerate() {
-                let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                hbox.set_margin_top(4);
-                hbox.set_margin_bottom(4);
-                hbox.set_margin_start(8);
-                hbox.set_margin_end(8);
-
-                let check = gtk::CheckButton::new();
-                check.set_active(*vis);
-                check.update_property(&[gtk::accessible::Property::Label(&format!("Show {id}"))]);
-
-                let icon_name = PLACES
-                    .iter()
-                    .find(|p| p.name == id)
-                    .map(|p| p.icon)
-                    .unwrap_or(if id == "File System" {
-                        "drive-harddisk-symbolic"
-                    } else {
-                        "folder-symbolic"
-                    });
-                let icon = gtk::Image::from_icon_name(icon_name);
-                icon.set_pixel_size(16);
-
-                let label = gtk::Label::builder()
-                    .label(id.as_str())
-                    .xalign(0.0)
-                    .hexpand(true)
-                    .build();
-
-                hbox.append(&check);
-                hbox.append(&icon);
-                hbox.append(&label);
-
-                let list_row = gtk::ListBoxRow::new();
-                list_row.set_child(Some(&hbox));
-                list_row.set_widget_name(id);
-
-                // The row says whether it's shown, as when the dialog opened.
-                let row_label = |id: &str, shown: bool| {
-                    format!("{id}, {}", if shown { "shown" } else { "hidden" })
-                };
-                // For the moved row, set the announcement as the label
-                // so Orca reads it instead of the plain name
-                if i == new_idx as usize {
-                    list_row.update_property(&[gtk::accessible::Property::Label(&announcement)]);
-                } else {
-                    list_row
-                        .update_property(&[gtk::accessible::Property::Label(&row_label(id, *vis))]);
-                }
-
-                // Sync checkbox
-                let data_ref = data_for_keys.clone();
-                let id_clone = id.clone();
-                let row_for_label = list_row.clone();
-                let dlg_for_toggle = dlg_for_keys.clone();
-                check.connect_toggled(move |cb| {
-                    let mut d = data_ref.borrow_mut();
-                    if let Some(entry) = d.iter_mut().find(|(name, _)| name == &id_clone) {
-                        entry.1 = cb.is_active();
-                    }
-                    let text = row_label(&id_clone, cb.is_active());
-                    row_for_label.update_property(&[gtk::accessible::Property::Label(&text)]);
-                    dlg_for_toggle.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
-                });
-
-                list_for_keys.append(&list_row);
-
-                if i == new_idx as usize {
-                    list_for_keys.select_row(Some(&list_row));
-                    // Restore the real label after Orca has read the announcement
-                    let row_ref = list_row.clone();
-                    // Read when it runs: the box may be ticked meanwhile.
-                    let check_now = check.clone();
-                    let id_now = id.clone();
-                    let row_to_focus = list_row.clone();
-                    glib::idle_add_local_once(move || {
-                        row_to_focus.grab_focus();
-                    });
-                    glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(500),
-                        move || {
-                            row_ref.update_property(&[gtk::accessible::Property::Label(
-                                &row_label(&id_now, check_now.is_active()),
-                            )]);
-                        },
-                    );
-                }
-            }
-            drop(data);
-
-            glib::Propagation::Stop
-        });
-        edit_list.add_controller(key_ctrl);
+        let (vbox, edit_list, row_data) = places_editor();
 
         // Done button
         let done_btn = gtk::Button::with_label("Done");
@@ -1504,25 +1187,9 @@ impl WayfinderSidebar {
         dlg.set_child(Some(&vbox));
 
         let d = dlg.clone();
-        let data_for_save = row_data.clone();
         done_btn.connect_clicked(move |_| {
-            // Save config
-            let data = data_for_save.borrow();
-            let entries: Vec<crate::state::SidebarEntry> = data
-                .iter()
-                .map(|(id, vis)| crate::state::SidebarEntry {
-                    id: id.clone(),
-                    visible: *vis,
-                })
-                .collect();
-            crate::state::save_sidebar_config(&entries);
-
             d.close();
-
-            // Rebuild the sidebars (every window's: they share the setup)
-            for other in live_sidebars() {
-                other.rebuild();
-            }
+            save_places(&row_data);
         });
 
         dlg.present();
@@ -1670,6 +1337,379 @@ impl WayfinderSidebar {
 impl Default for WayfinderSidebar {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The list of places that can be shown in the sidebar, each with a check
+/// box (Ctrl+Up/Down and Ctrl+Shift+Home/End reorder it), with its
+/// instructions, in a box: for Edit Sidebar and Preferences. Also the list,
+/// and the places as they're edited (`save_places` keeps them).
+pub fn places_editor() -> (gtk::Box, gtk::ListBox, PlacesEdit) {
+    // Load current config
+    let config = crate::state::load_sidebar_config();
+
+    // All available default places with their paths
+    let mut all_places: Vec<(&str, &str, String)> = Vec::new();
+    for place in PLACES {
+        if let Some(path) = (place.dir_fn)() {
+            all_places.push((place.name, place.icon, path.to_string_lossy().to_string()));
+        }
+    }
+    all_places.push(("File System", "drive-harddisk-symbolic", "/".to_string()));
+
+    // Determine order and visibility
+    struct EditRow {
+        id: String,
+        icon: String,
+        visible: bool,
+    }
+
+    let rows: Vec<EditRow> = if let Some(ref config) = config {
+        let mut result: Vec<EditRow> = Vec::new();
+        for entry in config {
+            if let Some((_name, icon, _path)) = all_places.iter().find(|(n, _, _)| *n == entry.id) {
+                result.push(EditRow {
+                    id: entry.id.clone(),
+                    icon: icon.to_string(),
+                    visible: entry.visible,
+                });
+            }
+        }
+        // Add any places not in config
+        for (name, icon, _) in &all_places {
+            if !result.iter().any(|r| r.id == *name) {
+                result.push(EditRow {
+                    id: name.to_string(),
+                    icon: icon.to_string(),
+                    visible: true,
+                });
+            }
+        }
+        result
+    } else {
+        all_places
+            .iter()
+            .map(|(name, icon, _)| EditRow {
+                id: name.to_string(),
+                icon: icon.to_string(),
+                visible: true,
+            })
+            .collect()
+    };
+
+    // Build the dialog UI
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    let instructions = gtk::Label::builder()
+        .label("Toggle places on or off. Use Ctrl+Up/Down to reorder.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    vbox.append(&instructions);
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .build();
+
+    let edit_list = gtk::ListBox::new();
+    edit_list.set_selection_mode(gtk::SelectionMode::Single);
+    edit_list.update_property(&[gtk::accessible::Property::Label("Sidebar places")]);
+
+    let row_data: std::rc::Rc<std::cell::RefCell<Vec<(String, bool)>>> = std::rc::Rc::new(
+        std::cell::RefCell::new(rows.iter().map(|r| (r.id.clone(), r.visible)).collect()),
+    );
+
+    for row_info in &rows {
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        hbox.set_margin_top(4);
+        hbox.set_margin_bottom(4);
+        hbox.set_margin_start(8);
+        hbox.set_margin_end(8);
+
+        let check = gtk::CheckButton::new();
+        check.set_active(row_info.visible);
+        check.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Show {}",
+            row_info.id
+        ))]);
+
+        let icon = gtk::Image::from_icon_name(&row_info.icon);
+        icon.set_pixel_size(16);
+
+        let label = gtk::Label::builder()
+            .label(&row_info.id)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+
+        hbox.append(&check);
+        hbox.append(&icon);
+        hbox.append(&label);
+
+        let list_row = gtk::ListBoxRow::new();
+        list_row.set_child(Some(&hbox));
+        list_row.set_widget_name(&row_info.id);
+        // The row is what has focus, so it says whether it's shown.
+        let row_label =
+            |id: &str, shown: bool| format!("{id}, {}", if shown { "shown" } else { "hidden" });
+        list_row.update_property(&[gtk::accessible::Property::Label(&row_label(
+            &row_info.id,
+            row_info.visible,
+        ))]);
+
+        // Sync checkbox with data
+        let data = row_data.clone();
+        let id = row_info.id.clone();
+        let row_for_label = list_row.clone();
+        let dlg_for_toggle = edit_list.clone();
+        check.connect_toggled(move |cb| {
+            let mut d = data.borrow_mut();
+            if let Some(entry) = d.iter_mut().find(|(name, _)| name == &id) {
+                entry.1 = cb.is_active();
+            }
+            let text = row_label(&id, cb.is_active());
+            row_for_label.update_property(&[gtk::accessible::Property::Label(&text)]);
+            dlg_for_toggle.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+        });
+
+        edit_list.append(&list_row);
+    }
+
+    // Enter or Space on a row ticks or unticks it.
+    edit_list.connect_row_activated(|_, row| {
+        if let Some(check) = row
+            .child()
+            .and_then(|hbox| hbox.first_child())
+            .and_downcast::<gtk::CheckButton>()
+        {
+            check.set_active(!check.is_active());
+        }
+    });
+
+    scrolled.set_child(Some(&edit_list));
+    vbox.append(&scrolled);
+
+    // Keyboard controller for reordering with announcements
+    let key_ctrl = gtk::EventControllerKey::new();
+    // Capture: the ListBox's own Ctrl+arrow bindings would take the keys.
+    key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let list_for_keys = edit_list.clone();
+    let data_for_keys = row_data.clone();
+    let dlg_for_keys = edit_list.clone();
+    key_ctrl.connect_key_pressed(move |_, key, _, mods| {
+        use gtk::gdk;
+        let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+        let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+
+        if !ctrl {
+            return glib::Propagation::Proceed;
+        }
+
+        let is_move = matches!(
+            (key, shift),
+            (gdk::Key::Up | gdk::Key::Down, false) | (gdk::Key::Home | gdk::Key::End, true)
+        );
+        if !is_move {
+            return glib::Propagation::Proceed;
+        }
+
+        let Some(selected) = list_for_keys.selected_row() else {
+            return glib::Propagation::Proceed;
+        };
+        let idx = selected.index();
+        let n = data_for_keys.borrow().len() as i32;
+
+        // Check boundaries and announce if can't move
+        match (key, shift) {
+            (gdk::Key::Up, false) if idx == 0 => {
+                dlg_for_keys.announce(
+                    "Already at top",
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+                return glib::Propagation::Stop;
+            }
+            (gdk::Key::Down, false) if idx >= n - 1 => {
+                dlg_for_keys.announce(
+                    "Already at bottom",
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+                return glib::Propagation::Stop;
+            }
+            (gdk::Key::Home, true) if idx == 0 => {
+                dlg_for_keys.announce(
+                    "Already at top",
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+                return glib::Propagation::Stop;
+            }
+            (gdk::Key::End, true) if idx >= n - 1 => {
+                dlg_for_keys.announce(
+                    "Already at bottom",
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+                return glib::Propagation::Stop;
+            }
+            _ => {}
+        }
+
+        let new_idx = match (key, shift) {
+            (gdk::Key::Up, false) => idx - 1,
+            (gdk::Key::Down, false) => idx + 1,
+            (gdk::Key::Home, true) => 0,
+            (gdk::Key::End, true) => n - 1,
+            _ => unreachable!(),
+        };
+
+        // Compute the announcement before rebuilding
+        let announcement = {
+            let d = data_for_keys.borrow();
+            let neighbour_name = if key == gdk::Key::Up || (key == gdk::Key::Home && shift) {
+                // Will move above — neighbour is the one currently at new_idx
+                d.get(new_idx as usize)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_default()
+            } else {
+                // Will move below — neighbour is the one currently at new_idx
+                d.get(new_idx as usize)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_default()
+            };
+            match (key, shift) {
+                (gdk::Key::Home, true) => "Moved to top".to_string(),
+                (gdk::Key::End, true) => "Moved to bottom".to_string(),
+                (gdk::Key::Up, _) => format!("Moved above {neighbour_name}"),
+                (gdk::Key::Down, _) => format!("Moved below {neighbour_name}"),
+                _ => String::new(),
+            }
+        };
+
+        // Move in data: remove from old position, insert at new
+        {
+            let mut d = data_for_keys.borrow_mut();
+            let item = d.remove(idx as usize);
+            d.insert(new_idx as usize, item);
+        }
+
+        // Rebuild the list visually to keep everything in sync
+        while let Some(child) = list_for_keys.first_child() {
+            list_for_keys.remove(&child);
+        }
+        let data = data_for_keys.borrow();
+        for (i, (id, vis)) in data.iter().enumerate() {
+            let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            hbox.set_margin_top(4);
+            hbox.set_margin_bottom(4);
+            hbox.set_margin_start(8);
+            hbox.set_margin_end(8);
+
+            let check = gtk::CheckButton::new();
+            check.set_active(*vis);
+            check.update_property(&[gtk::accessible::Property::Label(&format!("Show {id}"))]);
+
+            let icon_name = PLACES
+                .iter()
+                .find(|p| p.name == id)
+                .map(|p| p.icon)
+                .unwrap_or(if id == "File System" {
+                    "drive-harddisk-symbolic"
+                } else {
+                    "folder-symbolic"
+                });
+            let icon = gtk::Image::from_icon_name(icon_name);
+            icon.set_pixel_size(16);
+
+            let label = gtk::Label::builder()
+                .label(id.as_str())
+                .xalign(0.0)
+                .hexpand(true)
+                .build();
+
+            hbox.append(&check);
+            hbox.append(&icon);
+            hbox.append(&label);
+
+            let list_row = gtk::ListBoxRow::new();
+            list_row.set_child(Some(&hbox));
+            list_row.set_widget_name(id);
+
+            // The row says whether it's shown, as when the dialog opened.
+            let row_label =
+                |id: &str, shown: bool| format!("{id}, {}", if shown { "shown" } else { "hidden" });
+            // For the moved row, set the announcement as the label
+            // so Orca reads it instead of the plain name
+            if i == new_idx as usize {
+                list_row.update_property(&[gtk::accessible::Property::Label(&announcement)]);
+            } else {
+                list_row.update_property(&[gtk::accessible::Property::Label(&row_label(id, *vis))]);
+            }
+
+            // Sync checkbox
+            let data_ref = data_for_keys.clone();
+            let id_clone = id.clone();
+            let row_for_label = list_row.clone();
+            let dlg_for_toggle = dlg_for_keys.clone();
+            check.connect_toggled(move |cb| {
+                let mut d = data_ref.borrow_mut();
+                if let Some(entry) = d.iter_mut().find(|(name, _)| name == &id_clone) {
+                    entry.1 = cb.is_active();
+                }
+                let text = row_label(&id_clone, cb.is_active());
+                row_for_label.update_property(&[gtk::accessible::Property::Label(&text)]);
+                dlg_for_toggle.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+            });
+
+            list_for_keys.append(&list_row);
+
+            if i == new_idx as usize {
+                list_for_keys.select_row(Some(&list_row));
+                // Restore the real label after Orca has read the announcement
+                let row_ref = list_row.clone();
+                // Read when it runs: the box may be ticked meanwhile.
+                let check_now = check.clone();
+                let id_now = id.clone();
+                let row_to_focus = list_row.clone();
+                glib::idle_add_local_once(move || {
+                    row_to_focus.grab_focus();
+                });
+                glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                    row_ref.update_property(&[gtk::accessible::Property::Label(&row_label(
+                        &id_now,
+                        check_now.is_active(),
+                    ))]);
+                });
+            }
+        }
+        drop(data);
+
+        glib::Propagation::Stop
+    });
+    edit_list.add_controller(key_ctrl);
+
+    (vbox, edit_list, row_data)
+}
+
+/// Places as edited: (name, shown), in order.
+pub type PlacesEdit = std::rc::Rc<std::cell::RefCell<Vec<(String, bool)>>>;
+
+/// Keep the places as edited, and show them in every window's sidebar.
+pub fn save_places(edit: &PlacesEdit) {
+    let entries: Vec<crate::state::SidebarEntry> = edit
+        .borrow()
+        .iter()
+        .map(|(id, vis)| crate::state::SidebarEntry {
+            id: id.clone(),
+            visible: *vis,
+        })
+        .collect();
+    crate::state::save_sidebar_config(&entries);
+    for other in live_sidebars() {
+        other.rebuild();
     }
 }
 

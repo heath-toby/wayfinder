@@ -40,6 +40,32 @@ impl WayfinderListView {
         );
     }
 
+    /// Show the Original Location column (in the Bin) or not. Left sorted
+    /// by it, the list goes back to sorting by name.
+    pub fn show_original_location(&self, show: bool) {
+        let imp = self.imp();
+        imp.origin_column.set_visible(show);
+        imp.origin_button.set_visible(show);
+        if show {
+            return;
+        }
+        let sorter = imp
+            .column_view
+            .sorter()
+            .and_downcast::<gtk::ColumnViewSorter>();
+        if sorter.and_then(|s| s.primary_sort_column()) == Some(imp.origin_column.clone()) {
+            if let Some(name) = imp
+                .column_view
+                .columns()
+                .item(0)
+                .and_downcast::<gtk::ColumnViewColumn>()
+            {
+                imp.column_view
+                    .sort_by_column(Some(&name), gtk::SortType::Ascending);
+            }
+        }
+    }
+
     /// Whether sort changes are saved for next time (default: yes).
     pub fn set_persist_sort(&self, persist: bool) {
         self.imp().persist_sort.set(persist);

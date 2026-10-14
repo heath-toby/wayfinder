@@ -258,6 +258,8 @@ impl WayfinderWindow {
                     .unwrap_or_else(|| path.to_string());
                 let count = imp.model.item_count();
                 imp.current_column.set(0);
+                // (The Bin's Original Location column, there only.)
+                imp.list_view.show_original_location(w.is_in_trash());
                 imp.file_selection.borrow_mut().clear();
                 imp.type_ahead_buffer.borrow_mut().clear();
                 imp.selection.set_selected(0);
@@ -300,6 +302,8 @@ impl WayfinderWindow {
 
                 // Reset column, selection state, type-ahead
                 imp.current_column.set(0);
+                // (The Bin's Original Location column, there only.)
+                imp.list_view.show_original_location(self.is_in_trash());
                 imp.file_selection.borrow_mut().clear();
                 imp.type_ahead_buffer.borrow_mut().clear();
 
@@ -442,6 +446,8 @@ impl WayfinderWindow {
                 let count = imp.model.item_count();
 
                 imp.current_column.set(0);
+                // (The Bin's Original Location column, there only.)
+                imp.list_view.show_original_location(self.is_in_trash());
                 imp.file_selection.borrow_mut().clear();
                 imp.type_ahead_buffer.borrow_mut().clear();
 
@@ -652,12 +658,84 @@ impl WayfinderWindow {
         }
     }
 
+    /// Set the state of the window's stateful action `name` (what the menus
+    /// show ticked).
+    pub(crate) fn set_action_state(&self, name: &str, value: glib::Variant) {
+        if let Some(action) = self.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+            action.set_state(&value);
+        }
+    }
+
+    /// Sort by the column `column` (or the one sorted by now), `descending`
+    /// or not (or as it is now) — as clicking a column's header does, which
+    /// says and saves it.
+    pub(crate) fn sort_by(&self, column: Option<u32>, descending: Option<bool>) {
+        let column_view = self.imp().list_view.column_view();
+        let sorter = column_view.sorter().and_downcast::<gtk::ColumnViewSorter>();
+        let current = sorter.as_ref().and_then(|s| s.primary_sort_column());
+        let columns = column_view.columns();
+        let col = match column {
+            Some(i) => columns.item(i).and_downcast::<gtk::ColumnViewColumn>(),
+            None => current,
+        };
+        let Some(col) = col else {
+            return;
+        };
+        let descending = descending.unwrap_or_else(|| {
+            sorter
+                .as_ref()
+                .is_some_and(|s| s.primary_sort_order() == gtk::SortType::Descending)
+        });
+        let order = if descending {
+            gtk::SortType::Descending
+        } else {
+            gtk::SortType::Ascending
+        };
+        column_view.sort_by_column(Some(&col), order);
+    }
+
+    /// Copy the selected files' full paths, one a line, as text (Edit >
+    /// Copy Path): for a terminal, a chat, a document.
+    pub fn copy_paths(&self) {
+        let files = self.get_selected_files();
+        if files.is_empty() {
+            self.say_marked_hidden();
+            return;
+        }
+        if self.is_in_trash() {
+            self.announce(
+                "Items in the Bin have no path to copy. Restore them first.",
+                AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
+        let text = files
+            .iter()
+            .map(|f| f.path())
+            .collect::<Vec<_>>()
+            .join("\n");
+        WidgetExt::display(self).clipboard().set_text(&text);
+        // (The clipboard now holds text, not files: Paste mustn't paste
+        // files copied before.)
+        wayfinder::clipboard::global_clear();
+        let msg = match files.as_slice() {
+            [one] => format!("Copied the path of {}", one.name()),
+            _ => format!("Copied {} paths", files.len()),
+        };
+        self.announce(&msg, AccessibleAnnouncementPriority::Medium);
+    }
+
     pub fn switch_view(&self, mode: ViewMode) {
         let imp = self.imp();
         if imp.current_view.get() == mode {
             return;
         }
         imp.current_view.set(mode);
+        let key = match mode {
+            ViewMode::Grid => "grid",
+            ViewMode::List => "list",
+        };
+        self.set_action_state("view-mode", key.to_variant());
         match mode {
             ViewMode::Grid => {
                 imp.list_view
@@ -1522,36 +1600,23 @@ impl WayfinderWindow {
     fn paste_with_gio(&self, plan: PastePlan, guard: PastingGuard) {
         let parent_window: gtk::Window = self.clone().upcast();
         let dest_dir_gio = gio::File::for_path(&plan.dest_dir);
-        // Each reload callback holds a clone of the shared guard, which
-        // drops when the last one finishes (or all are dropped without
-        // running, e.g. due to panic).
-        let shared_guard = std::rc::Rc::new(guard);
-        for source in &plan.files {
-            let w = self.clone();
-            let guard_held = shared_guard.clone();
-            let changed = plan.changed.clone();
-            let moved = plan.moved.clone();
-            let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
-                let _g = guard_held;
-                w.forget_moved(&moved);
-                w.reload_after_change(&changed);
-            }));
-            if plan.is_move {
-                wayfinder::file_ops::move_with_progress(
-                    source,
-                    &dest_dir_gio,
-                    &parent_window,
-                    reload,
-                );
-            } else {
-                wayfinder::file_ops::copy_with_progress(
-                    source,
-                    &dest_dir_gio,
-                    &parent_window,
-                    reload,
-                );
-            }
-        }
+        // Everything in one progress window, and one reload when it's over
+        // (the guard held until then).
+        let w = self.clone();
+        let changed = plan.changed.clone();
+        let moved = plan.moved.clone();
+        let reload: Option<Box<dyn FnOnce() + 'static>> = Some(Box::new(move || {
+            let _g = guard;
+            w.forget_moved(&moved);
+            w.reload_after_change(&changed);
+        }));
+        wayfinder::file_ops::transfer_all(
+            plan.files.clone(),
+            &dest_dir_gio,
+            &parent_window,
+            plan.is_move,
+            reload,
+        );
     }
 
     pub fn trash_selected(&self) {
@@ -2086,89 +2151,11 @@ impl WayfinderWindow {
                             return;
                         }
 
-                        // Otherwise: if any path is a FUSE mount (sshfs, gvfs,
-                        // unrecognised rclone mount, etc.), run the delete in
-                        // a background thread with a progress dialog so the
-                        // UI stays responsive.
-                        let any_slow = file_paths.iter().any(|(_, p)| is_fuse_mount(p));
-                        if any_slow {
-                            run_threaded_delete(&window, file_paths, from);
-                            return;
-                        }
-
-                        // Off the main thread: a big folder takes a while,
-                        // and a link may lead onto a slow mount.
-                        let first = file_paths
-                            .first()
-                            .map(|(_, p)| p.clone())
-                            .unwrap_or_default();
-                        window.run_blocking(
-                            &first,
-                            move || {
-                                let mut success = 0;
-                                let mut failed = 0;
-                                let mut last_error = String::new();
-                                for (name, path) in &file_paths {
-                                    let gio_file = gio::File::for_path(path);
-                                    match wayfinder::file_ops::delete_file_recursive(&gio_file) {
-                                        Ok(()) => success += 1,
-                                        Err(e) => {
-                                            failed += 1;
-                                            last_error = format!("{name}: {e}");
-                                        }
-                                    }
-                                }
-                                let first_name = file_paths
-                                    .first()
-                                    .map(|(n, _)| n.clone())
-                                    .unwrap_or_default();
-                                (success, failed, last_error, first_name)
-                            },
-                            move |window, (success, failed, last_error, first_name)| {
-                                // Announce failures first
-                                // (With what was deleted, if anything was.)
-                                if failed > 0 {
-                                    let went = match success {
-                                        0 => String::new(),
-                                        1 => "1 file deleted. ".to_string(),
-                                        n => format!("{n} files deleted. "),
-                                    };
-                                    if failed == 1 {
-                                        window.announce(
-                                            &format!("{went}Could not delete: {last_error}"),
-                                            AccessibleAnnouncementPriority::High,
-                                        );
-                                    } else {
-                                        window.announce(
-                                            &format!("{went}{failed} files could not be deleted"),
-                                            AccessibleAnnouncementPriority::High,
-                                        );
-                                    }
-                                }
-                                if success > 0 {
-                                    // Select once the list no longer holds the
-                                    // deleted rows, so focus can't land on one.
-                                    window.reload_after_removal(from, move |w, relisted| {
-                                        if failed > 0 {
-                                            return;
-                                        }
-                                        let msg = if success == 1 {
-                                            format!("Deleted {first_name}")
-                                        } else {
-                                            format!("Deleted {success} files")
-                                        };
-                                        if relisted {
-                                            w.announce(
-                                                &msg,
-                                                AccessibleAnnouncementPriority::Medium,
-                                            );
-                                        } else {
-                                            w.announce_after_navigation(msg);
-                                        }
-                                    });
-                                }
-                            },
-                        );
+                        // Otherwise in a background thread, with a progress
+                        // window (if it takes a moment) counting down what's
+                        // left: a big folder takes a while, and a link may
+                        // lead onto a slow mount.
+                        run_threaded_delete(&window, file_paths, from);
                     }
                 }
             },
@@ -3132,7 +3119,11 @@ impl WayfinderWindow {
             (
                 "General",
                 &[
+                    ("F10", "Menu bar"),
                     ("Ctrl+N", "New window"),
+                    ("Ctrl+W", "Close window"),
+                    ("Ctrl+Q", "Quit Wayfinder"),
+                    ("Ctrl+,", "Preferences"),
                     ("Ctrl+`", "Open terminal here"),
                     ("Menu or Shift+F10", "Context menu"),
                     ("Tab", "Path completion (in location bar)"),
@@ -3431,8 +3422,8 @@ impl RemovedFrom {
     }
 }
 
-/// Spawn a threaded delete with a non-modal progress dialog. Used for
-/// FUSE mounts where each per-file delete may take seconds.
+/// Delete permanently in a background thread, with a progress window (if
+/// it takes a moment) counting down what's left.
 fn run_threaded_delete(
     window: &WayfinderWindow,
     file_paths: Vec<(String, String)>,
@@ -3440,52 +3431,84 @@ fn run_threaded_delete(
 ) {
     let parent: gtk::Window = window.clone().upcast();
     let paths: Vec<String> = file_paths.iter().map(|(_, p)| p.clone()).collect();
-    let names: Vec<String> = file_paths.iter().map(|(n, _)| n.clone()).collect();
+    let first_name = file_paths
+        .first()
+        .map(|(n, _)| n.clone())
+        .unwrap_or_default();
     let total = paths.len();
     let win = window.clone();
-    let on_complete: Option<Box<dyn FnOnce(usize, usize) + 'static>> =
-        Some(Box::new(move |success, failed| {
-            // Reload so the UI reflects the deletions, then restore focus
-            // near the previous position — unless nothing was deleted
-            // (cancelled, or every delete failed).
+    let on_complete: Option<wayfinder::file_ops::DeleteCompleteCallback> =
+        Some(Box::new(move |success, failed, why| {
+            let (msg, trouble) =
+                delete_outcome(success, failed, total, &first_name, why.as_deref());
+            let priority = if trouble {
+                AccessibleAnnouncementPriority::High
+            } else {
+                AccessibleAnnouncementPriority::Medium
+            };
             if success > 0 {
-                win.reload_after_removal(from, |_, _| {});
+                // Said once the list no longer holds the deleted rows (the
+                // focus moving would cut it off), near where they were.
+                win.reload_after_removal(from, move |w, relisted| {
+                    if relisted {
+                        w.announce(&msg, priority);
+                    } else {
+                        w.announce_after_navigation(msg);
+                    }
+                });
             } else {
                 // A folder may be partly gone: show what's there now, but
                 // leave the selection where the user put it.
                 win.forget_moved(&from.removed);
                 win.reload_after_change(std::slice::from_ref(&from.folder));
-            }
-
-            // Announce outcome
-            if success + failed < total && success + failed > 0 {
-                let mut msg = format!("Deletion cancelled after {success} of {total} items");
-                if failed > 0 {
-                    msg.push_str(&format!(", {failed} could not be deleted"));
-                }
-                win.announce(&msg, AccessibleAnnouncementPriority::Medium);
-            } else if failed == 0 && success > 0 {
-                let msg = if success == 1 {
-                    format!("Deleted {}", names[0])
-                } else {
-                    format!("Deleted {success} of {total} items")
-                };
-                win.announce(&msg, AccessibleAnnouncementPriority::Medium);
-            } else if failed > 0 && success == 0 {
-                win.announce(
-                    &format!("Failed to delete {failed} item(s)"),
-                    AccessibleAnnouncementPriority::High,
-                );
-            } else if failed > 0 {
-                win.announce(
-                    &format!("Deleted {success}, failed to delete {failed}"),
-                    AccessibleAnnouncementPriority::High,
-                );
-            } else {
-                win.announce("Deletion cancelled", AccessibleAnnouncementPriority::Medium);
+                win.announce(&msg, priority);
             }
         }));
     wayfinder::file_ops::delete_with_progress(paths, &parent, on_complete);
+}
+
+/// What's said when a permanent delete of `total` items is over: `success`
+/// deleted, `failed` not (`why`, the first's reason); fewer than all,
+/// together, means it was cancelled. And whether something went wrong.
+fn delete_outcome(
+    success: usize,
+    failed: usize,
+    total: usize,
+    first_name: &str,
+    why: Option<&str>,
+) -> (String, bool) {
+    let deleted = |n: usize| {
+        if n == 1 && total == 1 {
+            format!("Deleted {first_name}")
+        } else {
+            format!("Deleted {n} of {total} items")
+        }
+    };
+    let mut parts = Vec::new();
+    if failed > 0 {
+        let mut couldnt = format!("Couldn't delete {}", why.unwrap_or("an item"));
+        if failed > 1 {
+            couldnt.push_str(&format!(", nor {} more", failed - 1));
+        }
+        parts.push(couldnt);
+    }
+    if success + failed < total {
+        parts.push("Cancelled".to_string());
+    }
+    if success > 0 {
+        if failed == 0 && success == total {
+            return (
+                if total == 1 {
+                    deleted(1)
+                } else {
+                    format!("Deleted {total} items")
+                },
+                false,
+            );
+        }
+        parts.push(deleted(success));
+    }
+    (parts.join(". "), failed > 0)
 }
 
 /// Run a permanent delete via direct `rclone deletefile`/`purge` calls,
@@ -3665,6 +3688,7 @@ fn link_target(real: &std::path::Path) -> FileObject {
     FileObject::from_data(
         &parent,
         &wayfinder::file_object::FileInfoData {
+            original_location: String::new(),
             name: name.clone(),
             display_name: name,
             is_hidden: false,
@@ -3703,11 +3727,25 @@ fn dropped_paths(text: &str) -> Vec<String> {
 /// so they stay in Recent Files under their new names.
 fn note_renames(pairs: &[(String, String)]) {
     let recent = gtk::RecentManager::default();
+    // (Found by the file it names, not its address as written: apps write
+    // addresses differently — escaped otherwise, say — and a renamed file
+    // whose entry wasn't found dropped out of Recent Files.)
+    let items: Vec<(String, Option<std::path::PathBuf>)> = recent
+        .items()
+        .iter()
+        .map(|item| {
+            let uri = item.uri().to_string();
+            let path = gio::File::for_uri(&uri).path();
+            (uri, path)
+        })
+        .collect();
     for (old, new) in pairs {
-        let old_uri = gio::File::for_path(old).uri();
-        if recent.has_item(&old_uri) {
-            let new_uri = gio::File::for_path(new).uri();
-            if let Err(e) = recent.move_item(&old_uri, Some(new_uri.as_str())) {
+        let new_uri = gio::File::for_path(new).uri();
+        for (uri, _) in items
+            .iter()
+            .filter(|(_, path)| path.as_deref() == Some(std::path::Path::new(old)))
+        {
+            if let Err(e) = recent.move_item(uri, Some(new_uri.as_str())) {
                 log::warn!("Couldn't update Recent Files for {old}: {e}");
             }
         }
@@ -4211,6 +4249,19 @@ mod tests {
         assert_eq!(
             super::range_from_anchor(5, at, "/d/b", gtk::INVALID_LIST_POSITION),
             None
+        );
+    }
+
+    #[test]
+    fn a_permanent_delete_ends_in_a_sentence() {
+        let say = |s, f, t, why| super::delete_outcome(s, f, t, "a.txt", why).0;
+        assert_eq!(say(1, 0, 1, None), "Deleted a.txt");
+        assert_eq!(say(5, 0, 5, None), "Deleted 5 items");
+        assert_eq!(say(2, 0, 5, None), "Cancelled. Deleted 2 of 5 items");
+        assert_eq!(say(0, 0, 5, None), "Cancelled");
+        assert_eq!(
+            say(3, 2, 5, Some("b: Permission denied")),
+            "Couldn't delete b: Permission denied, nor 1 more. Deleted 3 of 5 items"
         );
     }
 

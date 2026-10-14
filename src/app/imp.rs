@@ -26,6 +26,7 @@ impl ApplicationImpl for WayfinderApplicationInner {
     fn startup(&self) {
         self.parent_startup();
         let app = self.obj().clone();
+        crate::menubar::install(app.upcast_ref());
         let rx = crate::dbus::start_service();
         crate::dbus::connect_to_app(app.upcast_ref(), rx);
 

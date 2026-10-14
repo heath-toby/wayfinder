@@ -111,9 +111,11 @@ pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
 /// List a GIO location such as `trash:///`. (Types by name: the Bin holds
 /// what was binned on mounts too, and sniffing would download it.)
 pub(super) fn list_uri(uri: &str) -> ListResult {
+    // (And, in the Bin, where each came from: its Original Location column.)
+    let attrs = format!("{FUSE_ATTRS},trash::orig-path");
     let enumerator = gio::File::for_uri(uri)
         .enumerate_children(
-            FUSE_ATTRS,
+            &attrs,
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
             gio::Cancellable::NONE,
         )
@@ -236,6 +238,7 @@ fn name_only(path: &std::path::Path) -> FileInfoData {
         .unwrap_or_default();
     let (content_type, _) = gio::content_type_guess(Some(path), None);
     FileInfoData {
+        original_location: String::new(),
         display_name: name.clone(),
         is_hidden: name.starts_with('.'),
         size_unknown: true,
@@ -452,6 +455,7 @@ mod tests {
             entries: vec![(
                 path.to_string(),
                 FileInfoData {
+                    original_location: String::new(),
                     name: "report.txt".to_string(),
                     display_name: "report.txt".to_string(),
                     is_hidden: false,

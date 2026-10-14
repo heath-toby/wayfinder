@@ -25,6 +25,8 @@ pub struct FileInfoData {
     pub modified: i64,
     pub modified_display: String,
     pub content_type: String,
+    /// In the Bin: the folder it was deleted from (empty elsewhere).
+    pub original_location: String,
 }
 
 impl FileInfoData {
@@ -62,6 +64,19 @@ impl FileInfoData {
         .unwrap_or_default();
 
         let display_name = info.display_name().to_string();
+        // (Only asked for in the Bin: asking for an attribute that wasn't
+        // requested is a GLib critical.)
+        let original_location = if info.has_attribute("trash::orig-path") {
+            info.attribute_byte_string("trash::orig-path")
+                .and_then(|p| {
+                    std::path::Path::new(p.as_str())
+                        .parent()
+                        .map(|d| d.to_string_lossy().to_string())
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let is_hidden = name.starts_with('.')
             || (info.has_attribute(gio::FILE_ATTRIBUTE_STANDARD_IS_HIDDEN) && info.is_hidden());
         Self {
@@ -74,6 +89,7 @@ impl FileInfoData {
             modified,
             modified_display,
             content_type,
+            original_location,
         }
     }
 }
@@ -122,13 +138,17 @@ impl FileObject {
             String::from("File")
         };
         let search_string = name.to_lowercase();
-        let a11y_name = if data.is_directory {
+        let mut a11y_name = if data.is_directory {
             format!("{name}, Folder")
         } else if data.size_unknown {
             format!("{name}, size unknown, {file_type_name}")
         } else {
             format!("{name}, {size_display}, {file_type_name}")
         };
+        // (In the Bin, where it came from: read with the rest.)
+        if !data.original_location.is_empty() {
+            a11y_name.push_str(&format!(", from {}", data.original_location));
+        }
 
         glib::Object::builder()
             .property("name", name)
@@ -144,6 +164,7 @@ impl FileObject {
             .property("hidden", hidden)
             .property("search-string", &search_string)
             .property("a11y-name", &a11y_name)
+            .property("original-location", &data.original_location)
             .build()
     }
 

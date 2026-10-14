@@ -18,6 +18,26 @@ struct Details {
     mode: Option<u32>,
     /// For an item in the Bin, the folder it came from.
     came_from: Option<String>,
+    /// For a link, where it leads (and whether anything is there).
+    link_to: Option<String>,
+}
+
+/// Where the link at `link` leads, as shown: `target` as written, with the
+/// full path too if it's written relative to the link's folder; "(missing)"
+/// if nothing is there (`exists`: whether something is).
+fn link_target_text(link: &std::path::Path, target: &std::path::Path, exists: bool) -> String {
+    let written = target.to_string_lossy().to_string();
+    let mut text = if target.is_absolute() {
+        written
+    } else {
+        let folder = link.parent().unwrap_or(std::path::Path::new("/"));
+        let full = wayfinder::path_complete::clean(&folder.join(target).to_string_lossy());
+        format!("{written} ({full})")
+    };
+    if !exists {
+        text.push_str(" (missing)");
+    }
+    text
 }
 
 /// setuid, setgid and sticky.
@@ -57,6 +77,17 @@ fn gather_details(path: &str) -> Result<Details, String> {
         });
     // The item itself, as Modified is: for a link, not what it leads to.
     let metadata = std::fs::symlink_metadata(path).ok();
+    let link_to = metadata
+        .as_ref()
+        .filter(|m| m.file_type().is_symlink())
+        .and_then(|_| std::fs::read_link(path).ok())
+        .map(|target| {
+            link_target_text(
+                std::path::Path::new(path),
+                &target,
+                std::fs::metadata(path).is_ok(),
+            )
+        });
     Ok(Details {
         modified,
         created: metadata.as_ref().and_then(|m| m.created().ok()),
@@ -67,6 +98,7 @@ fn gather_details(path: &str) -> Result<Details, String> {
             .filter(|m| !m.file_type().is_symlink())
             .map(|m| m.permissions().mode()),
         came_from,
+        link_to,
     })
 }
 
@@ -142,8 +174,18 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
     add_info_row(&grid, row, "Name", &file.name());
     row += 1;
 
-    add_info_row(&grid, row, "Kind", &file.file_type_name());
+    // (A link is a link, not "inode/symlink".)
+    let kind = if details.link_to.is_some() {
+        "Link".to_string()
+    } else {
+        file.file_type_name()
+    };
+    add_info_row(&grid, row, "Kind", &kind);
     row += 1;
+    if let Some(link_to) = &details.link_to {
+        add_info_row(&grid, row, "Link to", link_to);
+        row += 1;
+    }
 
     if !file.is_directory() {
         let size_detail = format!("{} ({} bytes)", file.size_display(), file.size());
@@ -567,4 +609,34 @@ fn add_info_row(grid: &gtk::Grid, row: i32, label_text: &str, value: &str) {
 
     grid.attach(&label, 0, row, 1, 1);
     grid.attach(&entry, 1, row, 1, 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_target_text;
+    use std::path::Path;
+
+    #[test]
+    fn a_link_says_where_it_leads() {
+        assert_eq!(
+            link_target_text(
+                Path::new("/etc/localtime"),
+                Path::new("/usr/share/zoneinfo/UTC"),
+                true
+            ),
+            "/usr/share/zoneinfo/UTC"
+        );
+        assert_eq!(
+            link_target_text(
+                Path::new("/etc/mtab"),
+                Path::new("../proc/self/mounts"),
+                true
+            ),
+            "../proc/self/mounts (/proc/self/mounts)"
+        );
+        assert_eq!(
+            link_target_text(Path::new("/etc/x"), Path::new("gone"), false),
+            "gone (/etc/gone) (missing)"
+        );
+    }
 }

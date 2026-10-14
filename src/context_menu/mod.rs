@@ -37,6 +37,22 @@ fn focused_index(buttons: &[gtk::Button]) -> Option<usize> {
     buttons.iter().position(|b| b.has_focus() || b.is_focus())
 }
 
+/// Focus the first of `items` once `popover` is on screen. (When it's
+/// "shown" it isn't yet: the focus could stay in the list behind, where the
+/// arrow keys then went.)
+fn focus_first_when_shown(popover: &gtk::Popover, items: &gtk::Box) {
+    let items = items.clone();
+    popover.connect_map(move |pop| {
+        let items = items.clone();
+        let pop = pop.downgrade();
+        glib::idle_add_local_once(move || {
+            if pop.upgrade().is_some_and(|p| p.is_visible()) {
+                focus_button(&get_buttons(&items), 0);
+            }
+        });
+    });
+}
+
 /// Focus the button at the given index.
 fn focus_button(buttons: &[gtk::Button], idx: usize) {
     if let Some(btn) = buttons.get(idx) {
@@ -130,6 +146,17 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
         add_menu_item(&main_box, "Delete Permanently", &popover, {
             let w = window.clone();
             move || w.delete_selected()
+        });
+        add_separator(&main_box);
+        // (Where it came from, and when it was deleted, are there.)
+        add_menu_item(&main_box, "Properties", &popover, {
+            let w = window.clone();
+            move || {
+                let win = w.clone();
+                glib::idle_add_local_once(move || {
+                    win.show_properties();
+                });
+            }
         });
         add_separator(&main_box);
         add_menu_item(&main_box, "Empty Bin", &popover, {
@@ -638,11 +665,7 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
     popover.set_has_arrow(false);
 
     // Focus the first item when the popover opens
-    let mb = main_box.clone();
-    popover.connect_show(move |_| {
-        let buttons = get_buttons(&mb);
-        focus_button(&buttons, 0);
-    });
+    focus_first_when_shown(&popover, &main_box);
 
     let w = window.clone();
     popover.connect_closed(move |pop| {
@@ -735,11 +758,7 @@ pub fn show_background_menu(window: &WayfinderWindow, x: f64, y: f64, in_trash: 
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
     popover.set_has_arrow(false);
 
-    let vb = vbox.clone();
-    popover.connect_show(move |_| {
-        let buttons = get_buttons(&vb);
-        focus_button(&buttons, 0);
-    });
+    focus_first_when_shown(&popover, &vbox);
 
     let w = window.clone();
     popover.connect_closed(move |pop| {

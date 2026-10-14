@@ -120,6 +120,8 @@ pub fn show<W>(
     )]);
 
     button_box.append(&cancel_btn);
+    let background_btn = crate::operations::background_button(&dlg, parent);
+    button_box.append(&background_btn);
     button_box.append(&save_log_btn);
     button_box.append(&close_btn);
 
@@ -181,6 +183,23 @@ pub fn show<W>(
         });
     }
 
+    // Closing the window cancels, as Cancel does (put away until rclone
+    // has stopped, which is then said from the window behind). Continue in
+    // Background only hides it.
+    crate::operations::register(&dlg);
+    {
+        let cancel = cancel_btn.clone();
+        dlg.connect_close_request(move |d| {
+            if !crate::operations::is_running(d) {
+                return glib::Propagation::Proceed;
+            }
+            if cancel.is_sensitive() {
+                cancel.emit_clicked();
+            }
+            d.set_visible(false);
+            glib::Propagation::Stop
+        });
+    }
     // (Results are said from this window, which has focus: Orca may not
     // speak for the one behind it.)
     dlg.present();
@@ -252,6 +271,8 @@ pub fn show<W>(
     let error_prefix = labels.error_prefix;
     let cancel_flag_poll = cancel_flag.clone();
     let mut on_complete_holder = on_complete;
+    let dlg_done = dlg.clone();
+    let background_done = background_btn.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
         loop {
             match rx.try_recv() {
@@ -283,6 +304,7 @@ pub fn show<W>(
                 Ok(RcloneEvent::Finished(result)) => {
                     pulsing_done.set(false);
                     cancel_clone.set_sensitive(false);
+                    background_done.set_sensitive(false);
                     close_clone.set_sensitive(true);
                     close_clone.grab_focus();
                     let was_cancelled = cancel_flag_poll.load(Ordering::Relaxed);
@@ -322,6 +344,7 @@ pub fn show<W>(
                             say(&msg, AccessibleAnnouncementPriority::High);
                         }
                     }
+                    crate::operations::finished(&dlg_done);
                     if let Some(cb) = on_complete_holder.take() {
                         cb(succeeded);
                     }
@@ -331,11 +354,13 @@ pub fn show<W>(
                 Err(_) => {
                     pulsing_done.set(false);
                     cancel_clone.set_sensitive(false);
+                    background_done.set_sensitive(false);
                     close_clone.set_sensitive(true);
                     close_clone.grab_focus();
                     let msg = "rclone disconnected unexpectedly. Operation may be incomplete.";
                     status_clone.set_text(msg);
                     say(msg, AccessibleAnnouncementPriority::High);
+                    crate::operations::finished(&dlg_done);
                     if let Some(cb) = on_complete_holder.take() {
                         cb(false);
                     }

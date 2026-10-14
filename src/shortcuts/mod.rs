@@ -49,8 +49,11 @@ pub fn register_shortcuts(window: &super::window::WayfinderWindow) {
     add_shortcut(&controller, "<Shift>F10", "win.context-menu");
     add_shortcut(&controller, "Menu", "win.context-menu");
 
-    // New window
+    // New window; close it; quit; preferences
     add_shortcut(&controller, "<Ctrl>n", "win.new-window");
+    add_shortcut(&controller, "<Ctrl>w", "win.close-window");
+    add_shortcut(&controller, "<Ctrl>q", "app.quit");
+    add_shortcut(&controller, "<Ctrl>comma", "app.preferences");
 
     // Go to folder (same dialog as Ctrl+L)
     add_shortcut(&controller, "<Ctrl><Shift>g", "win.location-bar");

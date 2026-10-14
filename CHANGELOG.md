@@ -1,10 +1,16 @@
 # Changelog
 
-## 2.5.1
+## 2.6.0
 
 ### New
 
-- **Reopen All Windows at Startup** — every window of your last session is opened again, each at the folder it last showed, including windows you closed along the way. (Before, this only worked if all the windows were closed at once, and in practice never.) It's a setting, on by default, in the sidebar's menu: press the Menu key or Shift+F10 on any place, or right-click one.
+- **Reopen All Windows at Startup** — every window of your last session is opened again, each at the folder it last showed, including windows you closed along the way. (Before, this only worked if all the windows were closed at once, and in practice never.) It's a setting, on by default, in Preferences and in the sidebar's menu (press the Menu key or Shift+F10 on any place, or right-click one).
+- **Menu bar** — F10 opens it. Wayfinder (About, Preferences, Keyboard Shortcuts, Quit), File, Edit, View, Go and Window menus hold everything the keyboard shortcuts do, each showing its shortcut, and a few things that had no key: Copy Path, Sort By (name, size, date modified or kind, and descending), and Music, Pictures, Videos and Recent Files in the Go menu. Show Hidden Files, the sidebar, the breadcrumb bar, the view and the sort are shown ticked when on.
+- **Preferences** (Ctrl+comma) — General (Reopen All Windows at Startup) and Sidebar (which places it shows, and in what order) pages.
+- **Operations in Progress** — progress windows (copy, move, delete, download, sync, actions) have a Continue in Background button: the window is put away while the work goes on, and Window > Operations in Progress brings it back. Closing the window instead cancels, as Cancel does (a delete finishes the item it's on first; an action, which can't be stopped, is put away). Quitting while operations run asks first.
+- **Close Window** (Ctrl+W) and **Quit** (Ctrl+Q).
+- **One progress window for a copy or move**, as in the Finder — not one per item, with a folder's bar starting again for every file in it. It first says "Preparing to copy 5,283 items to Files", counting up as it finds them, then "Copying 5,280 items to Files", counting down as each is done; the field below says "250 MB of 2.5 GB, about 2 minutes remaining, 20 MB/s". Clashes are asked about one at a time before it starts; an item that fails doesn't stop the rest, and what happened is said at the end ("Couldn't copy b: No space left on device. 4 of 5 copied"). Moves within a drive are instant, as before, and a copy that's quickly done shows no window at all. (Copies through rclone keep rclone's own window.)
+- **Deleting permanently** gets the same kind of window, on your own disks too (it had none there): "Preparing to delete 5,283 items", then "Deleting 5,280 items", counting down as each file and folder goes, with "1,200 of 5,283 items deleted, about 30 seconds remaining" below. Cancel now stops between files, not only between the items selected. A quick delete shows no window; what happened is said at the end, with the reason if something couldn't be deleted. (Deleting from the Bin, and through rclone, are as before.)
 
 ### Fixed
 
@@ -163,15 +169,14 @@
 - **Back to a folder that's gone** — when its parent opens instead, Forward no longer stays on, going to the same folder.
 - **Recent Files** — with a cloud drive that has dropped, the list no longer waits needlessly before showing.
 - **Changes made by other programs** — a file written while the folder was being refreshed no longer goes unseen until the next refresh.
-- **Closing a copy, move or delete progress window** (Alt+F4) — cancels, as Cancel does (it went on, unseen); a delete's window stays until the item being deleted is done. (rclone's progress windows can still be closed to let the work run on, saying when it's done.)
 - **Copying onto a name that can't be checked** (a mount erroring) — asks, as for a name taken, instead of merging into the folder there; "Keep both" says why it can't (no free number, a name too long, the mount's error) instead of merging into the existing folder.
 - **Keeping a folder offline again** — if the old offline copy can't be removed, it says so, instead of downloading beside it and reporting success.
-- **Properties** — a link's Created and Last Opened dates are shown; an item in the Bin shows its Original Location; Apply with an invalid octal number says so instead of applying the last valid one.
+- **Properties** — a link says where it leads (Link to, with the full path if it's written relative, and "missing" if nothing's there), and its Kind is Link, not inode/symlink; its Created and Last Opened dates are shown; an item in the Bin shows its Original Location; Apply with an invalid octal number says so instead of applying the last valid one.
 - **Go to Location** — Tab on `~` completes to `~/`; Escape closes it from its buttons too.
 - **Hiding the sidebar** (F3) with focus in it — focus goes to the files, instead of nowhere.
 - **Context menus** — Down with no item focused goes to the first item, not the second.
 - **Sidebar** — the Menu key (or Shift+F10) on the Bin opens its own menu with Empty Bin, as right-click does; removing a bookmark names it as it's shown.
-- **Renaming in Recent Files** — the renamed file is the one selected afterwards (another of the same name, from another folder, could be — and a Delete pressed next would go to it); renaming several there no longer leaves their folders' cached listings showing the old names.
+- **Renaming in Recent Files** — the file stays in Recent Files under its new name (one whose entry another app had written its own way dropped out of the list); the renamed file is the one selected afterwards (another of the same name, from another folder, could be — and a Delete pressed next would go to it); renaming several there no longer leaves their folders' cached listings showing the old names.
 - **Requests from other apps to show a file** — one that couldn't be shown then (the drive was unreachable) is no longer announced on a later, unrelated visit.
 - **The Bin in several windows** — emptying it, or restoring from it, in one window shows in the others when you go to them.
 - **Delete pressed again** while a file is still going to the Bin (on a slow drive) says so, instead of nothing; Shift+Delete leaves such a file alone instead of deleting it at the same time.
@@ -181,6 +186,8 @@
 - **Keep Available Offline pressed again** while it's downloading — says so, instead of starting a second download into the same copy.
 - **Suspend** — if the system bus goes away while offline copies are paused for sleep, they're no longer paused for the rest of the session; a download that can't be waited on is stopped, not left running.
 - **Two-way sync** — a sync that finishes after its pairing was changed to other folders no longer marks the new pairing as synced (its first sync then failed every time).
+- **Context menus** — Down and Up go through a menu as soon as it opens (focus could stay in the list behind it, where Up reached the column buttons); the sidebar's menus start on their first item too.
+- **The Bin** — an Original Location column shows where each item was deleted from (and Orca reads it with the row: "report.pdf, 2 MB, PDF document, from /home/u/Documents"; Left and Right reach it too); Properties is in its context menu.
 
 ### Development
 

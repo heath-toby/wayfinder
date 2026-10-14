@@ -14,7 +14,11 @@ use wayfinder::navigation::NavigationState;
 use wayfinder::sidebar::WayfinderSidebar;
 use wayfinder::views::{WayfinderGridView, WayfinderListView};
 
-const COLUMN_NAMES: &[&str] = &["Name", "Size", "Date Modified", "Kind"];
+/// The list's columns, as Left and Right read them (the last, in the Bin
+/// only).
+const COLUMN_NAMES: &[&str] = &["Name", "Size", "Date Modified", "Kind", "Original Location"];
+/// The columns, as the View menu's Sort By names them (in their order).
+const SORT_KEYS: &[&str] = &["name", "size", "modified", "kind"];
 
 pub struct SelectionState {
     pub selected: std::collections::HashSet<String>, // paths of selected files
@@ -287,22 +291,40 @@ impl ObjectImpl for WayfinderWindowInner {
         let w = window.clone();
         self.sidebar_toggle.connect_toggled(move |btn| {
             let visible = btn.is_active();
-            // (Hidden with focus in it: focus to the files, not nowhere.)
+            // (Hidden with focus in it: focus to the files first, not left
+            // in a sidebar on its way out.)
             let focus_inside =
                 gtk::prelude::GtkWindowExt::focus(&w).is_some_and(|f| f.is_ancestor(&revealer));
-            revealer.set_reveal_child(visible);
             if !visible && focus_inside {
                 w.restore_focus_to_selected();
             }
+            revealer.set_reveal_child(visible);
             wayfinder::state::save_sidebar_visible(visible);
             let msg = if visible {
                 "Sidebar shown"
             } else {
                 "Sidebar hidden"
             };
+            // (The View menu's tick follows the button, however it's
+            // toggled.)
+            w.set_action_state("toggle-sidebar", visible.to_variant());
             w.announce(msg, gtk::AccessibleAnnouncementPriority::Medium);
         });
         header.pack_end(&self.sidebar_toggle);
+        // Once the sidebar has gone, focus left in it (or lost with it) goes
+        // to the files.
+        let w = window.clone();
+        self.sidebar_revealer
+            .connect_child_revealed_notify(move |revealer| {
+                if revealer.is_child_revealed() {
+                    return;
+                }
+                let lost =
+                    gtk::prelude::GtkWindowExt::focus(&w).is_none_or(|f| f.is_ancestor(revealer));
+                if lost {
+                    w.restore_focus_to_selected();
+                }
+            });
 
         // Breadcrumb toggle button
         let breadcrumb_visible = wayfinder::state::load_breadcrumb_visible();
@@ -321,6 +343,7 @@ impl ObjectImpl for WayfinderWindowInner {
             } else {
                 "Breadcrumb bar hidden"
             };
+            w.set_action_state("toggle-breadcrumb", visible.to_variant());
             w.announce(msg, gtk::AccessibleAnnouncementPriority::Medium);
         });
         header.pack_end(&self.breadcrumb_toggle);
@@ -560,6 +583,136 @@ impl WindowImpl for WayfinderWindowInner {
 impl ApplicationWindowImpl for WayfinderWindowInner {}
 
 impl WayfinderWindowInner {
+    /// Actions the menu bar offers beyond the keyboard's: the view and
+    /// sort as choices, more places to go, Copy Path, Close Window and
+    /// Operations in Progress.
+    fn setup_menu_actions(&self) {
+        let window = self.obj();
+
+        // View mode, as the View menu's choice (Ctrl+1 and Ctrl+2 are
+        // view-grid and view-list).
+        let w = window.clone();
+        let current = match self.current_view.get() {
+            ViewMode::Grid => "grid",
+            ViewMode::List => "list",
+        };
+        let action = gio::SimpleAction::new_stateful(
+            "view-mode",
+            Some(glib::VariantTy::STRING),
+            &current.to_variant(),
+        );
+        action.connect_activate(move |_, param| match param.and_then(|p| p.str()) {
+            Some("grid") => w.switch_view(ViewMode::Grid),
+            Some("list") => w.switch_view(ViewMode::List),
+            _ => {}
+        });
+        window.add_action(&action);
+
+        // Sort by, and which way: as a column's header does (the icon view
+        // shares the list's order).
+        let (col, asc) = wayfinder::state::load_sort_state();
+        let key = SORT_KEYS.get(col as usize).copied().unwrap_or("name");
+        let w = window.clone();
+        let action = gio::SimpleAction::new_stateful(
+            "sort-by",
+            Some(glib::VariantTy::STRING),
+            &key.to_variant(),
+        );
+        action.connect_activate(move |_, param| {
+            let Some(i) = param
+                .and_then(|p| p.str())
+                .and_then(|k| SORT_KEYS.iter().position(|s| *s == k))
+            else {
+                return;
+            };
+            w.sort_by(Some(i as u32), None);
+        });
+        window.add_action(&action);
+
+        let w = window.clone();
+        let action = gio::SimpleAction::new_stateful("sort-descending", None, &(!asc).to_variant());
+        action.connect_activate(move |action, _| {
+            let descending = !action
+                .state()
+                .and_then(|s| s.get::<bool>())
+                .unwrap_or(false);
+            w.sort_by(None, Some(descending));
+        });
+        window.add_action(&action);
+
+        // The menus' ticks follow the order however it's changed (a
+        // column's header too).
+        if let Some(sorter) = self
+            .list_view
+            .column_view()
+            .sorter()
+            .and_downcast::<gtk::ColumnViewSorter>()
+        {
+            let w = window.clone();
+            sorter.connect_changed(move |sorter, _| {
+                let columns = w.imp().list_view.column_view().columns();
+                let Some(col) = sorter.primary_sort_column() else {
+                    return;
+                };
+                let index = (0..columns.n_items()).find(|i| {
+                    columns.item(*i).and_downcast::<gtk::ColumnViewColumn>() == Some(col.clone())
+                });
+                if let Some(key) = index.and_then(|i| SORT_KEYS.get(i as usize)) {
+                    w.set_action_state("sort-by", (*key).to_variant());
+                }
+                let descending = sorter.primary_sort_order() == gtk::SortType::Descending;
+                w.set_action_state("sort-descending", descending.to_variant());
+            });
+        }
+
+        // More places to go (the Go menu).
+        for (name, dir) in [
+            (
+                "music",
+                dirs::audio_dir as fn() -> Option<std::path::PathBuf>,
+            ),
+            ("pictures", dirs::picture_dir),
+            ("videos", dirs::video_dir),
+        ] {
+            let w = window.clone();
+            let action = gio::SimpleAction::new(name, None);
+            action.connect_activate(move |_, _| match dir() {
+                Some(dir) => w.navigate_to_path(&dir.to_string_lossy()),
+                None => w.announce(
+                    "That folder isn't set up on this computer",
+                    AccessibleAnnouncementPriority::Medium,
+                ),
+            });
+            window.add_action(&action);
+        }
+        let w = window.clone();
+        let action = gio::SimpleAction::new("recent", None);
+        action.connect_activate(move |_, _| w.load_special_uri("recent:///"));
+        window.add_action(&action);
+
+        let w = window.clone();
+        let action = gio::SimpleAction::new("copy-path", None);
+        action.connect_activate(move |_, _| w.copy_paths());
+        window.add_action(&action);
+
+        let w = window.clone();
+        let action = gio::SimpleAction::new("close-window", None);
+        action.connect_activate(move |_, _| w.close());
+        window.add_action(&action);
+
+        let w = window.clone();
+        let action = gio::SimpleAction::new("show-operations", None);
+        action.connect_activate(move |_, _| {
+            if wayfinder::operations::show_all() == 0 {
+                w.announce(
+                    "No operations in progress",
+                    AccessibleAnnouncementPriority::Medium,
+                );
+            }
+        });
+        window.add_action(&action);
+    }
+
     fn setup_actions(&self) {
         let window = self.obj();
 
@@ -639,10 +792,16 @@ impl WayfinderWindowInner {
 
         // location-bar action is set up in setup_location_dialog()
 
+        // (Stateful: the View menu shows it ticked or not.)
         let w = window.clone();
-        let action = gio::SimpleAction::new("toggle-hidden", None);
-        action.connect_activate(move |_, _| {
+        let action = gio::SimpleAction::new_stateful(
+            "toggle-hidden",
+            None,
+            &self.model.showing_hidden().to_variant(),
+        );
+        action.connect_activate(move |action, _| {
             let showing = w.imp().model.toggle_hidden();
+            action.set_state(&showing.to_variant());
             wayfinder::state::save_show_hidden(showing);
             let msg = if showing {
                 "Showing hidden files"
@@ -671,7 +830,11 @@ impl WayfinderWindowInner {
 
         // Sidebar toggle (F3) — flip the button, which triggers connect_toggled
         let toggle = self.sidebar_toggle.clone();
-        let action = gio::SimpleAction::new("toggle-sidebar", None);
+        let action = gio::SimpleAction::new_stateful(
+            "toggle-sidebar",
+            None,
+            &toggle.is_active().to_variant(),
+        );
         action.connect_activate(move |_, _| {
             toggle.set_active(!toggle.is_active());
         });
@@ -679,7 +842,11 @@ impl WayfinderWindowInner {
 
         // Breadcrumb toggle (F4)
         let toggle = self.breadcrumb_toggle.clone();
-        let action = gio::SimpleAction::new("toggle-breadcrumb", None);
+        let action = gio::SimpleAction::new_stateful(
+            "toggle-breadcrumb",
+            None,
+            &toggle.is_active().to_variant(),
+        );
         action.connect_activate(move |_, _| {
             toggle.set_active(!toggle.is_active());
         });
@@ -694,6 +861,8 @@ impl WayfinderWindowInner {
             search_entry.grab_focus();
         });
         window.add_action(&action);
+
+        self.setup_menu_actions();
 
         // File operations
         let w = window.clone();
@@ -1133,7 +1302,12 @@ impl WayfinderWindowInner {
                 glib::Propagation::Stop
             } else if key == gdk::Key::Right && !mods.contains(gdk::ModifierType::ALT_MASK) {
                 let col = imp.current_column.get();
-                if col + 1 < COLUMN_NAMES.len() {
+                let columns = if window.is_in_trash() {
+                    COLUMN_NAMES.len()
+                } else {
+                    COLUMN_NAMES.len() - 1
+                };
+                if col + 1 < columns {
                     imp.current_column.set(col + 1);
                     imp.announce_current_cell(&window);
                 }
@@ -1490,30 +1664,6 @@ impl WayfinderWindowInner {
                 window.navigate_to_path(&path);
             }
         });
-        // Right-click on Bin shows "Empty Bin" menu
-        let window2 = self.obj().clone();
-        self.sidebar.connect_trash_right_click(move || {
-            let menu = gio::Menu::new();
-            menu.append(Some("Open Bin"), Some("win.open-trash"));
-            menu.append(Some("Empty Bin"), Some("win.empty-trash"));
-
-            let popover = gtk::PopoverMenu::from_model(Some(&menu));
-            popover.set_parent(window2.upcast_ref::<gtk::Widget>());
-            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(10, 10, 1, 1)));
-            popover.set_has_arrow(false);
-
-            let w = window2.clone();
-            popover.connect_closed(move |pop| {
-                pop.unparent();
-                let win = w.clone();
-                glib::idle_add_local_once(move || {
-                    win.restore_focus_to_selected();
-                });
-            });
-
-            popover.popup();
-        });
-
         // Right-click on sidebar (non-bookmark, non-trash) shows "Edit Sidebar" menu
         self.sidebar
             .connect_sidebar_edit_menu(&self.obj().clone().upcast());
@@ -1661,6 +1811,7 @@ impl WayfinderWindowInner {
                 1 => file.size_display(),
                 2 => file.modified_display(),
                 3 => file.file_type_name(),
+                4 => file.original_location(),
                 _ => String::new(),
             };
             let announcement = format!("{col_name}: {value}");

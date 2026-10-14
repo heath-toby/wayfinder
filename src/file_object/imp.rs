@@ -34,6 +34,9 @@ pub struct FileObject {
     search_string: RefCell<String>,
     #[property(get, set)]
     a11y_name: RefCell<String>,
+    /// In the Bin: the folder it was deleted from (empty elsewhere).
+    #[property(get, set)]
+    original_location: RefCell<String>,
 }
 
 #[glib::object_subclass]

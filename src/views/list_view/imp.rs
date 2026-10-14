@@ -12,6 +12,10 @@ pub struct ListViewInner {
     /// Whether sorting is remembered for next time (not in the portal's
     /// file chooser, which mustn't change Wayfinder's own sort).
     pub persist_sort: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The Bin's Original Location column, and its header button: shown
+    /// only there.
+    pub origin_column: ColumnViewColumn,
+    pub origin_button: gtk::Button,
 }
 
 impl Default for ListViewInner {
@@ -132,6 +136,36 @@ impl Default for ListViewInner {
             .build();
         column_view.append_column(&kind_column);
 
+        // Original Location (in the Bin only) with sorter
+        let origin_factory = SignalListItemFactory::new();
+        setup_label_factory(&origin_factory, "original-location");
+        let desc = descending.clone();
+        let origin_sorter = CustomSorter::new(move |a, b| {
+            let a = a.downcast_ref::<FileObject>().unwrap();
+            let b = b.downcast_ref::<FileObject>().unwrap();
+            if let Some(order) = folders_first(a, b, desc.get()) {
+                return order;
+            }
+            let cmp = a
+                .original_location()
+                .cmp(&b.original_location())
+                .then_with(|| a.search_string().cmp(&b.search_string()));
+            match cmp {
+                std::cmp::Ordering::Less => gtk::Ordering::Smaller,
+                std::cmp::Ordering::Greater => gtk::Ordering::Larger,
+                std::cmp::Ordering::Equal => gtk::Ordering::Equal,
+            }
+        });
+        let origin_column = ColumnViewColumn::builder()
+            .title("Original Location")
+            .factory(&origin_factory)
+            .sorter(&origin_sorter)
+            .fixed_width(220)
+            .resizable(true)
+            .visible(false)
+            .build();
+        column_view.append_column(&origin_column);
+
         column_view.update_property(&[gtk::accessible::Property::Label("File list")]);
 
         // Build accessible header row — buttons that trigger sorting
@@ -143,6 +177,7 @@ impl Default for ListViewInner {
             ("Size", size_column.clone()),
             ("Date Modified", modified_column.clone()),
             ("Kind", kind_column.clone()),
+            ("Original Location", origin_column.clone()),
         ];
 
         // Track current sort column index and direction — restore from saved state
@@ -262,6 +297,7 @@ impl Default for ListViewInner {
                 size_sorter.clone(),
                 modified_sorter.clone(),
                 kind_sorter.clone(),
+                origin_sorter.clone(),
             ];
             let idx = sort_col_idx.clone();
             let asc = sort_ascending.clone();
@@ -333,10 +369,15 @@ impl Default for ListViewInner {
             .child(&inner_box)
             .build();
 
+        let origin_button = all_buttons[4].1.clone();
+        origin_button.set_visible(false);
+
         Self {
             column_view,
             scrolled_window,
             persist_sort,
+            origin_column,
+            origin_button,
         }
     }
 }
@@ -496,6 +537,7 @@ mod tests {
         FileObject::from_data(
             "/d",
             &FileInfoData {
+                original_location: String::new(),
                 name: name.to_string(),
                 display_name: name.to_string(),
                 is_hidden: false,

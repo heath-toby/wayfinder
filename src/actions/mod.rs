@@ -411,6 +411,19 @@ fn show_action_progress(
     vbox.append(&progress_bar);
     vbox.append(&hide_btn);
     dlg.set_child(Some(&vbox));
+    // Put away (or closed: an action can't be stopped), it's hidden while
+    // it runs; Window > Operations in Progress brings it back.
+    crate::operations::register(&dlg);
+    {
+        let parent = parent.clone();
+        dlg.connect_close_request(move |d| {
+            if !crate::operations::is_running(d) {
+                return glib::Propagation::Proceed;
+            }
+            crate::operations::hide(d, &parent);
+            glib::Propagation::Stop
+        });
+    }
     dlg.present();
     hide_btn.grab_focus();
 
@@ -421,7 +434,7 @@ fn show_action_progress(
         pb.pulse();
         match rx.try_recv() {
             Ok(Ok(())) => {
-                dlg.close();
+                crate::operations::close(&dlg);
                 p.announce(
                     &format!("{name} complete"),
                     AccessibleAnnouncementPriority::Medium,
@@ -429,7 +442,7 @@ fn show_action_progress(
                 glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
-                dlg.close();
+                crate::operations::close(&dlg);
                 p.announce(
                     &format!("{name} failed: {e}"),
                     AccessibleAnnouncementPriority::High,
@@ -438,7 +451,7 @@ fn show_action_progress(
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(_) => {
-                dlg.close();
+                crate::operations::close(&dlg);
                 glib::ControlFlow::Break
             }
         }
