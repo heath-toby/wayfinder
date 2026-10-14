@@ -2896,7 +2896,12 @@ impl WayfinderWindow {
         // (No row selected — a search matching nothing, say: a range
         // started is kept for when there is one.)
         let Some(here) = (pos < n).then(|| path_at(pos)).flatten() else {
-            self.announce("No file selected", AccessibleAnnouncementPriority::Medium);
+            let msg = if imp.file_selection.borrow().range_anchor.is_some() {
+                "No file selected. The selection started is kept; Escape cancels it"
+            } else {
+                "No file selected"
+            };
+            self.announce(msg, AccessibleAnnouncementPriority::Medium);
             return;
         };
         let anchor = imp.file_selection.borrow().range_anchor.clone();
@@ -3584,8 +3589,8 @@ fn newest_trashed(
         std::collections::HashMap::new();
     for (orig, date, name) in items {
         // ISO 8601 local time: later sorts after.
-        // (An item with no date can't be told apart: taken, as before.)
-        if !wanted.contains(orig.as_str()) || (!date.is_empty() && date.as_str() < since) {
+        // (One with no date isn't Wayfinder's: GLib dates what it bins.)
+        if !wanted.contains(orig.as_str()) || date.is_empty() || date.as_str() < since {
             continue;
         }
         if newest.get(&orig).is_none_or(|(d, _)| date > *d) {
@@ -3828,13 +3833,16 @@ fn parent_dir(path: &str) -> Option<String> {
 /// The rows a Shift+Space range covers: from the file it started on —
 /// found by path, as files may have come or gone since — to the selected
 /// row `pos`, of `n` rows (`path_at` gives each one's path). None if that
-/// file isn't listed any more.
+/// file isn't listed any more, or `pos` isn't a row.
 fn range_from_anchor(
     n: u32,
     path_at: impl Fn(u32) -> Option<String>,
     anchor: &str,
     pos: u32,
 ) -> Option<(u32, u32)> {
+    if pos >= n {
+        return None;
+    }
     let start = (0..n).find(|i| path_at(*i).as_deref() == Some(anchor))?;
     Some((start.min(pos), start.max(pos)))
 }
@@ -4151,6 +4159,10 @@ mod tests {
         assert_eq!(super::range_from_anchor(5, at, "/d/b", 4), Some((2, 4)));
         assert_eq!(super::range_from_anchor(5, at, "/d/b", 0), Some((0, 2)));
         assert_eq!(super::range_from_anchor(5, at, "/d/gone", 4), None);
+        assert_eq!(
+            super::range_from_anchor(5, at, "/d/b", gtk::INVALID_LIST_POSITION),
+            None
+        );
     }
 
     /// Undo doesn't restore an older item from the same place, binned
@@ -4179,11 +4191,13 @@ mod tests {
                 "2026-10-14T10:00:00".to_string(),
                 p("c"),
             ),
+            ("/d/e".to_string(), String::new(), p("e")),
         ];
-        let paths = ["/d/a".to_string(), "/d/b".to_string(), "/d/c".to_string()];
+        let paths = ["/d/a", "/d/b", "/d/c", "/d/e"].map(String::from);
         let got = super::newest_trashed(&paths, "2026-10-14T10:00:00", items);
         assert_eq!(got.get("/d/a"), Some(&p("a.2")));
         assert_eq!(got.get("/d/b"), None);
         assert_eq!(got.get("/d/c"), Some(&p("c")));
+        assert_eq!(got.get("/d/e"), None);
     }
 }
