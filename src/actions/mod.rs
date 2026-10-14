@@ -595,13 +595,18 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
             })
             .collect();
 
-        let tar = if bsdtar { "bsdtar" } else { "tar" };
-        let cmd = build_compress_command(&ext, &archive_name, &basenames, tar);
-
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let archive_path = Path::new(&dir).join(&archive_name);
         let existing_name = archive_name.clone();
+        let (ext, archive) = (ext.clone(), archive_name.clone());
         std::thread::spawn(move || {
+            // (Asking tar what it is starts it: not on the main thread.)
+            let (tar, gnu) = if bsdtar {
+                ("bsdtar", false)
+            } else {
+                ("tar", is_gnu_tar())
+            };
+            let cmd = build_compress_command(&ext, &archive, &basenames, tar, gnu);
             // zip would add to an existing archive, tar replace it.
             if archive_path.exists() {
                 let _ = tx.send(Err(format!("{existing_name} already exists")));
@@ -644,12 +649,14 @@ fn is_gnu_tar() -> bool {
     })
 }
 
-/// `tar`: the tar to run (`bsdtar`, or GNU `tar`: both take these options).
+/// `tar`: the tar to run (`bsdtar`, or GNU `tar`: both take these options);
+/// `gnu`: whether it's GNU tar (its exit status 1 is a warning).
 fn build_compress_command(
     ext: &str,
     archive_name: &str,
     basenames: &[String],
     tar: &str,
+    gnu: bool,
 ) -> String {
     // `./` first, so a name starting with `-` isn't taken for an option.
     let quoted_files: String = basenames
@@ -672,7 +679,7 @@ fn build_compress_command(
             let cmd = format!("{tar} {options} {quoted_archive} {quoted_files}");
             // GNU tar's 1 is a warning (a file changed as it was read): the
             // archive is made.
-            if tar == "tar" && is_gnu_tar() {
+            if gnu {
                 format!("{cmd} || [ $? -eq 1 ]")
             } else {
                 cmd
@@ -838,18 +845,17 @@ mod tests {
     fn tar_archives_with_either_tar() {
         let names = files(&["a"]);
         assert_eq!(
-            build_compress_command("tar.zst", "x.tar.zst", &names, "bsdtar"),
+            build_compress_command("tar.zst", "x.tar.zst", &names, "bsdtar", false),
             "bsdtar --zstd -cf './x.tar.zst' './a'"
         );
         // GNU tar: a warning (1) isn't a failure. (Any other tar's 1 is.)
-        let expected = if super::is_gnu_tar() {
-            "tar cJf './x.tar.xz' './a' || [ $? -eq 1 ]"
-        } else {
-            "tar cJf './x.tar.xz' './a'"
-        };
         assert_eq!(
-            build_compress_command("tar.xz", "x.tar.xz", &names, "tar"),
-            expected
+            build_compress_command("tar.xz", "x.tar.xz", &names, "tar", true),
+            "tar cJf './x.tar.xz' './a' || [ $? -eq 1 ]"
+        );
+        assert_eq!(
+            build_compress_command("tar.xz", "x.tar.xz", &names, "tar", false),
+            "tar cJf './x.tar.xz' './a'"
         );
     }
 
@@ -918,7 +924,7 @@ mod tests {
     /// A name starting with `-` mustn't be read as an option.
     #[test]
     fn compress_names_cant_be_options() {
-        let cmd = build_compress_command("zip", "out.zip", &files(&["-T", "a b"]), "tar");
+        let cmd = build_compress_command("zip", "out.zip", &files(&["-T", "a b"]), "tar", false);
         assert_eq!(cmd, "zip -r './out.zip' './-T' './a b'");
     }
 }

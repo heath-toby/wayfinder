@@ -763,22 +763,28 @@ pub fn show_chooser(
             let d_slow = d_accept.clone();
             let waiting = wayfinder::background::waiting_message(&check);
             wayfinder::background::run(
-                // (Some(true): a folder of that name.)
+                // What's there by that name: a folder, a link leading
+                // nowhere, or a file (a link to one counts, as in GTK's).
                 move || {
-                    std::fs::symlink_metadata(&check)
-                        .ok()
-                        .map(|_| std::path::Path::new(&check).is_dir())
+                    std::fs::symlink_metadata(&check).ok().map(|_| {
+                        match std::fs::metadata(&check) {
+                            Ok(m) if m.is_dir() => Some("a folder"),
+                            Ok(_) => None,
+                            Err(_) => Some("a link that leads nowhere"),
+                        }
+                    })
                 },
                 move |found| {
-                    let Some(is_folder) = found else {
+                    let Some(refused) = found else {
                         send(&full_path);
                         return;
                     };
-                    // A folder isn't a file to save over (the app couldn't
-                    // write to it).
-                    if is_folder {
+                    // Not a file to save over: the app couldn't write to a
+                    // folder, and through a broken link would write
+                    // somewhere else.
+                    if let Some(what) = refused {
                         d.announce(
-                            &format!("{name} is a folder: give the file another name"),
+                            &format!("{name} is {what}: give the file another name"),
                             AccessibleAnnouncementPriority::High,
                         );
                         return;

@@ -28,7 +28,7 @@
 - **Right-clicking a bookmark** — removed it at once; it now opens the bookmark menu (Remove Bookmark, Edit Sidebar). Removing a bookmark is announced, and focus goes to a neighbouring place.
 - **Copying a folder into itself** — pasting a folder into one of its own subfolders copied it into itself over and over until the disk filled; it's now refused.
 - **Overwriting on rclone mounts** — pasting onto an rclone mount where a file or folder of the same name already exists now asks Skip, Replace or Rename, as everywhere else, instead of silently overwriting it; renaming to a name that's taken, or a batch rename that would give two files the same name, is refused.
-- **rclone copies and moves** — empty folders are copied and moved too, and moving a folder no longer leaves an empty copy of its folder tree behind. When rclone fails, its error message is read out in full.
+- **rclone copies and moves** — empty folders are copied and moved too, and moving a folder no longer leaves an empty copy of its folder tree behind (moved between a disk and a remote, its own emptied folder may stay). When rclone fails, its error message is read out in full.
 - **rclone mounts started with flags** — mounts started with options such as `--daemon` or `-v` before the remote name are recognised, so they get the faster direct rclone operations.
 - **Copy and move messages** — after "Rename (keep both)", the announcement names the copy's new name; a cancelled copy is recognised as cancelled whatever the system language; and "Waiting for rclone" is said if checking for a clash takes a moment.
 - **Responsiveness** — paste, delete and rename on many files no longer run `ps` once per file on the main thread, and emptying the Bin no longer freezes the window.
