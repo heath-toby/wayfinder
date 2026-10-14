@@ -141,10 +141,13 @@ impl WayfinderWindow {
 
         let w = self.clone();
         let requested = path.to_string();
+        // Asked for with this load only: if it fails or is overtaken, it's
+        // dropped, not shown on some later visit.
+        let properties = self.imp().pending_properties.take();
         self.imp()
             .model
             .load_directory(path, resolve, move |result| {
-                w.finish_open_directory(&requested, result)
+                w.finish_open_directory(&requested, result, properties)
             });
         self.notify_if_waiting(path);
     }
@@ -159,7 +162,12 @@ impl WayfinderWindow {
         });
     }
 
-    fn finish_open_directory(&self, requested: &str, live_result: Result<u32, String>) {
+    fn finish_open_directory(
+        &self,
+        requested: &str,
+        live_result: Result<u32, String>,
+        properties: Option<(String, String)>,
+    ) {
         let imp = self.imp();
         // A folder that no longer exists resolves to its nearest parent.
         let resolved = imp.model.current_path();
@@ -319,11 +327,13 @@ impl WayfinderWindow {
                     );
                 }
 
-                let pending = imp.pending_properties.take();
-                if let Some((folder, name)) = pending {
+                if let Some((folder, name)) = properties {
                     if folder == path && self.get_selected_file().is_some_and(|f| f.name() == name)
                     {
-                        self.show_properties();
+                        // Once the window is up: presenting it after would
+                        // put it over the dialog.
+                        let w = self.clone();
+                        glib::idle_add_local_once(move || w.show_properties());
                     }
                 }
             }
@@ -451,16 +461,17 @@ impl WayfinderWindow {
     /// Like `reload_after_change`, then select `name` (a renamed file) once
     /// listed: otherwise its old row goes and the selection jumps to a
     /// neighbour, which a Delete pressed next would act on.
-    pub fn reload_and_select(&self, folders: &[String], name: Option<String>) {
+    /// `select`: the navigation (`generation()`) the rename was made in,
+    /// and the new name; nothing is selected if the user has moved on.
+    pub fn reload_and_select(&self, folders: &[String], select: Option<(u64, String)>) {
         let model = &self.imp().model;
         for folder in folders {
             model.forget_cached(folder);
         }
-        let generation = model.generation();
         let w = self.clone();
         model.refresh(move |listed| {
             w.update_status();
-            let Some(name) = name else {
+            let Some((generation, name)) = select else {
                 return;
             };
             if !listed || w.imp().model.generation() != generation {
@@ -557,13 +568,6 @@ impl WayfinderWindow {
                             files.push(file.clone());
                         }
                     }
-                }
-            }
-            // The marked files all filtered out of view: act on the one
-            // that has focus, not on nothing.
-            if files.is_empty() {
-                if let Some(file) = self.get_selected_file() {
-                    files.push(file);
                 }
             }
             files
@@ -904,14 +908,15 @@ impl WayfinderWindow {
         }
     }
 
-    /// Select `name` the next time `folder` is opened.
-    /// Show the properties of `name` in `folder` once it's been opened.
+    /// Show the properties of `name` in `folder` once it's been opened (by
+    /// the next navigation, which must come straight after).
     pub fn show_properties_when_opened(&self, folder: &str, name: &str) {
         self.imp()
             .pending_properties
             .replace(Some((folder.to_string(), name.to_string())));
     }
 
+    /// Select `name` the next time `folder` is opened.
     pub fn remember_selection(&self, folder: &str, name: &str) {
         self.imp()
             .last_position
@@ -2128,6 +2133,8 @@ impl WayfinderWindow {
                 );
                 return;
             }
+            // Where the user is now: the new name is selected only there.
+            let generation = w.imp().model.generation();
 
             // rclone-direct rename: server-side moveto, no FUSE round-trip.
             if wayfinder::rclone_ops::rclone_for_path(&file_path).is_some()
@@ -2167,10 +2174,11 @@ impl WayfinderWindow {
                                 }
                                 w_done.forget_moved(&moved);
                                 let select = succeeded.then(|| {
-                                    std::path::Path::new(&renamed[0].1)
+                                    let name = std::path::Path::new(&renamed[0].1)
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default()
+                                        .unwrap_or_default();
+                                    (generation, name)
                                 });
                                 w_done.reload_and_select(&changed, select);
                             }));
@@ -2210,7 +2218,7 @@ impl WayfinderWindow {
                         );
                         // Reload directory as fallback in case file monitor doesn't catch the rename
                         w.forget_moved(&moved);
-                        w.reload_and_select(&changed, Some(new_name));
+                        w.reload_and_select(&changed, Some((generation, new_name)));
                     }
                     Err(e) => {
                         w.announce(
@@ -3258,11 +3266,12 @@ fn run_threaded_delete(
             }
 
             // Announce outcome
-            if success > 0 && success + failed < total {
-                win.announce(
-                    &format!("Deletion cancelled after {success} of {total} items"),
-                    AccessibleAnnouncementPriority::Medium,
-                );
+            if success + failed < total && success + failed > 0 {
+                let mut msg = format!("Deletion cancelled after {success} of {total} items");
+                if failed > 0 {
+                    msg.push_str(&format!(", {failed} could not be deleted"));
+                }
+                win.announce(&msg, AccessibleAnnouncementPriority::Medium);
             } else if failed == 0 && success > 0 {
                 let msg = if success == 1 {
                     format!("Deleted {}", names[0])

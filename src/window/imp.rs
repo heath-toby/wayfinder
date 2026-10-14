@@ -503,7 +503,7 @@ impl ObjectImpl for WayfinderWindowInner {
                 return;
             };
             if location.starts_with('/') {
-                w.finish_open_directory(&location, Err(e));
+                w.finish_open_directory(&location, Err(e), None);
             } else {
                 // Bin or Recent Files.
                 log::error!("Failed to refresh {location}: {e}");

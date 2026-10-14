@@ -75,13 +75,12 @@ pub struct DirectoryModel {
     /// Called with (location, error) when a background refresh found the
     /// location can no longer be listed; the store has been emptied.
     on_background_error: Rc<RefCell<Option<ErrorCallback>>>,
+    /// Bumped by each listing's folder-size job, and by each navigation:
+    /// older jobs see it and stop (walking a big tree takes a while).
+    size_job: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Refresh threads still running — counted by the threads themselves,
     /// so one left waiting on a dead mount after the user moved on still
-    /// counts.
-    /// Bumped by each listing's folder-size job: older ones see it and
-    /// stop (walking a big tree takes a while).
-    size_job: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// By location: a thread stuck on one dead mount mustn't stop
+    /// counts. By location: a thread stuck on one dead mount mustn't stop
     /// refreshes of the others.
     refreshes_in_flight: std::sync::Arc<std::sync::Mutex<HashMap<String, u32>>>,
     /// A refresh was asked for while a navigation was loading.
@@ -388,6 +387,10 @@ impl DirectoryModel {
         *self.current_path.borrow_mut() = location.to_string();
         self.is_fuse.set(is_fuse);
         *self.monitor.borrow_mut() = None;
+        // Sizes of the folder left behind aren't wanted any more (the new
+        // one may be on a mount, or have no folders, and start no job).
+        self.size_job
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         gen
     }
 

@@ -481,7 +481,9 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let remote = crate::rclone_ops::rclone_for_path(&entry.original_path)
         .filter(|_| crate::rclone_ops::rclone_available())
         .map(|t| t.full_remote_spec);
-    KEPT_LOCAL.with(|k| k.set(false));
+    let dest_root = dest.clone();
+    KEPT_BEFORE.with(|k| *k.borrow_mut() = load_kept());
+    KEPT.with(|k| k.borrow_mut().clear());
     let changed = if entry.is_directory {
         sync_dir(src, &dest, remote.as_deref(), entry.last_refreshed)?
     } else {
@@ -494,12 +496,13 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
         if let Some(e) = manifest.get_mut(&entry.original_path) {
             e.last_synced_mtime = mtime;
             e.last_synced_size = size;
-            // Moved on only if nothing of the user's was kept: otherwise
-            // what was kept would no longer count as theirs next time,
-            // and be removed.
-            if !KEPT_LOCAL.with(|k| k.get()) {
-                e.last_refreshed = now_secs();
-            }
+            e.last_refreshed = now_secs();
+            // What was kept as the user's is listed, so it still counts as
+            // theirs next time, though older than this refresh.
+            let mut kept = load_kept();
+            kept.retain(|path, _| !path.starts_with(&dest_root));
+            kept.extend(KEPT.with(|k| k.take()));
+            save_kept(&kept);
         }
     })?;
     Ok(changed)
@@ -537,15 +540,54 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 }
 
 thread_local! {
-    /// Set when a refresh kept something changed in the copy here.
-    static KEPT_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What earlier refreshes kept as the user's: path → its mtime then.
+    static KEPT_BEFORE: std::cell::RefCell<HashMap<PathBuf, i64>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// What this refresh is keeping as the user's.
+    static KEPT: std::cell::RefCell<HashMap<PathBuf, i64>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Where the list of kept items is saved (written with the manifest).
+fn kept_list_path() -> PathBuf {
+    manifest_path().with_file_name("offline-kept")
+}
+
+fn load_kept() -> HashMap<PathBuf, i64> {
+    std::fs::read_to_string(kept_list_path())
+        .map(|c| parse_kept(&c))
+        .unwrap_or_default()
+}
+
+/// Lines of `mtime<TAB>path`.
+fn parse_kept(contents: &str) -> HashMap<PathBuf, i64> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let (mtime, path) = line.split_once('\t')?;
+            Some((PathBuf::from(path), mtime.parse().ok()?))
+        })
+        .collect()
+}
+
+fn save_kept(kept: &HashMap<PathBuf, i64>) {
+    let contents: String = kept
+        .iter()
+        .map(|(path, mtime)| format!("{mtime}\t{}\n", path.display()))
+        .collect();
+    let path = kept_list_path();
+    let part = path.with_extension("wayfinder-part");
+    if let Err(e) = std::fs::write(&part, contents).and_then(|()| std::fs::rename(&part, &path)) {
+        log::warn!("Couldn't save the list of kept offline items: {e}");
+    }
 }
 
 /// A refresh is keeping `path`, changed in the offline copy since the last
 /// refresh.
 fn note_kept(path: &Path) {
     log::warn!("Offline copy {} changed here; kept", path.display());
-    KEPT_LOCAL.with(|k| k.set(true));
+    let mtime = path.symlink_metadata().map(|m| mtime_secs(&m)).unwrap_or(0);
+    KEPT.with(|k| k.borrow_mut().insert(path.to_path_buf(), mtime));
 }
 
 fn now_secs() -> i64 {
@@ -556,7 +598,8 @@ fn now_secs() -> i64 {
 }
 
 /// Whether `path`, or anything in it, was changed after `since` (a
-/// refresh time; 0 means unknown, and then nothing counts as changed).
+/// refresh time; 0 means unknown, and then nothing counts as changed), or
+/// was kept as changed by an earlier refresh and is still as it was then.
 /// Fetched files keep the remote's dates, so only the user's own changes
 /// are newer than the refresh that fetched them.
 fn changed_since(path: &Path, since: i64) -> bool {
@@ -566,7 +609,8 @@ fn changed_since(path: &Path, since: i64) -> bool {
     let Ok(meta) = path.symlink_metadata() else {
         return false;
     };
-    if mtime_secs(&meta) > since {
+    let mtime = mtime_secs(&meta);
+    if mtime > since || KEPT_BEFORE.with(|k| k.borrow().get(path) == Some(&mtime)) {
         return true;
     }
     meta.is_dir()
@@ -675,6 +719,12 @@ fn sync_file(
                 note_kept(dst);
                 return Ok(false);
             }
+            // Pinned before refresh times were recorded: as before, a copy
+            // newer than the remote's is taken for an edit made here.
+            if since <= 0 && mtime_secs(&dst_meta) > mtime_secs(src_meta) {
+                note_kept(dst);
+                return Ok(false);
+            }
         }
     }
 
@@ -746,8 +796,31 @@ fn remote_child(remote: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_downloaded, paths_overlap};
+    use super::{changed_since, check_downloaded, parse_kept, paths_overlap, KEPT_BEFORE};
     use std::path::Path;
+
+    #[test]
+    fn kept_items_stay_the_users_after_later_refreshes() {
+        let dir = std::env::temp_dir().join(format!("wayfinder-kept-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "edited here").unwrap();
+        let mtime = super::mtime_secs(&file.symlink_metadata().unwrap());
+        // A later refresh: the edit is older than it.
+        let since = mtime + 100;
+        assert!(!changed_since(&file, since));
+        // Kept by the refresh before, unchanged since: still the user's.
+        let kept = parse_kept(&format!("{mtime}\t{}\n", file.display()));
+        KEPT_BEFORE.with(|k| *k.borrow_mut() = kept);
+        assert!(changed_since(&file, since));
+        assert!(changed_since(&dir, since));
+        // Changed since it was kept (a fetched remote version, say): not.
+        KEPT_BEFORE.with(|k| {
+            *k.borrow_mut() = parse_kept(&format!("{}\t{}\n", mtime - 5, file.display()))
+        });
+        assert!(!changed_since(&file, since));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn copies_overlap_a_sync_folder_inside_or_around_it() {

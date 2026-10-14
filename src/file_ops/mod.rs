@@ -43,17 +43,32 @@ pub fn delete_file_recursive(file: &gio::File) -> Result<(), glib::Error> {
 /// moved there with its folder): deleting from the Bin would delete what's
 /// on the drive.
 pub fn refuse_mounts_in_bin() -> Result<(), glib::Error> {
-    let Some(bin) = dirs::data_dir().map(|d| d.join("Trash")) else {
-        return Ok(());
-    };
-    let real = std::fs::canonicalize(&bin).unwrap_or(bin);
-    match crate::rclone_ops::mountpoints_inside(&real.to_string_lossy()).first() {
+    let home_bin = dirs::data_dir()
+        .map(|d| d.join("Trash"))
+        .map(|bin| std::fs::canonicalize(&bin).unwrap_or(bin));
+    // The Bin also holds what was binned on other drives, in their own
+    // `.Trash-<uid>` (or `.Trash/<uid>`) folders.
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    let mounts = crate::rclone_ops::mountpoints_inside("/");
+    let found = mounts.iter().find(|m| {
+        home_bin
+            .as_ref()
+            .is_some_and(|bin| std::path::Path::new(m).starts_with(bin))
+            || uid.is_some_and(|uid| in_drive_bin(m, uid))
+    });
+    match found {
         Some(mount) => Err(glib::Error::new(
             gio::IOErrorEnum::Busy,
             &format!("{mount} is mounted inside something in the Bin; unmount it first"),
         )),
         None => Ok(()),
     }
+}
+
+/// Whether `mount` is inside a drive's Bin folder for user `uid`.
+fn in_drive_bin(mount: &str, uid: u32) -> bool {
+    mount.contains(&format!("/.Trash-{uid}/")) || mount.contains(&format!("/.Trash/{uid}/"))
 }
 
 /// `path` with every link resolved but its last part: a link is judged as
@@ -1175,10 +1190,21 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_keeping_links, placement, Placement};
+    use super::{copy_keeping_links, in_drive_bin, placement, Placement};
     use gtk::gio;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn mounts_in_a_drives_bin_are_found() {
+        assert!(in_drive_bin(
+            "/media/usb/.Trash-1000/files/Projects/remote",
+            1000
+        ));
+        assert!(in_drive_bin("/media/usb/.Trash/1000/files/x", 1000));
+        assert!(!in_drive_bin("/media/usb/.Trash-1001/files/x", 1000));
+        assert!(!in_drive_bin("/media/usb/Projects/remote", 1000));
+    }
 
     #[test]
     fn links_are_copied_as_links() {
