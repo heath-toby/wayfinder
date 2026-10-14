@@ -68,10 +68,30 @@ pub fn show_dialog(
             .to_string_lossy()
             .to_string();
     let is_on_rclone_mount = crate::rclone_ops::is_rclone_fuse_path(&real_path);
-    // In a mount's folder while its drive is down: its offline copy all the
-    // same (never the bare mountpoint, which the drive would hide).
-    let in_mountpoint = crate::offline::path_is_in_known_mountpoint(&real_path);
-    let sync_local_path = if is_on_rclone_mount || in_mountpoint {
+    // A mount's folder with its drive down, or its offline copy (as the
+    // offline view shows it): which remote it's mounted from, and which
+    // copy it syncs, can't be told. Set up while it's mounted.
+    let offline_copy = std::path::Path::new(&real_path).starts_with(crate::offline::cache_root());
+    if offline_copy
+        || (!is_on_rclone_mount && crate::offline::path_is_in_known_mountpoint(&real_path))
+    {
+        parent.announce(
+            "Two-way sync of a drive's folder is set up while the drive is mounted. Connect it and try again.",
+            AccessibleAnnouncementPriority::High,
+        );
+        on_close();
+        return;
+    }
+    // Remembered as a mount, so that while it's down a pairing isn't made
+    // with its bare mountpoint, nor synced into it.
+    if is_on_rclone_mount {
+        for mount in crate::rclone_ops::current_rclone_fuse_mountpoints() {
+            if std::path::Path::new(&real_path).starts_with(&mount) {
+                crate::offline::record_mountpoint(&mount);
+            }
+        }
+    }
+    let sync_local_path = if is_on_rclone_mount {
         crate::offline::cache_path_for(local_path)
             .to_string_lossy()
             .to_string()
