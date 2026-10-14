@@ -190,6 +190,7 @@
 - **Two-way sync** — a sync that finishes after its pairing was changed to other folders no longer marks the new pairing as synced (its first sync then failed every time).
 - **Context menus** — Down and Up go through a menu as soon as it opens (focus could stay in the list behind it, where Up reached the column buttons); the sidebar's menus start on their first item too.
 - **The Bin** — an Original Location column shows where each item was deleted from (and Orca reads it with the row: "report.pdf, 2 MB, PDF document, from /home/u/Documents"; Left and Right reach it too); Properties is in its context menu.
+- **Two-way sync** leaves out Wayfinder's own part-downloaded offline copies (`*.wayfinder-part`) and LibreOffice's lock files (`.~lock.…#`): one of each kind had been uploaded to the remote, and a synced lock file makes a document look open elsewhere.
 
 ### Development
 

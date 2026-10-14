@@ -231,6 +231,14 @@ pub fn bisync_args(pair: &SyncPair) -> Vec<String> {
         "--conflict-suffix".to_string(),
         "conflict-local,conflict-remote".to_string(),
         "--resilient".to_string(),
+        // Not synced: Wayfinder's own part-downloaded offline copies, and
+        // the lock files LibreOffice keeps beside an open document (synced,
+        // they'd make it look open elsewhere). (Tried on a real pair:
+        // already-synced ones are just left alone on both sides.)
+        "--exclude".to_string(),
+        "*.wayfinder-part".to_string(),
+        "--exclude".to_string(),
+        ".~lock.*#".to_string(),
         // (Not --one-file-system: it would leave out btrfs subvolumes and
         // bind mounts too, and bisync would delete their files on the
         // remote. Mounts inside the folder are refused when it's set up.)
@@ -273,6 +281,25 @@ pub fn count_conflicts(stdout: &str, stderr: &str) -> usize {
 mod tests {
     use super::remote_refusal;
     use std::path::Path;
+
+    /// Wayfinder's part-downloads and LibreOffice's lock files aren't synced.
+    #[test]
+    fn temporary_files_are_left_out_of_a_sync() {
+        let pair = super::SyncPair {
+            local_path: "/l".to_string(),
+            sync_local_path: "/l".to_string(),
+            remote: "r:x".to_string(),
+            last_sync_time: 0,
+            initial_resync_done: true,
+        };
+        let args = super::bisync_args(&pair);
+        let excluded: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--exclude")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(excluded, ["*.wayfinder-part", ".~lock.*#"]);
+    }
 
     #[test]
     fn a_mount_folders_sync_is_with_its_own_remote_only() {
