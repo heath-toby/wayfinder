@@ -505,16 +505,19 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
     if has_command("zip") {
         formats.push(("Zip (.zip)", "zip"));
     }
-    if has_command("bsdtar") || has_command("gzip") {
+    // bsdtar compresses by itself; GNU tar (`tar`) needs the compressor.
+    let bsdtar = has_command("bsdtar");
+    let tar = bsdtar || has_command("tar");
+    if bsdtar || (tar && has_command("gzip")) {
         formats.push(("tar.gz", "tar.gz"));
     }
-    if has_command("bsdtar") || has_command("xz") {
+    if bsdtar || (tar && has_command("xz")) {
         formats.push(("tar.xz", "tar.xz"));
     }
-    if has_command("bsdtar") || has_command("zstd") {
+    if bsdtar || (tar && has_command("zstd")) {
         formats.push(("tar.zst", "tar.zst"));
     }
-    if has_command("bsdtar") {
+    if tar {
         formats.push(("tar (uncompressed)", "tar"));
     }
     if has_command("7z") {
@@ -558,7 +561,17 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
     let parent = parent_window.clone();
     let entry_for_focus = name_entry.clone();
     create_btn.connect_clicked(move |_| {
-        let stem = name_entry.text().to_string();
+        let stem = name_entry.text().trim().to_string();
+        // A name, in the folder of the files — not a hidden `.zip`, nor a
+        // path elsewhere.
+        if stem.is_empty() || stem.contains('/') || stem == "." || stem == ".." {
+            d.announce(
+                "Give the archive a name, without / in it",
+                AccessibleAnnouncementPriority::High,
+            );
+            name_entry.grab_focus();
+            return;
+        }
         let idx = dropdown.selected() as usize;
         let ext = formats_clone
             .get(idx)
@@ -582,7 +595,12 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
             })
             .collect();
 
-        let cmd = build_compress_command(&ext, &archive_name, &basenames);
+        let tar = if has_command("bsdtar") {
+            "bsdtar"
+        } else {
+            "tar"
+        };
+        let cmd = build_compress_command(&ext, &archive_name, &basenames, tar);
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let archive_path = Path::new(&dir).join(&archive_name);
@@ -617,7 +635,13 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
     entry_for_focus.grab_focus();
 }
 
-fn build_compress_command(ext: &str, archive_name: &str, basenames: &[String]) -> String {
+/// `tar`: the tar to run (`bsdtar`, or GNU `tar`: both take these options).
+fn build_compress_command(
+    ext: &str,
+    archive_name: &str,
+    basenames: &[String],
+    tar: &str,
+) -> String {
     // `./` first, so a name starting with `-` isn't taken for an option.
     let quoted_files: String = basenames
         .iter()
@@ -628,12 +652,12 @@ fn build_compress_command(ext: &str, archive_name: &str, basenames: &[String]) -
 
     match ext {
         "zip" => format!("zip -r {quoted_archive} {quoted_files}"),
-        "tar.gz" => format!("bsdtar czf {quoted_archive} {quoted_files}"),
-        "tar.xz" => format!("bsdtar cJf {quoted_archive} {quoted_files}"),
-        "tar.zst" => format!("bsdtar --zstd -cf {quoted_archive} {quoted_files}"),
-        "tar" => format!("bsdtar cf {quoted_archive} {quoted_files}"),
+        "tar.gz" => format!("{tar} czf {quoted_archive} {quoted_files}"),
+        "tar.xz" => format!("{tar} cJf {quoted_archive} {quoted_files}"),
+        "tar.zst" => format!("{tar} --zstd -cf {quoted_archive} {quoted_files}"),
+        "tar" => format!("{tar} cf {quoted_archive} {quoted_files}"),
         "7z" => format!("7z a {quoted_archive} {quoted_files}"),
-        _ => format!("bsdtar czf {quoted_archive} {quoted_files}"),
+        _ => format!("{tar} czf {quoted_archive} {quoted_files}"),
     }
 }
 
@@ -855,7 +879,7 @@ mod tests {
     /// A name starting with `-` mustn't be read as an option.
     #[test]
     fn compress_names_cant_be_options() {
-        let cmd = build_compress_command("zip", "out.zip", &files(&["-T", "a b"]));
+        let cmd = build_compress_command("zip", "out.zip", &files(&["-T", "a b"]), "tar");
         assert_eq!(cmd, "zip -r './out.zip' './-T' './a b'");
     }
 }

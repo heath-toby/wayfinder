@@ -137,7 +137,6 @@ pub fn show<W>(
 
     {
         let buf = log_buffer.clone();
-        let parent_for_save = parent.clone();
         save_log_btn.connect_clicked(move |btn| {
             let start = buf.start_iter();
             let end = buf.end_iter();
@@ -169,11 +168,11 @@ pub fn show<W>(
             match written {
                 Ok(()) => {
                     let msg = format!("Log saved to {path}");
-                    parent_for_save.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                    btn.announce(&msg, AccessibleAnnouncementPriority::Medium);
                     btn.set_label("Saved");
                 }
                 Err(e) => {
-                    parent_for_save.announce(
+                    btn.announce(
                         &format!("Could not save log: {e}"),
                         AccessibleAnnouncementPriority::High,
                     );
@@ -182,12 +181,14 @@ pub fn show<W>(
         });
     }
 
-    parent.announce(
+    // (Results are said from this window, which has focus: Orca may not
+    // speak for the one behind it.)
+    dlg.present();
+    status.grab_focus();
+    status.announce(
         labels.initial_status,
         AccessibleAnnouncementPriority::Medium,
     );
-    dlg.present();
-    status.grab_focus();
 
     let progress_pulse = progress.clone();
     let pulsing = std::rc::Rc::new(std::cell::Cell::new(true));
@@ -212,7 +213,6 @@ pub fn show<W>(
     {
         let pid_holder = pid_holder.clone();
         let cancel_flag = cancel_flag.clone();
-        let parent = parent.clone();
         let cancel_announce = labels.cancel_announce;
         cancel_btn.connect_clicked(move |btn| {
             cancel_flag.store(true, Ordering::Relaxed);
@@ -227,11 +227,10 @@ pub fn show<W>(
                 }
             }
             btn.set_sensitive(false);
-            parent.announce(cancel_announce, AccessibleAnnouncementPriority::Medium);
+            btn.announce(cancel_announce, AccessibleAnnouncementPriority::Medium);
         });
     }
 
-    let parent_clone = parent.clone();
     let status_clone = status.clone();
     let close_clone = close_btn.clone();
     let cancel_clone = cancel_btn.clone();
@@ -285,12 +284,12 @@ pub fn show<W>(
                                 .map(|f| f(&r))
                                 .unwrap_or_else(|| "Done.".to_string());
                             status_clone.set_text(&msg);
-                            parent_clone.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                            status_clone.announce(&msg, AccessibleAnnouncementPriority::Medium);
                         }
                         Ok(_) if was_cancelled => {
                             let msg = "Cancelled before completion.";
                             status_clone.set_text(msg);
-                            parent_clone.announce(msg, AccessibleAnnouncementPriority::Medium);
+                            status_clone.announce(msg, AccessibleAnnouncementPriority::Medium);
                         }
                         Ok(r) => {
                             let tail: String = r
@@ -305,12 +304,12 @@ pub fn show<W>(
                                 .join(" | ");
                             let msg = format!("{fail_prefix} {tail}");
                             status_clone.set_text(&msg);
-                            parent_clone.announce(&msg, AccessibleAnnouncementPriority::High);
+                            status_clone.announce(&msg, AccessibleAnnouncementPriority::High);
                         }
                         Err(e) => {
                             let msg = format!("{error_prefix} {e}");
                             status_clone.set_text(&msg);
-                            parent_clone.announce(&msg, AccessibleAnnouncementPriority::High);
+                            status_clone.announce(&msg, AccessibleAnnouncementPriority::High);
                         }
                     }
                     if let Some(cb) = on_complete_holder.take() {
@@ -326,7 +325,7 @@ pub fn show<W>(
                     close_clone.grab_focus();
                     let msg = "rclone disconnected unexpectedly. Operation may be incomplete.";
                     status_clone.set_text(msg);
-                    parent_clone.announce(msg, AccessibleAnnouncementPriority::High);
+                    status_clone.announce(msg, AccessibleAnnouncementPriority::High);
                     if let Some(cb) = on_complete_holder.take() {
                         cb(false);
                     }
