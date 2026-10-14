@@ -1345,9 +1345,14 @@ impl WayfinderWindow {
             .iter()
             .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some());
         let dest_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
+        // (Not a folder with another drive mounted inside: rclone would
+        // copy what's hidden under it from the remote.)
         let use_rclone = (any_src_rclone || dest_rclone)
             && wayfinder::rclone_ops::rclone_available()
-            && !source_paths.is_empty();
+            && !source_paths.is_empty()
+            && !source_paths
+                .iter()
+                .any(|p| wayfinder::rclone_ops::has_mounts_inside(p));
 
         // The folders this paste changes: the destination, and for a move
         // the folders the files leave.
@@ -2765,7 +2770,10 @@ impl WayfinderWindow {
             .iter()
             .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some())
             || wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some())
-            && wayfinder::rclone_ops::rclone_available();
+            && wayfinder::rclone_ops::rclone_available()
+            && !paths
+                .iter()
+                .any(|p| wayfinder::rclone_ops::has_mounts_inside(p));
         // A drop copies, with the same care as a paste: nothing into
         // itself, nothing overwritten without asking.
         let plan = PastePlan {

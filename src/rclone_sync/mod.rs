@@ -193,9 +193,14 @@ pub fn remove_pair(local_path: &str) -> Result<(), String> {
 }
 
 /// Mark the initial resync as complete and update the last-sync time.
-fn mark_synced(local_path: &str) -> Result<(), String> {
+fn mark_synced(synced: &SyncPair) -> Result<(), String> {
     let mut pairs = load_pairs();
-    if let Some(p) = pairs.get_mut(local_path) {
+    // (Only the pairing synced: one edited to other ends meanwhile hasn't
+    // had its first sync.)
+    if let Some(p) = pairs
+        .get_mut(&synced.local_path)
+        .filter(|p| p.remote == synced.remote && p.sync_local_path == synced.sync_local_path)
+    {
         p.initial_resync_done = true;
         p.last_sync_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -240,8 +245,8 @@ pub fn bisync_args(pair: &SyncPair) -> Vec<String> {
 
 /// Stamp the pair as synced (best-effort). Public so the dialog can call it
 /// from inside the success-message closure once rclone exits cleanly.
-pub fn record_successful_sync(local_path: &str) {
-    let _ = mark_synced(local_path);
+pub fn record_successful_sync(synced: &SyncPair) {
+    let _ = mark_synced(synced);
 }
 
 /// Count conflict files in captured rclone output. rclone bisync logs each

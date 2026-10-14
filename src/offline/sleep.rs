@@ -86,11 +86,15 @@ fn wait_child() -> std::io::Result<std::process::ExitStatus> {
                     return Ok(status);
                 }
                 Ok(None) => {}
-                // Can't be waited on: stopped, not left running untracked.
+                // Can't be waited on: stopped, not left running untracked
+                // (reaped elsewhere: a child stuck in a frozen mount's read
+                // mustn't hold the lock `pause` needs).
                 Err(e) => {
                     if let Some(mut child) = slot.take() {
                         let _ = child.kill();
-                        let _ = child.wait();
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
                     }
                     return Err(e);
                 }

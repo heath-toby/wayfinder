@@ -483,7 +483,7 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
     }
 
     let args = super::bisync_args(&pair);
-    let local_owned = local_path.to_string();
+    let synced = pair.clone();
 
     let labels = crate::rclone_ops::progress::ProgressLabels {
         title: "Syncing",
@@ -492,7 +492,7 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
         cancel_label: "Cancel sync",
         success_message: Box::new(move |r| {
             // Stamp the pair as synced now that rclone exited cleanly.
-            super::record_successful_sync(&local_owned);
+            super::record_successful_sync(&synced);
             let conflicts = super::count_conflicts(&r.stdout, &r.stderr);
             if conflicts > 0 {
                 format!(

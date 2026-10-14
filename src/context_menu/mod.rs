@@ -372,8 +372,11 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         // Prefer rclone-direct copy when the source lives on
                         // an rclone FUSE mount — much faster than reading
                         // through the FUSE layer, and it shows real progress.
+                        // (Not with another drive mounted inside: rclone
+                        // would fetch what's hidden under it.)
                         if wayfinder::rclone_ops::rclone_for_path(&p).is_some()
                             && wayfinder::rclone_ops::rclone_available()
+                            && !wayfinder::rclone_ops::has_mounts_inside(&p)
                         {
                             wayfinder::rclone_ops::pin_with_progress(
                                 &p,
