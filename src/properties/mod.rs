@@ -329,6 +329,17 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
         // Results are said from the dialog, which has focus: Orca may not
         // speak for the window behind it.
         apply_btn.connect_clicked(move |btn| {
+            // An offline copy's change would be undone at its next refresh,
+            // and never reach the drive (a two-way sync folder's excepted).
+            let p = std::path::Path::new(&fp);
+            if wayfinder::offline::is_offline_copy(p) && !wayfinder::offline::inside_sync_folder(p)
+            {
+                btn.announce(
+                    "This is an offline copy. Its permissions can't be changed here.",
+                    AccessibleAnnouncementPriority::High,
+                );
+                return;
+            }
             let bits: u32 = cbs_apply.iter()
                 .filter(|(_, c)| c.is_active())
                 .map(|(b, _)| b)

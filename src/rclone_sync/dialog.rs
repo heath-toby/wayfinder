@@ -273,21 +273,21 @@ pub fn show_dialog(
             // "Proton:") would walk the entire remote and is almost certainly
             // a mistake — block it explicitly.
             if remote.is_empty() {
-                parent.announce(
+                d.announce(
                     "Remote is empty. Use the form remote:path, e.g. Proton:Work",
                     AccessibleAnnouncementPriority::High,
                 );
                 return;
             }
             let Some((remote_name, remote_path)) = remote.split_once(':') else {
-                parent.announce(
+                d.announce(
                     "Remote must contain a colon. Use the form remote:path, e.g. Proton:Work",
                     AccessibleAnnouncementPriority::High,
                 );
                 return;
             };
             if remote_name.is_empty() {
-                parent.announce(
+                d.announce(
                     "Remote name is missing before the colon",
                     AccessibleAnnouncementPriority::High,
                 );
@@ -295,7 +295,7 @@ pub fn show_dialog(
             }
             let trimmed_path = remote_path.trim_matches('/');
             if trimmed_path.is_empty() {
-                parent.announce(
+                d.announce(
                     "Remote path cannot be empty. Add a subfolder after the colon, e.g. Proton:Documents/German. Syncing against a remote root is too dangerous.",
                     AccessibleAnnouncementPriority::High,
                 );
@@ -313,7 +313,7 @@ pub fn show_dialog(
                 crate::rclone_ops::rclone_for_path(&guard_path.to_string_lossy())
             {
                 if target.full_remote_spec.eq_ignore_ascii_case(remote) {
-                    parent.announce(
+                    d.announce(
                         "Refusing to sync a folder with itself: the local path is already mounted from this same remote. Pick a different remote path or use the offline-cache flow.",
                         AccessibleAnnouncementPriority::High,
                     );
@@ -328,7 +328,7 @@ pub fn show_dialog(
                 .iter()
                 .find(|m| m.trim_end_matches('/') != sync_local.trim_end_matches('/'))
             {
-                parent.announce(
+                d.announce(
                     &format!("Refusing to sync: {mount} is mounted inside this folder. Unmount it, or pick a folder without one."),
                     AccessibleAnnouncementPriority::High,
                 );
@@ -346,7 +346,7 @@ pub fn show_dialog(
                 std::path::Path::new(&sync_local),
             );
             if crate::rclone_ops::is_rclone_fuse_path(&sync_local_real.to_string_lossy()) {
-                parent.announce(
+                d.announce(
                     "Refusing to sync: the local path is on an rclone FUSE mount. This would sync the remote with itself, risking data loss. Close this dialog and try again — Wayfinder will redirect to the offline cache path.",
                     AccessibleAnnouncementPriority::High,
                 );
@@ -354,7 +354,7 @@ pub fn show_dialog(
             }
 
             if let Err(e) = set_pair(&p, &sync_local, remote) {
-                parent.announce(
+                d.announce(
                     &format!("Failed to save pairing: {e}"),
                     AccessibleAnnouncementPriority::High,
                 );

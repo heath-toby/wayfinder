@@ -165,9 +165,13 @@ pub fn show_chooser(
     let cancel_btn = gtk::Button::with_label("Cancel");
     cancel_btn.update_property(&[gtk::accessible::Property::Label("Cancel")]);
 
-    let accept_btn = gtk::Button::with_label(accept_label);
+    // (The app's label may mark a mnemonic, "_Save": used as one, and not
+    // read out as "underscore".)
+    let accept_btn = gtk::Button::with_mnemonic(accept_label);
     accept_btn.add_css_class("suggested-action");
-    accept_btn.update_property(&[gtk::accessible::Property::Label(accept_label)]);
+    accept_btn.update_property(&[gtk::accessible::Property::Label(&without_mnemonic(
+        accept_label,
+    ))]);
 
     bottom_bar.append(&cancel_btn);
     bottom_bar.append(&accept_btn);
@@ -1039,6 +1043,23 @@ fn save_target(path: &std::path::Path) -> Result<Option<Option<String>>, String>
     }
 }
 
+/// A GTK label with its mnemonic marks taken out: `_Save` is "Save", `__`
+/// an underscore.
+fn without_mnemonic(label: &str) -> String {
+    let mut out = String::new();
+    let mut chars = label.chars();
+    while let Some(c) = chars.next() {
+        if c == '_' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Whether the location typed (`typed`) is somewhere other than the folder
 /// shown (`current`): typed but not gone to. As written or trimmed (a
 /// folder's name may end in a space; a stray one typed is no matter).
@@ -1053,7 +1074,14 @@ fn location_not_open(typed: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{location_not_open, save_target};
+    use super::{location_not_open, save_target, without_mnemonic};
+
+    #[test]
+    fn mnemonic_marks_arent_read_out() {
+        assert_eq!(without_mnemonic("_Save"), "Save");
+        assert_eq!(without_mnemonic("Save __As"), "Save _As");
+        assert_eq!(without_mnemonic("Open"), "Open");
+    }
 
     #[test]
     fn what_a_save_would_go_over() {

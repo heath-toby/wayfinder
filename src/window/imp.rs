@@ -18,7 +18,7 @@ const COLUMN_NAMES: &[&str] = &["Name", "Size", "Date Modified", "Kind"];
 
 pub struct SelectionState {
     pub selected: std::collections::HashSet<String>, // paths of selected files
-    pub range_anchor: Option<u32>,                   // position where Shift+Space started
+    pub range_anchor: Option<String>,                // file where Shift+Space started
 }
 
 impl SelectionState {
@@ -86,7 +86,8 @@ pub struct WayfinderWindowInner {
     pub file_selection: RefCell<SelectionState>,
     pub type_ahead_buffer: Rc<RefCell<String>>,
     pub type_ahead_generation: Rc<Cell<u32>>,
-    pub last_trashed: RefCell<Vec<String>>,
+    /// The paths last moved to the Bin, and when (as the Bin dates them).
+    pub last_trashed: RefCell<(Vec<String>, String)>,
     /// Paths whose move to Bin is still waiting on the filesystem.
     pub trashing: RefCell<std::collections::HashSet<String>>,
     /// Remembers the last-selected filename per directory so that
@@ -226,7 +227,7 @@ impl Default for WayfinderWindowInner {
             file_selection: RefCell::new(SelectionState::new()),
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),
             type_ahead_generation: Rc::new(Cell::new(0)),
-            last_trashed: RefCell::new(Vec::new()),
+            last_trashed: RefCell::new((Vec::new(), String::new())),
             trashing: RefCell::new(std::collections::HashSet::new()),
             last_position: RefCell::new(std::collections::HashMap::new()),
             pending_properties: RefCell::new(None),
@@ -1143,22 +1144,25 @@ impl WayfinderWindowInner {
                 // Shift+Space: start or finish range selection
                 let mut sel = imp.file_selection.borrow_mut();
                 let pos = imp.selection.selected();
-                // An anchor set where nothing was selected is no anchor.
-                if let Some(anchor) = sel
+                // (The range starts at the file, not its position: the list
+                // may have changed since.)
+                let paths: Vec<String> = (0..imp.selection.n_items())
+                    .map(|i| {
+                        imp.selection
+                            .item(i)
+                            .and_downcast::<FileObject>()
+                            .map(|f| f.path())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let range = sel
                     .range_anchor
-                    .filter(|a| *a != gtk::INVALID_LIST_POSITION)
-                {
-                    // Finish range — select all items between anchor and current
-                    // No row selected (an empty or filtered-out list) gives
-                    // an invalid position: never loop to it.
-                    let n_items = imp.selection.n_items();
-                    let start = anchor.min(pos);
-                    let end = anchor.max(pos).min(n_items.saturating_sub(1));
-                    for i in (start..=end).take_while(|_| n_items > 0) {
-                        if let Some(item) = imp.selection.model().and_then(|m| m.item(i)) {
-                            if let Some(file) = item.downcast_ref::<FileObject>() {
-                                sel.selected.insert(file.path());
-                            }
+                    .as_deref()
+                    .and_then(|anchor| super::range_from_anchor(&paths, anchor, pos));
+                if let Some((start, end)) = range {
+                    for path in &paths[start..=end] {
+                        if !path.is_empty() {
+                            sel.selected.insert(path.clone());
                         }
                     }
                     let count = sel.count();
@@ -1171,7 +1175,7 @@ impl WayfinderWindowInner {
                     window.update_status();
                 } else {
                     // Start range
-                    sel.range_anchor = Some(pos);
+                    sel.range_anchor = paths.get(pos as usize).cloned();
                     drop(sel);
                     window.announce("Selection started", AccessibleAnnouncementPriority::Medium);
                 }
@@ -1350,21 +1354,25 @@ impl WayfinderWindowInner {
             } else if key == gdk::Key::space && mods.contains(gdk::ModifierType::SHIFT_MASK) {
                 let mut sel = imp.file_selection.borrow_mut();
                 let pos = imp.selection.selected();
-                // An anchor set where nothing was selected is no anchor.
-                if let Some(anchor) = sel
+                // (The range starts at the file, not its position: the list
+                // may have changed since.)
+                let paths: Vec<String> = (0..imp.selection.n_items())
+                    .map(|i| {
+                        imp.selection
+                            .item(i)
+                            .and_downcast::<FileObject>()
+                            .map(|f| f.path())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let range = sel
                     .range_anchor
-                    .filter(|a| *a != gtk::INVALID_LIST_POSITION)
-                {
-                    // No row selected (an empty or filtered-out list) gives
-                    // an invalid position: never loop to it.
-                    let n_items = imp.selection.n_items();
-                    let start = anchor.min(pos);
-                    let end = anchor.max(pos).min(n_items.saturating_sub(1));
-                    for i in (start..=end).take_while(|_| n_items > 0) {
-                        if let Some(item) = imp.selection.model().and_then(|m| m.item(i)) {
-                            if let Some(file) = item.downcast_ref::<FileObject>() {
-                                sel.selected.insert(file.path());
-                            }
+                    .as_deref()
+                    .and_then(|anchor| super::range_from_anchor(&paths, anchor, pos));
+                if let Some((start, end)) = range {
+                    for path in &paths[start..=end] {
+                        if !path.is_empty() {
+                            sel.selected.insert(path.clone());
                         }
                     }
                     let count = sel.count();
@@ -1376,7 +1384,7 @@ impl WayfinderWindowInner {
                     );
                     window.update_status();
                 } else {
-                    sel.range_anchor = Some(pos);
+                    sel.range_anchor = paths.get(pos as usize).cloned();
                     drop(sel);
                     window.announce("Selection started", AccessibleAnnouncementPriority::Medium);
                 }

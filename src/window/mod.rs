@@ -1452,6 +1452,7 @@ impl WayfinderWindow {
             // Replace or Rename, and copies links.
             let landing = landing_paths(&plan.source_paths, &plan.dest_dir);
             let sources = plan.source_paths.clone();
+            let dest_dir = plan.dest_dir.clone();
             self.run_blocking(
                 &plan.dest_dir.clone(),
                 move || {
@@ -1461,6 +1462,9 @@ impl WayfinderWindow {
                     landing.iter().any(|p| {
                         !wayfinder::file_ops::name_free(std::path::Path::new(p)).unwrap_or(false)
                     }) || has_duplicate(&landing)
+                        // (Also by another case: a remote that ignores it —
+                        // OneDrive, say — takes Report and report for one.)
+                        || name_taken_in_any_case(&dest_dir, &landing)
                         || sources.iter().any(|p| {
                             !wayfinder::rclone_ops::is_fuse_path(p)
                                 && holds_link(std::path::Path::new(p))
@@ -1583,6 +1587,9 @@ impl WayfinderWindow {
             .borrow_mut()
             .extend(paths.iter().cloned());
         let count = paths.len();
+        // (Undo restores only what's gone to the Bin since: deletion dates
+        // are local times to the second.)
+        let since = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         self.run_blocking(
             &paths[0].clone(),
             move || {
@@ -1610,7 +1617,7 @@ impl WayfinderWindow {
                         trashing.remove(&f.path());
                     }
                 }
-                w.finish_trash(files, from, results)
+                w.finish_trash(files, from, results, since)
             },
         );
     }
@@ -1620,6 +1627,7 @@ impl WayfinderWindow {
         files: Vec<FileObject>,
         from: RemovedFrom,
         results: Vec<Result<wayfinder::file_ops::TrashResult, String>>,
+        since: String,
     ) {
         let imp = self.imp();
         let mut success = 0;
@@ -1721,7 +1729,7 @@ impl WayfinderWindow {
 
         // Store trashed paths for undo (only successfully trashed ones)
         if !trashed_paths.is_empty() {
-            *imp.last_trashed.borrow_mut() = trashed_paths.clone();
+            *imp.last_trashed.borrow_mut() = (trashed_paths.clone(), since);
         }
 
         // Announce failures FIRST (before focus changes trigger Orca)
@@ -2878,19 +2886,19 @@ impl WayfinderWindow {
     }
 
     pub fn undo_trash(&self) {
-        let paths = self.imp().last_trashed.borrow().clone();
+        let (paths, since) = self.imp().last_trashed.borrow().clone();
         if paths.is_empty() {
             self.announce("Nothing to undo", AccessibleAnnouncementPriority::Medium);
             return;
         }
-        self.imp().last_trashed.borrow_mut().clear();
+        self.imp().last_trashed.borrow_mut().0.clear();
 
         // Going through the Bin, and moving files back (maybe onto a slow
         // drive), isn't for the main thread.
         let work_paths = paths.clone();
         self.run_blocking(
             "trash:///",
-            move || restore_newest(&work_paths),
+            move || restore_newest(&work_paths, &since),
             move |w, restored| {
                 if restored.is_empty() {
                     w.announce(
@@ -3476,10 +3484,11 @@ fn apply_zoom_css(level: i32) {
 }
 
 /// Restore, for each of `paths`, the most recently trashed item that came
-/// from it (an older one from the same place may be in the Bin too).
+/// from it (an older one from the same place may be in the Bin too) —
+/// if it went to the Bin at or after `since`.
 /// Returns where each restored file went back to (its name may have
 /// changed if something new took its place). Goes through the Bin once.
-fn restore_newest(paths: &[String]) -> Vec<String> {
+fn restore_newest(paths: &[String], since: &str) -> Vec<String> {
     let trash = gio::File::for_uri("trash:///");
     let Ok(enumerator) = trash.enumerate_children(
         "standard::name,trash::orig-path,trash::deletion-date",
@@ -3488,31 +3497,23 @@ fn restore_newest(paths: &[String]) -> Vec<String> {
     ) else {
         return Vec::new();
     };
-    let wanted: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
-    // orig-path → (deletion date, name in the Bin) of the newest.
-    let mut newest: std::collections::HashMap<String, (String, std::path::PathBuf)> =
-        std::collections::HashMap::new();
+    let mut items: Vec<(String, String, std::path::PathBuf)> = Vec::new();
     while let Ok(Some(info)) = enumerator.next_file(gio::Cancellable::NONE) {
         let orig = info
             .attribute_byte_string("trash::orig-path")
             .map(|p| p.to_string())
             .unwrap_or_default();
-        if !wanted.contains(orig.as_str()) {
-            continue;
-        }
-        // ISO 8601 local time: later sorts after.
         let date = info
             .attribute_string("trash::deletion-date")
             .map(|d| d.to_string())
             .unwrap_or_default();
-        if newest.get(&orig).is_none_or(|(d, _)| date > *d) {
-            newest.insert(orig, (date, info.name()));
-        }
+        items.push((orig, date, info.name()));
     }
+    let newest = newest_trashed(paths, since, items);
     paths
         .iter()
         .filter_map(|path| {
-            let (_, name) = newest.get(path.as_str())?;
+            let name = newest.get(path.as_str())?;
             match wayfinder::file_ops::restore_from_trash(&trash.child(name)) {
                 Ok(dest) => Some(dest),
                 Err(e) => {
@@ -3521,6 +3522,33 @@ fn restore_newest(paths: &[String]) -> Vec<String> {
                 }
             }
         })
+        .collect()
+}
+
+/// Of the Bin's `items` (where from, when trashed, name in the Bin), the
+/// name of the newest from each of `paths` that went at or after `since`.
+/// (An older one, from before, is someone else's: not Undo's to restore.)
+fn newest_trashed(
+    paths: &[String],
+    since: &str,
+    items: Vec<(String, String, std::path::PathBuf)>,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
+    let wanted: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+    // orig-path → (deletion date, name in the Bin) of the newest.
+    let mut newest: std::collections::HashMap<String, (String, std::path::PathBuf)> =
+        std::collections::HashMap::new();
+    for (orig, date, name) in items {
+        // ISO 8601 local time: later sorts after.
+        if !wanted.contains(orig.as_str()) || date.as_str() < since {
+            continue;
+        }
+        if newest.get(&orig).is_none_or(|(d, _)| date > *d) {
+            newest.insert(orig, (date, name));
+        }
+    }
+    newest
+        .into_iter()
+        .map(|(orig, (_, name))| (orig, name))
         .collect()
 }
 
@@ -3605,10 +3633,28 @@ fn is_plain_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
-/// Whether any path appears twice.
+/// Whether two of `paths` are one name — in any case (a remote may take
+/// Report and report for one).
 fn has_duplicate(paths: &[String]) -> bool {
     let mut seen = std::collections::HashSet::new();
-    paths.iter().any(|p| !seen.insert(p))
+    paths.iter().any(|p| !seen.insert(p.to_lowercase()))
+}
+
+/// Whether something in `dir` has one of `paths`' names, in any case (or
+/// `dir` can't be looked in: then it may).
+fn name_taken_in_any_case(dir: &str, paths: &[String]) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    let here: std::collections::HashSet<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_lowercase())
+        .collect();
+    paths.iter().any(|p| {
+        std::path::Path::new(p)
+            .file_name()
+            .is_some_and(|n| here.contains(&n.to_string_lossy().to_lowercase()))
+    })
 }
 
 /// Whether `path` is a link, or a folder with one somewhere inside — or
@@ -3721,9 +3767,10 @@ fn rename_check(old: &str, new: &str) -> Result<bool, String> {
 
 /// The new name given to more than one file, if any, in rename `pairs`.
 fn duplicate_target(pairs: &[(String, String)]) -> Option<String> {
+    // (In any case: a remote may take Report and report for one.)
     let mut seen = std::collections::HashSet::new();
     pairs.iter().find_map(|(_, new)| {
-        (!seen.insert(new.as_str())).then(|| {
+        (!seen.insert(new.to_lowercase())).then(|| {
             std::path::Path::new(new)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -3749,6 +3796,16 @@ fn parent_dir(path: &str) -> Option<String> {
     std::path::Path::new(path)
         .parent()
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// The rows a Shift+Space range covers, as indexes into `paths` (the
+/// listed files, in order): from the file it started on — found by path, as
+/// files may have come or gone since — to the selected row `pos`. None if
+/// that file isn't listed any more, or no row is selected.
+fn range_from_anchor(paths: &[String], anchor: &str, pos: u32) -> Option<(usize, usize)> {
+    let pos = usize::try_from(pos).ok().filter(|p| *p < paths.len())?;
+    let start = paths.iter().position(|p| p == anchor)?;
+    Some((start.min(pos), start.max(pos)))
 }
 
 /// Where to put the selection after removing the item at `old_pos`, with
@@ -3852,6 +3909,28 @@ fn stem_chars(name: &str, is_dir: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn names_differing_only_in_case_are_one_for_a_paste_or_rename() {
+        assert!(super::has_duplicate(&[
+            "/d/Report.txt".into(),
+            "/d/report.txt".into()
+        ]));
+        let pairs = vec![
+            ("/d/aReport.txt".to_string(), "/d/Report.txt".to_string()),
+            ("/d/areport.txt".to_string(), "/d/report.txt".to_string()),
+        ];
+        assert!(super::duplicate_target(&pairs).is_some());
+        let d = std::env::temp_dir().join(format!("wayfinder-anycase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Report.txt"), "").unwrap();
+        let dir = d.to_string_lossy().to_string();
+        let taken = super::name_taken_in_any_case(&dir, &[format!("{dir}/report.txt")]);
+        let free = super::name_taken_in_any_case(&dir, &[format!("{dir}/other.txt")]);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(taken && !free);
+    }
+
     #[test]
     fn a_rename_clashes_only_with_another_file() {
         let d = std::env::temp_dir().join(format!("wayfinder-rclash-{}", std::process::id()));
@@ -4048,5 +4127,57 @@ mod tests {
     #[test]
     fn nothing_left_selects_nothing() {
         assert_eq!(position_near_removed(3, 0), None);
+    }
+
+    /// A range runs from the file it started on, even if files were added
+    /// above it meanwhile; one whose start is gone selects nothing.
+    #[test]
+    fn a_range_starts_at_its_file_not_its_old_row() {
+        let paths: Vec<String> = ["/d/a", "/d/new", "/d/b", "/d/c", "/d/d"]
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        // Started on /d/b (then row 1); now row 2.
+        assert_eq!(super::range_from_anchor(&paths, "/d/b", 4), Some((2, 4)));
+        assert_eq!(super::range_from_anchor(&paths, "/d/b", 0), Some((0, 2)));
+        assert_eq!(super::range_from_anchor(&paths, "/d/gone", 4), None);
+        assert_eq!(
+            super::range_from_anchor(&paths, "/d/b", gtk::INVALID_LIST_POSITION),
+            None
+        );
+    }
+
+    /// Undo doesn't restore an older item from the same place, binned
+    /// before (by someone else, or itself since restored).
+    #[test]
+    fn undo_restores_only_what_went_since() {
+        let p = std::path::PathBuf::from;
+        let items = vec![
+            (
+                "/d/a".to_string(),
+                "2026-10-14T09:00:00".to_string(),
+                p("a"),
+            ),
+            (
+                "/d/a".to_string(),
+                "2026-10-14T10:00:05".to_string(),
+                p("a.2"),
+            ),
+            (
+                "/d/b".to_string(),
+                "2026-10-13T08:00:00".to_string(),
+                p("b"),
+            ),
+            (
+                "/d/c".to_string(),
+                "2026-10-14T10:00:00".to_string(),
+                p("c"),
+            ),
+        ];
+        let paths = ["/d/a".to_string(), "/d/b".to_string(), "/d/c".to_string()];
+        let got = super::newest_trashed(&paths, "2026-10-14T10:00:00", items);
+        assert_eq!(got.get("/d/a"), Some(&p("a.2")));
+        assert_eq!(got.get("/d/b"), None);
+        assert_eq!(got.get("/d/c"), Some(&p("c")));
     }
 }

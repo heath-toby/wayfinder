@@ -50,28 +50,44 @@ fn parse_bookmarks(contents: &str) -> Vec<(String, String)> {
             let (uri, display) = if let Some((u, d)) = line.split_once(' ') {
                 (u.to_string(), d.to_string())
             } else {
-                // No name given: the folder's own (decoded, so `My%20Docs`
-                // is read as "My Docs").
-                let name = bookmark_path(line)
-                    .and_then(|p| {
-                        std::path::Path::new(&p)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                    })
-                    .unwrap_or_else(|| crate::file_model::display_name(line));
-                (line.to_string(), name)
+                (line.to_string(), default_bookmark_name(line))
             };
             Some((uri, display))
         })
         .collect()
 }
 
-fn save_bookmarks(bookmarks: &[(String, String)]) -> Result<(), String> {
-    let contents: String = bookmarks
+/// The name a bookmark with none given is shown by: the folder's own
+/// (decoded, so `My%20Docs` is read as "My Docs").
+fn default_bookmark_name(uri: &str) -> String {
+    bookmark_path(uri)
+        .and_then(|p| {
+            std::path::Path::new(&p)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| crate::file_model::display_name(uri))
+}
+
+/// The bookmarks file's text for `bookmarks`. One shown by its folder's own
+/// name is written without one, as it was read: no label is added to the
+/// user's bookmarks (other apps' too) just by reordering them.
+fn bookmarks_text(bookmarks: &[(String, String)]) -> String {
+    bookmarks
         .iter()
-        .map(|(uri, name)| format!("{uri} {name}"))
+        .map(|(uri, name)| {
+            if *name == default_bookmark_name(uri) {
+                uri.clone()
+            } else {
+                format!("{uri} {name}")
+            }
+        })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+fn save_bookmarks(bookmarks: &[(String, String)]) -> Result<(), String> {
+    let contents = bookmarks_text(bookmarks);
     // (Through a link, to a dotfiles folder say, to the file it leads to.)
     crate::state::write_atomically(&bookmarks_file(), contents.as_bytes())
         .map_err(|e| format!("Couldn't save the bookmarks: {e}"))
@@ -1645,6 +1661,12 @@ impl Default for WayfinderSidebar {
 #[cfg(test)]
 mod tests {
     use super::{bookmark_path, bookmarks_insert_pos, read_bookmarks_from, volumes_insert_pos};
+
+    #[test]
+    fn bookmarks_without_a_name_are_saved_without_one() {
+        let text = "file:///home/u/My%20Docs\nfile:///home/u/Work Projects";
+        assert_eq!(super::bookmarks_text(&super::parse_bookmarks(text)), text);
+    }
 
     #[test]
     fn a_bookmarks_file_that_cant_be_read_isnt_taken_for_none() {

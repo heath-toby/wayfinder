@@ -152,6 +152,13 @@
 - **File chooser** — choosing a place in its sidebar, or going to a typed location, moves focus to the files (Tab can't leave the sidebar's list).
 - **Requests from other apps** — "show these folders" with several folders opens a window for each (each used to replace the last in one window), and items in several folders likewise; "show properties" now opens the Properties window once the folder is shown.
 - **Undo trash and cancelled deletes** — undo says the name a restored file actually went back under; a cancelled delete says how far it got. In rclone progress windows, focus moves to a working button when Cancel is pressed or rclone stops unexpectedly.
+- **Names differing only in case** — pasting onto a cloud drive where a name differs only in case (`Report.txt` onto `report.txt`), or pasting or renaming several files to such names, now asks about the clash as for the same name: on remotes that ignore case, rclone replaced one with the other unasked.
+- **Shift+Space ranges** — a range runs from the file it was started on, even if files came or went in the list meanwhile (it used the old row, marking the wrong files).
+- **Undo after moving to the Bin** — restores only what that move put in the Bin, never an older item that once came from the same place.
+- **Offline copies** — the Properties window no longer changes the permissions of an offline copy (the change never reached the drive, and was undone at the next refresh).
+- **Bookmarks saved by other apps without a name** — no longer get one written into the bookmarks file when Wayfinder changes the bookmarks.
+- **Two-way sync window** — why a sync can't start is spoken from the window itself (Orca could miss it).
+- **File chooser** — the Open/Save button has an Alt key, and its spoken name has no stray underscore.
 
 ### Development
 
