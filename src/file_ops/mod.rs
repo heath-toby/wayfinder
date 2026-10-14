@@ -201,19 +201,27 @@ pub fn rename_file(file: &gio::File, new_name: &str) -> Result<gio::File, glib::
         else {
             return false;
         };
-        std::fs::read_dir(parent).is_ok_and(|entries| {
-            !entries
-                .flatten()
-                .any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
-        })
+        // (An entry that can't be read might be it: then not.)
+        std::fs::read_dir(parent)
+            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+            .is_ok_and(|entries| {
+                !entries
+                    .iter()
+                    .any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
+            })
     };
     match direct {
         Err(e) if case_only && e.matches(gio::IOErrorEnum::Exists) && same_file() => {
             // Short (a long name's case can change too) and of its own (one
             // left by an earlier failure doesn't stand in the way).
             static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            // (The time too: a process number comes round again.)
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let step = format!(
-                ".wayfinder-renaming-{}-{}",
+                ".wayfinder-renaming-{}-{}-{nanos}",
                 std::process::id(),
                 STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             );
