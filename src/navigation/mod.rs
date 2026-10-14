@@ -3,6 +3,9 @@ use std::path::PathBuf;
 pub struct NavigationState {
     history: Vec<PathBuf>,
     current_index: usize,
+    /// The one entry is only where a window would start if nothing else is
+    /// asked for: the first place gone to takes its place.
+    seeded: bool,
 }
 
 impl NavigationState {
@@ -10,6 +13,17 @@ impl NavigationState {
         Self {
             history: vec![initial],
             current_index: 0,
+            seeded: false,
+        }
+    }
+
+    /// Starting at `initial` unless somewhere else is gone to first (a
+    /// window opened on a folder by another app shouldn't have its last
+    /// session's folder to go Back to).
+    pub fn seeded(initial: PathBuf) -> Self {
+        Self {
+            seeded: true,
+            ..Self::new(initial)
         }
     }
 
@@ -18,6 +32,10 @@ impl NavigationState {
     }
 
     pub fn navigate_to(&mut self, path: PathBuf) {
+        if std::mem::take(&mut self.seeded) {
+            self.history[0] = path;
+            return;
+        }
         // Don't navigate to the same place
         if self.current() == &path {
             return;
@@ -31,6 +49,7 @@ impl NavigationState {
     /// Replace the current entry, e.g. when the folder asked for turned out
     /// not to exist and its nearest existing parent was opened instead.
     pub fn replace_current(&mut self, path: PathBuf) {
+        self.seeded = false;
         // The entry before may already be it (a missing folder opened its
         // parent, where we came from): one entry, or Back goes nowhere.
         if self.current_index > 0 && self.history[self.current_index - 1] == path {
@@ -79,6 +98,20 @@ impl NavigationState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_window_sent_somewhere_first_has_no_start_to_go_back_to() {
+        let mut nav = NavigationState::seeded(PathBuf::from("/mnt/cloud/Work"));
+        nav.navigate_to(PathBuf::from("trash:///"));
+        assert!(!nav.can_go_back());
+        nav.navigate_to(PathBuf::from("/home/u"));
+        assert!(nav.can_go_back());
+        // Started where it was seeded: going on from there keeps it.
+        let mut nav = NavigationState::seeded(PathBuf::from("/home/u"));
+        nav.navigate_to(PathBuf::from("/home/u"));
+        nav.navigate_to(PathBuf::from("/home/u/Docs"));
+        assert!(nav.can_go_back());
+    }
+
     use super::NavigationState;
     use std::path::PathBuf;
 

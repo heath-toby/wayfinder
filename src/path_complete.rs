@@ -97,6 +97,12 @@ fn contract_with(path: &str, home: &Path) -> String {
 
 fn complete_with(partial: &str, home: Option<&Path>) -> Completion {
     let expanded = expand_with(partial, home);
+    // Only a full path: a relative one would be looked up from wherever
+    // Wayfinder was started (as in the Bin, which isn't a folder to start
+    // from).
+    if !expanded.starts_with('/') {
+        return Completion::NoMatch;
+    }
     // Answer in the form typed.
     let as_typed = |path: &str| match home {
         Some(home) if partial.starts_with('~') => contract_with(path, home),
@@ -177,6 +183,14 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relative_text_isnt_completed_from_the_working_folder() {
+        assert!(matches!(
+            super::complete_with("Doc", Some(std::path::Path::new("/home/u"))),
+            super::Completion::NoMatch
+        ));
+    }
+
     use super::*;
     use std::path::PathBuf;
 

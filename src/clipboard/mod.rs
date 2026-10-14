@@ -63,11 +63,21 @@ pub fn publish(display: &gdk::Display, state: &ClipboardState) {
         gnome.push('\n');
         gnome.push_str(&f.uri());
     }
-    let kde_cut = if state.operation == ClipboardOperation::Cut { "1" } else { "0" };
+    let kde_cut = if state.operation == ClipboardOperation::Cut {
+        "1"
+    } else {
+        "0"
+    };
     let providers = [
         gdk::ContentProvider::for_value(&file_list.to_value()),
-        gdk::ContentProvider::for_bytes(GNOME_COPIED_FILES, &glib::Bytes::from_owned(gnome.into_bytes())),
-        gdk::ContentProvider::for_bytes(KDE_CUT_SELECTION, &glib::Bytes::from_static(kde_cut.as_bytes())),
+        gdk::ContentProvider::for_bytes(
+            GNOME_COPIED_FILES,
+            &glib::Bytes::from_owned(gnome.into_bytes()),
+        ),
+        gdk::ContentProvider::for_bytes(
+            KDE_CUT_SELECTION,
+            &glib::Bytes::from_static(kde_cut.as_bytes()),
+        ),
     ];
     if let Err(e) = display
         .clipboard()
@@ -114,7 +124,11 @@ pub async fn read_system(display: &gdk::Display) -> Option<ClipboardState> {
             && read_mime_text(&clipboard, KDE_CUT_SELECTION)
                 .await
                 .is_some_and(|t| t.trim() == "1");
-        let operation = if cut { ClipboardOperation::Cut } else { ClipboardOperation::Copy };
+        let operation = if cut {
+            ClipboardOperation::Cut
+        } else {
+            ClipboardOperation::Copy
+        };
         return Some(ClipboardState::new(operation, files));
     }
 

@@ -85,14 +85,7 @@ impl WayfinderWindow {
             );
             return;
         }
-        if self.imp().just_made.replace(false) {
-            self.imp()
-                .nav
-                .borrow_mut()
-                .replace_current(PathBuf::from(path));
-        } else {
-            self.imp().nav.borrow_mut().navigate_to(PathBuf::from(path));
-        }
+        self.imp().nav.borrow_mut().navigate_to(PathBuf::from(path));
         self.open_directory(path, true);
     }
 
@@ -2115,7 +2108,12 @@ impl WayfinderWindow {
             file.name()
         ))]);
         // Select the name without extension for convenience
-        entry.select_region(0, stem_chars(&file.name()));
+        // (A folder has no extension: `v1.2` is all name.)
+        if file.is_directory() {
+            entry.select_region(0, -1);
+        } else {
+            entry.select_region(0, stem_chars(&file.name()));
+        }
 
         let dlg = gtk::Window::builder()
             .title(format!("Rename {}", file.name()))
@@ -2874,23 +2872,34 @@ impl WayfinderWindow {
             ("konsole", &["--workdir"]),
         ];
 
+        // Each tried in turn: one that isn't installed fails to start
+        // (no `which` run first, waited for on this thread).
         for (cmd, args) in terminals {
-            if std::process::Command::new("which")
-                .arg(cmd)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+            match std::process::Command::new(cmd)
+                .args(*args)
+                .arg(&path)
+                .spawn()
             {
-                let mut full_args: Vec<&str> = args.to_vec();
-                full_args.push(&path);
-                let _ = std::process::Command::new(cmd).args(&full_args).spawn();
-                self.announce(
-                    &format!("Opened terminal in {path}"),
-                    AccessibleAnnouncementPriority::Medium,
-                );
-                return;
+                Ok(mut child) => {
+                    // Waited for once it's closed, or it lingers until
+                    // Wayfinder exits.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    self.announce(
+                        &format!("Opened terminal in {path}"),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    self.announce(
+                        &format!("Couldn't open {cmd}: {e}"),
+                        AccessibleAnnouncementPriority::High,
+                    );
+                    return;
+                }
             }
         }
         self.announce(

@@ -95,10 +95,6 @@ pub struct WayfinderWindowInner {
     /// (folder, name): show this file's properties once the folder has
     /// been opened (asked for over D-Bus).
     pub pending_properties: RefCell<Option<(String, String)>>,
-    /// Just made: a location asked for straight away (by D-Bus, the saved
-    /// session, a command line) takes the place of the last directory it
-    /// started on, rather than leaving that to go Back to.
-    pub just_made: Cell<bool>,
     pub breadcrumb_box: gtk::Box,
     pub breadcrumb_scroll: gtk::ScrolledWindow,
     pub breadcrumb_toggle: gtk::ToggleButton,
@@ -125,7 +121,7 @@ impl Default for WayfinderWindowInner {
         let initial_dir = wayfinder::state::load_last_directory()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| "/".into());
-        let nav = RefCell::new(NavigationState::new(initial_dir));
+        let nav = RefCell::new(NavigationState::seeded(initial_dir));
 
         let location_entry = gtk::Entry::builder()
             .hexpand(true)
@@ -231,7 +227,6 @@ impl Default for WayfinderWindowInner {
             trashing: RefCell::new(std::collections::HashSet::new()),
             last_position: RefCell::new(std::collections::HashMap::new()),
             pending_properties: RefCell::new(None),
-            just_made: Cell::new(true),
             breadcrumb_box: gtk::Box::new(gtk::Orientation::Horizontal, 0),
             breadcrumb_scroll: gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -258,14 +253,6 @@ impl ObjectImpl for WayfinderWindowInner {
         self.parent_constructed();
         self.obj().join_session();
         let window = self.obj();
-        {
-            let w = window.downgrade();
-            glib::idle_add_local_once(move || {
-                if let Some(w) = w.upgrade() {
-                    w.imp().just_made.set(false);
-                }
-            });
-        }
 
         window.set_title(Some("Wayfinder"));
         let (w, h) = wayfinder::state::load_window_size();

@@ -270,9 +270,13 @@ pub fn matches_mime(action: &CustomAction, mime_type: &str) -> bool {
         if pattern == "all/allfiles" {
             return mime_type != "inode/directory";
         }
-        // The type itself, or one that's a kind of it (text/x-python is a
-        // text/plain).
-        if pattern == mime_type || gtk::gio::content_type_is_a(mime_type, pattern) {
+        if pattern == mime_type {
+            return true;
+        }
+        // A kind of it (text/x-python is a text/plain) — but not by the
+        // rule that makes everything an application/octet-stream.
+        if pattern != "application/octet-stream" && gtk::gio::content_type_is_a(mime_type, pattern)
+        {
             return true;
         }
         // Support wildcard like "application/*"
@@ -281,11 +285,12 @@ pub fn matches_mime(action: &CustomAction, mime_type: &str) -> bool {
         }
         false
     };
-    // `!type`: never for that type.
+    // `!type`: never for that type (itself: not every kind of it, or
+    // `!text/plain` would rule out all text).
     if action
         .mime_types
         .iter()
-        .any(|p| p.strip_prefix('!').is_some_and(matches))
+        .any(|p| p.strip_prefix('!') == Some(mime_type))
     {
         return false;
     }
@@ -794,6 +799,12 @@ mod tests {
             "inode/directory"
         ));
         assert!(matches_mime(&action(&["!inode/directory"]), "text/plain"));
+        assert!(matches_mime(&action(&["text/plain"]), "text/x-python"));
+        assert!(!matches_mime(
+            &action(&["application/octet-stream"]),
+            "image/png"
+        ));
+        assert!(matches_mime(&action(&["*", "!text/plain"]), "text/html"));
     }
 
     fn files(names: &[&str]) -> Vec<String> {

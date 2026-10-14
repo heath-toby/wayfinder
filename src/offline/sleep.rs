@@ -163,7 +163,10 @@ async fn watch() -> zbus::Result<()> {
             // Wait for any in-flight step to finish. Once we get the lock,
             // the worker will see PAUSED before its next step.
             let deadline = Instant::now() + DRAIN_TIMEOUT;
-            while IO_LOCK.try_lock().is_err() && Instant::now() < deadline {
+            // (Held, that is: a lock poisoned by a panic is free.)
+            while matches!(IO_LOCK.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+                && Instant::now() < deadline
+            {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             inhibitor = None;

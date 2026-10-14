@@ -59,7 +59,8 @@ fn load_state() -> HashMap<String, String> {
             let mut map = HashMap::new();
             for line in contents.lines() {
                 if let Some((key, value)) = line.split_once('=') {
-                    map.insert(key.trim().to_string(), value.trim().to_string());
+                    // The value exactly: a folder's name may end in a space.
+                    map.insert(key.trim().to_string(), value.to_string());
                 }
             }
             map
@@ -75,7 +76,8 @@ fn save_state(map: &HashMap<String, String>) {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("\n");
-    if let Err(e) = fs::write(&file, contents) {
+    // Whole or not at all: a crash mid-write mustn't lose every setting.
+    if let Err(e) = write_atomically(&file, contents.as_bytes()) {
         log::warn!("Failed to save state: {e}");
     }
 }
@@ -101,7 +103,7 @@ pub fn save_last_directory(path: &str) {
 /// parent if it's gone.
 pub fn load_last_directory() -> Option<PathBuf> {
     let path_str = get_value("directory")?;
-    Some(PathBuf::from(path_str.trim()))
+    Some(PathBuf::from(path_str))
 }
 
 pub fn save_view_mode(mode: &str) {
@@ -212,7 +214,8 @@ fn windows_path() -> PathBuf {
 pub fn save_window_session(dirs: &[String]) {
     let file = windows_path();
     let contents = dirs.join("\n");
-    if let Err(e) = fs::write(&file, contents) {
+    // Whole or not at all: a crash mid-write mustn't lose every setting.
+    if let Err(e) = write_atomically(&file, contents.as_bytes()) {
         log::warn!("Failed to save window session: {e}");
     }
 }
@@ -223,9 +226,10 @@ pub fn load_window_session() -> Vec<PathBuf> {
     match fs::read_to_string(&file) {
         Ok(contents) => contents
             .lines()
-            .filter(|l| !l.trim().is_empty())
-            // Not checked here (see load_last_directory).
-            .map(|l| PathBuf::from(l.trim()))
+            .filter(|l| !l.is_empty())
+            // Not checked here (see load_last_directory). Exactly as
+            // written: a folder's name may end in a space.
+            .map(PathBuf::from)
             .collect(),
         Err(_) => Vec::new(),
     }
@@ -276,7 +280,8 @@ fn save_file_apps(map: &HashMap<String, String>) {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("\n");
-    if let Err(e) = fs::write(&file, contents) {
+    // Whole or not at all: a crash mid-write mustn't lose every setting.
+    if let Err(e) = write_atomically(&file, contents.as_bytes()) {
         log::warn!("Failed to save file app associations: {e}");
     }
 }
@@ -336,7 +341,8 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
         .map(|e| format!("{}:{}", e.id, if e.visible { "true" } else { "false" }))
         .collect::<Vec<_>>()
         .join("\n");
-    if let Err(e) = fs::write(&file, contents) {
+    // Whole or not at all: a crash mid-write mustn't lose every setting.
+    if let Err(e) = write_atomically(&file, contents.as_bytes()) {
         log::warn!("Failed to save sidebar config: {e}");
     }
 }
