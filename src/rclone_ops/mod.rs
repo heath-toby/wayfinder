@@ -470,6 +470,26 @@ pub fn copyto_args(src_spec: &str, dst_spec: &str) -> Vec<String> {
     ]
 }
 
+/// `copyto`/`moveto` `args` fitted to what's at `src_local` (the source
+/// as a local path): a folder is copied or moved with `copy`/`move`, which
+/// take the empty-folder flags (`copyto`/`moveto` refuse them as unknown);
+/// a file with `copyto`/`moveto`, without them. Checked off the main thread
+/// (it may be on a mount).
+pub fn fit_to_kind(mut args: Vec<String>, src_local: &str) -> Vec<String> {
+    if std::path::Path::new(src_local).is_dir() {
+        if let Some(verb) = args.first_mut() {
+            match verb.as_str() {
+                "copyto" => *verb = "copy".to_string(),
+                "moveto" => *verb = "move".to_string(),
+                _ => {}
+            }
+        }
+    } else {
+        args.retain(|a| a != "--create-empty-src-dirs" && a != "--delete-empty-src-dirs");
+    }
+    args
+}
+
 /// Build the args for `rclone moveto <src> <dst>` — single-source,
 /// single-destination move (server-side when both are the same remote).
 pub fn moveto_args(src_spec: &str, dst_spec: &str) -> Vec<String> {
@@ -619,6 +639,15 @@ pub fn spec_for_path(local_path: &str) -> String {
 ///
 /// Each step is `(label, args)`. The label is logged before the step runs
 /// so progress markers appear in the dialog as `[i/N] label`.
+/// `steps` fitted, each, to its source in `sources` (see `fit_to_kind`).
+fn fit_steps(steps: Vec<(String, Vec<String>)>, sources: &[String]) -> Vec<(String, Vec<String>)> {
+    steps
+        .into_iter()
+        .zip(sources)
+        .map(|((label, args), src)| (label, fit_to_kind(args, src)))
+        .collect()
+}
+
 fn run_serial(
     steps: Vec<(String, Vec<String>)>,
     tx: &std::sync::mpsc::Sender<RcloneEvent>,
@@ -740,10 +769,11 @@ pub fn pin_with_progress(
         return;
     }
 
-    // `copyto`, not `copy`: for a single file, `copy` would treat the
-    // destination as a folder and put the file inside it. For a folder
-    // the two behave the same.
+    // `copyto` for a file (`copy` would treat the destination as a folder
+    // and put the file inside it); `copy` for a folder, which keeps its
+    // empty subfolders (see `fit_to_kind`).
     let args = copyto_args(&target.full_remote_spec, &cache_path.to_string_lossy());
+    let source = local_path.to_string();
     let labels = progress::ProgressLabels {
         title: "Downloading for offline use",
         target_description: format!(
@@ -764,6 +794,7 @@ pub fn pin_with_progress(
         summarise_copy_line,
         on_complete,
         move |tx, _cancel| {
+            let args = fit_to_kind(args, &source);
             if let Err(e) = run_streaming(&args, tx.clone()) {
                 let _ = tx.send(RcloneEvent::Finished(Err(e)));
             }
@@ -920,6 +951,7 @@ pub fn copy_paths_with_progress(
         summarise_copy_line,
         ignore_outcome(on_complete),
         move |tx, cancel| {
+            let steps = fit_steps(steps, &sources);
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
         },
@@ -975,6 +1007,7 @@ pub fn move_paths_with_progress(
         summarise_copy_line,
         ignore_outcome(on_complete),
         move |tx, cancel| {
+            let steps = fit_steps(steps, &sources);
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
         },
@@ -1014,6 +1047,7 @@ pub fn rename_with_progress(
         summarise_copy_line,
         on_complete,
         move |tx, cancel| {
+            let steps = fit_steps(steps, std::slice::from_ref(&old_path));
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
         },
@@ -1058,6 +1092,7 @@ pub fn batch_rename_with_progress(
             (label, moveto_args(&src_spec, &dst_spec))
         })
         .collect();
+    let olds: Vec<String> = pairs.iter().map(|(old, _)| old.clone()).collect();
 
     progress::show(
         parent_window,
@@ -1065,6 +1100,7 @@ pub fn batch_rename_with_progress(
         summarise_copy_line,
         on_complete,
         move |tx, cancel| {
+            let steps = fit_steps(steps, &olds);
             let result = run_serial(steps, &tx, &cancel);
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
         },
@@ -1286,5 +1322,27 @@ mod mount_parse_tests {
             None
         );
         assert_eq!(parse_rclone_mount("vim notes.txt", &mounts(), &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::{copyto_args, fit_to_kind, moveto_args};
+
+    #[test]
+    fn folders_and_files_get_the_rclone_verbs_and_flags_they_take() {
+        let d = std::env::temp_dir().join(format!("wayfinder-fit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("dir")).unwrap();
+        std::fs::write(d.join("file"), "").unwrap();
+        let dir = d.join("dir").to_string_lossy().to_string();
+        let file = d.join("file").to_string_lossy().to_string();
+        let moved_dir = fit_to_kind(moveto_args("a:x", "a:y"), &dir);
+        let copied_file = fit_to_kind(copyto_args("a:x", "/tmp/y"), &file);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(moved_dir[0], "move");
+        assert!(moved_dir.iter().any(|a| a == "--delete-empty-src-dirs"));
+        assert_eq!(copied_file[0], "copyto");
+        assert!(!copied_file.iter().any(|a| a.contains("empty-src-dirs")));
     }
 }
