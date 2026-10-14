@@ -396,6 +396,20 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
         return;
     }
 
+    // A drive mounted inside since the pair was set up: bisync would sync
+    // what's on it, and delete it on the remote once it's unmounted.
+    let sync_local = pair.sync_local_path.trim_end_matches('/');
+    if let Some(mount) = crate::rclone_ops::mountpoints_inside(sync_local)
+        .iter()
+        .find(|m| m.trim_end_matches('/') != sync_local)
+    {
+        parent_window.announce(
+            &format!("Refusing to sync: {mount} is mounted inside this folder. Unmount it first."),
+            AccessibleAnnouncementPriority::High,
+        );
+        return;
+    }
+
     let args = super::bisync_args(&pair);
     let local_owned = local_path.to_string();
 

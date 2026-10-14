@@ -327,8 +327,25 @@ pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
         return Err("it's being refreshed right now; try again in a moment".to_string());
     }
     let _unpinning = Unpinning::new(original_path);
-    let (was_pinned, manifest) =
-        update_manifest(|manifest| (manifest.remove(original_path).is_some(), manifest.clone()))?;
+    let (was_pinned, manifest) = update_manifest(|manifest| {
+        let was_pinned = manifest.remove(original_path).is_some();
+        // What its refreshes kept as the user's is no longer theirs to keep
+        // (unless a pinned folder holding it still refreshes it).
+        if was_pinned
+            && !manifest
+                .keys()
+                .any(|other| Path::new(original_path).starts_with(other))
+        {
+            let cached = cache_path_for(original_path);
+            let mut kept = load_kept();
+            let before = kept.len();
+            kept.retain(|path, _| !path.starts_with(&cached));
+            if kept.len() != before {
+                let _ = save_kept(&kept);
+            }
+        }
+        (was_pinned, manifest.clone())
+    })?;
     if !was_pinned {
         return Ok(Unpinned::Removed);
     }
@@ -482,13 +499,19 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
         .filter(|_| crate::rclone_ops::rclone_available())
         .map(|t| t.full_remote_spec);
     let dest_root = dest.clone();
+    let started = now_secs();
     KEPT_BEFORE.with(|k| *k.borrow_mut() = load_kept());
     KEPT.with(|k| k.borrow_mut().clear());
+    FETCHED.with(|f| f.borrow_mut().clear());
     let changed = if entry.is_directory {
         sync_dir(src, &dest, remote.as_deref(), entry.last_refreshed)?
     } else {
         sync_file(src, &meta, &dest, remote.as_deref(), entry.last_refreshed)?
     };
+
+    // Files saved here while this ran are older than the refresh time
+    // recorded below: list them as the user's now.
+    note_changed_during(&dest_root, started);
 
     // Update manifest (if it's still pinned: it may have been unpinned
     // while this ran).
@@ -496,13 +519,16 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
         if let Some(e) = manifest.get_mut(&entry.original_path) {
             e.last_synced_mtime = mtime;
             e.last_synced_size = size;
-            e.last_refreshed = now_secs();
             // What was kept as the user's is listed, so it still counts as
-            // theirs next time, though older than this refresh.
+            // theirs next time, though older than this refresh. If the
+            // list can't be saved, the refresh time stays where it was, so
+            // that what was kept still counts by its date.
             let mut kept = load_kept();
             kept.retain(|path, _| !path.starts_with(&dest_root));
             kept.extend(KEPT.with(|k| k.take()));
-            save_kept(&kept);
+            if save_kept(&kept) {
+                e.last_refreshed = now_secs();
+            }
         }
     })?;
     Ok(changed)
@@ -546,6 +572,9 @@ thread_local! {
     /// What this refresh is keeping as the user's.
     static KEPT: std::cell::RefCell<HashMap<PathBuf, i64>> =
         std::cell::RefCell::new(HashMap::new());
+    /// What this refresh fetched.
+    static FETCHED: std::cell::RefCell<HashSet<PathBuf>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 /// Where the list of kept items is saved (written with the manifest).
@@ -570,24 +599,63 @@ fn parse_kept(contents: &str) -> HashMap<PathBuf, i64> {
         .collect()
 }
 
-fn save_kept(kept: &HashMap<PathBuf, i64>) {
+/// Returns whether it was saved.
+fn save_kept(kept: &HashMap<PathBuf, i64>) -> bool {
     let contents: String = kept
         .iter()
         .map(|(path, mtime)| format!("{mtime}\t{}\n", path.display()))
         .collect();
     let path = kept_list_path();
     let part = path.with_extension("wayfinder-part");
-    if let Err(e) = std::fs::write(&part, contents).and_then(|()| std::fs::rename(&part, &path)) {
-        log::warn!("Couldn't save the list of kept offline items: {e}");
+    match std::fs::write(&part, contents).and_then(|()| std::fs::rename(&part, &path)) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("Couldn't save the list of kept offline items: {e}");
+            false
+        }
     }
 }
 
 /// A refresh is keeping `path`, changed in the offline copy since the last
-/// refresh.
+/// refresh — and, if it's a folder, everything in it (should the remote
+/// get a folder of that name, what's in this one is still the user's).
 fn note_kept(path: &Path) {
     log::warn!("Offline copy {} changed here; kept", path.display());
-    let mtime = path.symlink_metadata().map(|m| mtime_secs(&m)).unwrap_or(0);
-    KEPT.with(|k| k.borrow_mut().insert(path.to_path_buf(), mtime));
+    KEPT.with(|k| record_tree(path, &mut k.borrow_mut()));
+}
+
+fn record_tree(path: &Path, into: &mut HashMap<PathBuf, i64>) {
+    let Ok(meta) = path.symlink_metadata() else {
+        return;
+    };
+    into.insert(path.to_path_buf(), mtime_secs(&meta));
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            record_tree(&entry.path(), into);
+        }
+    }
+}
+
+/// List as the user's the files under `root` changed since `started` that
+/// this refresh didn't fetch itself (saved while it ran).
+fn note_changed_during(root: &Path, started: i64) {
+    let Ok(meta) = root.symlink_metadata() else {
+        return;
+    };
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            note_changed_during(&entry.path(), started);
+        }
+    } else if mtime_secs(&meta) >= started
+        && !FETCHED.with(|f| f.borrow().contains(root))
+        && !root.to_string_lossy().ends_with(PART_SUFFIX)
+    {
+        log::warn!(
+            "Offline copy {} changed during refresh; kept",
+            root.display()
+        );
+        KEPT.with(|k| k.borrow_mut().insert(root.to_path_buf(), mtime_secs(&meta)));
+    }
 }
 
 fn now_secs() -> i64 {
@@ -740,6 +808,7 @@ fn sync_file(
         let _ = std::fs::remove_file(&part);
         return Err(e.to_string());
     }
+    FETCHED.with(|f| f.borrow_mut().insert(dst.to_path_buf()));
     Ok(true)
 }
 
@@ -796,7 +865,10 @@ fn remote_child(remote: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{changed_since, check_downloaded, parse_kept, paths_overlap, KEPT_BEFORE};
+    use super::{
+        changed_since, check_downloaded, note_changed_during, note_kept, parse_kept, paths_overlap,
+        FETCHED, KEPT, KEPT_BEFORE,
+    };
     use std::path::Path;
 
     #[test]
@@ -819,6 +891,33 @@ mod tests {
             *k.borrow_mut() = parse_kept(&format!("{}\t{}\n", mtime - 5, file.display()))
         });
         assert!(!changed_since(&file, since));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_kept_folder_keeps_what_is_in_it_and_edits_during_a_refresh_count() {
+        let dir = std::env::temp_dir().join(format!("wayfinder-kept2-{}", std::process::id()));
+        let notes = dir.join("Notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let todo = notes.join("todo.txt");
+        std::fs::write(&todo, "mine").unwrap();
+        KEPT.with(|k| k.borrow_mut().clear());
+        note_kept(&notes);
+        assert!(KEPT.with(|k| k.borrow().contains_key(&todo)));
+
+        // Saved while a refresh ran, next to a file the refresh fetched.
+        let fetched = dir.join("fetched.txt");
+        let saved = dir.join("saved.txt");
+        std::fs::write(&fetched, "remote").unwrap();
+        std::fs::write(&saved, "edit").unwrap();
+        KEPT.with(|k| k.borrow_mut().clear());
+        FETCHED.with(|f| *f.borrow_mut() = [fetched.clone()].into_iter().collect());
+        note_changed_during(&dir, super::now_secs() - 5);
+        KEPT.with(|k| {
+            let k = k.borrow();
+            assert!(k.contains_key(&saved));
+            assert!(!k.contains_key(&fetched));
+        });
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

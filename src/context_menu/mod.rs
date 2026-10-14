@@ -492,6 +492,10 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         let w = window.clone();
                         move || {
                             let files = w.get_selected_files();
+                            if files.is_empty() {
+                                w.say_marked_hidden();
+                                return;
+                            }
                             let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
                             let parent: gtk::Window = w.clone().upcast();
                             wayfinder::actions::show_compress_dialog(&paths, &parent);
@@ -503,6 +507,10 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         let a = action.clone();
                         move || {
                             let files = w.get_selected_files();
+                            if files.is_empty() {
+                                w.say_marked_hidden();
+                                return;
+                            }
                             let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
                             let current_dir = w.imp().model.current_path();
                             let parent: gtk::Window = w.clone().upcast();

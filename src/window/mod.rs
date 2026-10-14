@@ -333,7 +333,12 @@ impl WayfinderWindow {
                         // Once the window is up: presenting it after would
                         // put it over the dialog.
                         let w = self.clone();
-                        glib::idle_add_local_once(move || w.show_properties());
+                        glib::idle_add_local_once(move || {
+                            // Still that file (the selection may have moved).
+                            if w.get_selected_file().is_some_and(|f| f.name() == name) {
+                                w.show_properties();
+                            }
+                        });
                     }
                 }
             }
@@ -551,6 +556,17 @@ impl WayfinderWindow {
         }
         let status = parts.join(", ");
         imp.status_label.set_text(&status);
+    }
+
+    /// When an action found nothing to act on because every marked file is
+    /// out of view (hidden by the search, say), say so rather than nothing.
+    pub fn say_marked_hidden(&self) {
+        if self.imp().file_selection.borrow().count() > 0 {
+            self.announce(
+                "The marked files are hidden. Clear the search to see them, or press Escape to unmark them.",
+                AccessibleAnnouncementPriority::Medium,
+            );
+        }
     }
 
     /// Get selected files — if multi-selection has files, use those; otherwise use the focused file
@@ -936,6 +952,7 @@ impl WayfinderWindow {
         // Every selected (marked) item, not just the focused one.
         let files = self.get_selected_files();
         if files.is_empty() {
+            self.say_marked_hidden();
             return;
         }
         // Restoring the same items again while they're on their way would
@@ -1071,6 +1088,7 @@ impl WayfinderWindow {
     pub fn copy_selected(&self) {
         let files = self.get_selected_files();
         if files.is_empty() {
+            self.say_marked_hidden();
             return;
         }
         if self.is_in_trash() {
@@ -1109,6 +1127,7 @@ impl WayfinderWindow {
         }
         let files = self.get_selected_files();
         if files.is_empty() {
+            self.say_marked_hidden();
             return;
         }
         if self.is_in_trash() {
@@ -1158,6 +1177,7 @@ impl WayfinderWindow {
     pub fn copy_selected_local(&self) {
         let files = self.get_selected_files();
         if files.is_empty() {
+            self.say_marked_hidden();
             return;
         }
         if self.is_in_trash() {
@@ -1195,6 +1215,7 @@ impl WayfinderWindow {
         }
         let files = self.get_selected_files();
         if files.is_empty() {
+            self.say_marked_hidden();
             return;
         }
         if self.is_in_trash() {
@@ -1490,6 +1511,7 @@ impl WayfinderWindow {
                 .collect()
         };
         if files.is_empty() {
+            self.say_marked_hidden();
             return;
         }
         // A drive mounted inside goes along into the Bin, and emptying the
@@ -1865,6 +1887,7 @@ impl WayfinderWindow {
         }
         let files = self.get_selected_files();
         if files.is_empty() {
+            self.say_marked_hidden();
             return;
         }
         let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
@@ -2119,6 +2142,9 @@ impl WayfinderWindow {
         let entry_clone = entry.clone();
         let file_path = file.path();
         let w = window.clone();
+        // Where the rename was asked for: the new name is selected only if
+        // the window is still there.
+        let generation = window.imp().model.generation();
         let do_rename = move || {
             let new_name = entry_clone.text().to_string();
             if new_name.is_empty() || new_name == file.name() {
@@ -2133,8 +2159,6 @@ impl WayfinderWindow {
                 );
                 return;
             }
-            // Where the user is now: the new name is selected only there.
-            let generation = w.imp().model.generation();
 
             // rclone-direct rename: server-side moveto, no FUSE round-trip.
             if wayfinder::rclone_ops::rclone_for_path(&file_path).is_some()
