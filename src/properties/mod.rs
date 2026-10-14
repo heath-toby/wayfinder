@@ -46,12 +46,17 @@ fn gather_details(path: &str) -> Result<Details, String> {
                 .to_string()
         })
         .unwrap_or_else(|| "Unknown".to_string());
-    let metadata = std::fs::metadata(path).ok();
+    // The item itself, as Modified is: for a link, not what it leads to.
+    let metadata = std::fs::symlink_metadata(path).ok();
     Ok(Details {
         modified,
         created: metadata.as_ref().and_then(|m| m.created().ok()),
         accessed: metadata.as_ref().and_then(|m| m.accessed().ok()),
-        mode: metadata.map(|m| m.permissions().mode()),
+        // A link has no permissions of its own (changing them would change
+        // its target's): no permissions section for one.
+        mode: metadata
+            .filter(|m| !m.file_type().is_symlink())
+            .map(|m| m.permissions().mode()),
     })
 }
 
@@ -319,10 +324,11 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
         apply_btn.update_property(&[gtk::accessible::Property::Label("Apply file permissions")]);
         apply_btn.set_margin_top(4);
         let fp = file.path();
-        let parent_ref = parent.clone();
         let cbs_apply = checkboxes.clone();
         let special_apply = special.clone();
-        apply_btn.connect_clicked(move |_| {
+        // Results are said from the dialog, which has focus: Orca may not
+        // speak for the window behind it.
+        apply_btn.connect_clicked(move |btn| {
             let bits: u32 = cbs_apply.iter()
                 .filter(|(_, c)| c.is_active())
                 .map(|(b, _)| b)
@@ -332,8 +338,8 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
             let new_mode = (original_mode & !0o7777) | (new_perm_bits & 0o7777);
             let perms = std::fs::Permissions::from_mode(new_mode);
             let path = fp.clone();
-            let parent_done = parent_ref.clone();
-            let parent_slow = parent_ref.clone();
+            let parent_done = btn.clone();
+            let parent_slow = btn.clone();
             let waiting = wayfinder::background::waiting_message(&fp);
             wayfinder::background::run(
                 move || std::fs::set_permissions(&path, perms),
@@ -405,14 +411,14 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
             let per_file_app = wayfinder::state::load_file_app(&file_path);
             let mut selected_idx = 0u32;
 
-            if let Some(ref per_file_id) = per_file_app {
-                // Find the app matching the per-file desktop ID
-                for (i, app) in apps.iter().enumerate() {
-                    if app.id().map(|id| id.to_string()) == Some(per_file_id.clone()) {
-                        selected_idx = i as u32;
-                        break;
-                    }
-                }
+            // (A per-file app that's gone, or not for this type, isn't
+            // what opens it: show the default then, not the first app.)
+            let per_file_idx = per_file_app.as_ref().and_then(|per_file_id| {
+                apps.iter()
+                    .position(|app| app.id().map(|id| id.to_string()).as_ref() == Some(per_file_id))
+            });
+            if let Some(i) = per_file_idx {
+                selected_idx = i as u32;
             } else if let Some(ref default_name) = default_name {
                 for (i, name) in app_names.iter().enumerate() {
                     if name == default_name {
@@ -426,13 +432,12 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
             // When the dropdown changes, save the per-file association
             let apps_for_change = apps.clone();
             let fp = file_path.clone();
-            let parent_for_change = parent.clone();
             dropdown.connect_selected_notify(move |dd| {
                 let idx = dd.selected() as usize;
                 if let Some(app) = apps_for_change.get(idx) {
                     if let Some(id) = app.id() {
                         wayfinder::state::save_file_app(&fp, id.as_ref());
-                        parent_for_change.announce(
+                        dd.announce(
                             &format!("{} will be used to open this file", app.name()),
                             AccessibleAnnouncementPriority::Medium,
                         );
@@ -455,10 +460,9 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
                 "Set selected application as default for all files of this type",
             )]);
             let ct = content_type.clone();
-            let parent_win = parent.clone();
             let apps_clone = apps.clone();
             let dd = dropdown.clone();
-            set_default_btn.connect_clicked(move |_| {
+            set_default_btn.connect_clicked(move |parent_win| {
                 let idx = dd.selected() as usize;
                 if let Some(app) = apps_clone.get(idx) {
                     if let Err(e) = app.set_as_default_for_type(&ct) {

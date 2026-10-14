@@ -18,11 +18,24 @@ fn bookmarks_file() -> PathBuf {
         .join("bookmarks")
 }
 
+/// The bookmarks, to show; none if they can't be read.
 pub fn load_bookmarks() -> Vec<(String, String)> {
-    let file = bookmarks_file();
-    let Ok(contents) = std::fs::read_to_string(&file) else {
-        return Vec::new();
+    read_bookmarks().unwrap_or_default()
+}
+
+/// The bookmarks, to change: an error if the file is there but can't be
+/// read (or isn't UTF-8) — writing it back would lose them all, other
+/// apps' too.
+fn read_bookmarks() -> Result<Vec<(String, String)>, String> {
+    let contents = match std::fs::read_to_string(bookmarks_file()) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("Couldn't read the bookmarks: {e}")),
     };
+    Ok(parse_bookmarks(&contents))
+}
+
+fn parse_bookmarks(contents: &str) -> Vec<(String, String)> {
     contents
         .lines()
         .filter_map(|line| {
@@ -49,19 +62,37 @@ pub fn load_bookmarks() -> Vec<(String, String)> {
         .collect()
 }
 
-fn save_bookmarks(bookmarks: &[(String, String)]) {
-    let file = bookmarks_file();
-    if let Some(parent) = file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+fn save_bookmarks(bookmarks: &[(String, String)]) -> Result<(), String> {
     let contents: String = bookmarks
         .iter()
         .map(|(uri, name)| format!("{uri} {name}"))
         .collect::<Vec<_>>()
         .join("\n");
-    if let Err(e) = std::fs::write(&file, contents) {
-        log::warn!("Failed to save bookmarks: {e}");
+    crate::state::write_atomically(&bookmarks_file(), contents.as_bytes())
+        .map_err(|e| format!("Couldn't save the bookmarks: {e}"))
+}
+
+thread_local! {
+    /// Every sidebar (one per window): a bookmark change shows in all.
+    static SIDEBARS: std::cell::RefCell<Vec<glib::WeakRef<WayfinderSidebar>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Show the bookmarks as they are now in every sidebar but `except`.
+pub fn refresh_all_bookmarks(except: Option<&WayfinderSidebar>) {
+    for sidebar in live_sidebars() {
+        if Some(&sidebar) != except {
+            sidebar.refresh_bookmarks();
+        }
     }
+}
+
+fn live_sidebars() -> Vec<WayfinderSidebar> {
+    SIDEBARS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.retain(|w| w.upgrade().is_some());
+        s.iter().filter_map(|w| w.upgrade()).collect()
+    })
 }
 
 /// The local folder a bookmark URI names (percent-decoded); `None` for
@@ -80,26 +111,27 @@ fn bookmark_index(bookmarks: &[(String, String)], path: &str) -> Option<usize> {
         .position(|(u, _)| bookmark_path(u).as_deref() == Some(path))
 }
 
-pub fn add_bookmark(path: &str) -> bool {
+/// Bookmark `path`; false if it already is.
+pub fn add_bookmark(path: &str) -> Result<bool, String> {
     // Encoded as GTK writes it: a space would end the URI on reading.
     let uri = gtk::gio::File::for_path(path).uri().to_string();
-    let mut bookmarks = load_bookmarks();
+    let mut bookmarks = read_bookmarks()?;
     if bookmark_index(&bookmarks, path).is_some() {
-        return false; // already exists
+        return Ok(false); // already exists
     }
     let name = std::path::Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string());
     bookmarks.push((uri, name));
-    save_bookmarks(&bookmarks);
-    true
+    save_bookmarks(&bookmarks)?;
+    Ok(true)
 }
 
-pub fn remove_bookmark(path: &str) {
-    let mut bookmarks = load_bookmarks();
+pub fn remove_bookmark(path: &str) -> Result<(), String> {
+    let mut bookmarks = read_bookmarks()?;
     bookmarks.retain(|(u, _)| bookmark_path(u).as_deref() != Some(path));
-    save_bookmarks(&bookmarks);
+    save_bookmarks(&bookmarks)
 }
 
 /// Remove a bookmark's row (and the bookmark), say so, and put focus on a
@@ -109,13 +141,31 @@ fn remove_bookmark_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
     let Some(path) = name.strip_prefix("bookmark:") else {
         return;
     };
-    remove_bookmark(path);
+    if let Err(e) = remove_bookmark(path) {
+        list.announce(&e, gtk::AccessibleAnnouncementPriority::High);
+        return;
+    }
     let display = std::path::Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string());
     let idx = row.index();
     list.remove(row);
+    // The last one gone: its separator goes too.
+    let names = row_names(list);
+    if !names.iter().any(|n| n.starts_with("bookmark:")) {
+        let mut child = list.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.widget_name() == "bookmark-separator" {
+                list.remove(&widget);
+            }
+        }
+    }
+    let this = live_sidebars()
+        .into_iter()
+        .find(|s| s.imp().places_list == *list);
+    refresh_all_bookmarks(this.as_ref());
     // A neighbour that can take focus (not a separator), or else the first
     // row that can.
     let next = [idx, idx - 1]
@@ -389,6 +439,7 @@ const PLACES: &[PlaceEntry] = &[
 impl WayfinderSidebar {
     pub fn new() -> Self {
         let sidebar: Self = glib::Object::builder().build();
+        SIDEBARS.with(|s| s.borrow_mut().push(sidebar.downgrade()));
         sidebar.populate_places();
         sidebar.connect_volume_signals();
         sidebar.connect_bookmark_delete_key();
@@ -564,7 +615,13 @@ impl WayfinderSidebar {
             }
 
             // Swap in the bookmarks file
-            let mut bookmarks = load_bookmarks();
+            let mut bookmarks = match read_bookmarks() {
+                Ok(bookmarks) => bookmarks,
+                Err(e) => {
+                    list.announce(&e, gtk::AccessibleAnnouncementPriority::High);
+                    return glib::Propagation::Stop;
+                }
+            };
             let target_name = target_widget.as_ref().unwrap().widget_name().to_string();
             let cur_idx = bookmark_index(&bookmarks, name.strip_prefix("bookmark:").unwrap_or(""));
             let tgt_idx = bookmark_index(
@@ -582,10 +639,14 @@ impl WayfinderSidebar {
                 };
 
                 bookmarks.swap(ci, ti);
-                save_bookmarks(&bookmarks);
+                if let Err(e) = save_bookmarks(&bookmarks) {
+                    list.announce(&e, gtk::AccessibleAnnouncementPriority::High);
+                    return glib::Propagation::Stop;
+                }
 
                 // Refresh and re-focus
                 sidebar.refresh_bookmarks();
+                refresh_all_bookmarks(Some(&sidebar));
 
                 // Find and focus the moved bookmark row, with announcement as label
                 let mut child = list.first_child();
@@ -636,8 +697,13 @@ impl WayfinderSidebar {
             list.remove(&widget);
         }
 
+        // Only local folders: other URIs (sftp://…) can't be opened here.
         let bookmarks = load_bookmarks();
-        if bookmarks.is_empty() {
+        let local: Vec<(String, &String)> = bookmarks
+            .iter()
+            .filter_map(|(uri, name)| bookmark_path(uri).map(|p| (p, name)))
+            .collect();
+        if local.is_empty() {
             return;
         }
 
@@ -652,11 +718,6 @@ impl WayfinderSidebar {
         list.insert(&sep_row, insert_pos);
 
         // Insert bookmark rows
-        // Only local folders: other URIs (sftp://…) can't be opened here.
-        let local: Vec<(String, &String)> = bookmarks
-            .iter()
-            .filter_map(|(uri, name)| bookmark_path(uri).map(|p| (p, name)))
-            .collect();
         for (i, (path, display_name)) in local.iter().enumerate() {
             let path = path.as_str();
 
@@ -1403,7 +1464,6 @@ impl WayfinderSidebar {
 
         dlg.set_child(Some(&vbox));
 
-        let sidebar = self.clone();
         let d = dlg.clone();
         let data_for_save = row_data.clone();
         done_btn.connect_clicked(move |_| {
@@ -1420,8 +1480,10 @@ impl WayfinderSidebar {
 
             d.close();
 
-            // Rebuild sidebar
-            sidebar.rebuild();
+            // Rebuild the sidebars (every window's: they share the setup)
+            for other in live_sidebars() {
+                other.rebuild();
+            }
         });
 
         dlg.present();

@@ -525,6 +525,8 @@ pub fn show_chooser(
                 d.clone(),
                 lv.clone(),
             );
+            let waiting = wayfinder::background::waiting_message(&check);
+            let d_slow = d.clone();
             wayfinder::background::run(
                 move || std::path::Path::new(&check).is_dir(),
                 move |is_dir| {
@@ -543,7 +545,11 @@ pub fn show_chooser(
                     load_dir(&model, &path, &entry, &sl, &nav, &bb, &fb, &ub, &sel, &d);
                     lv.grab_focus();
                 },
-                || {},
+                move || {
+                    if let Some(msg) = waiting {
+                        d_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                    }
+                },
             );
         });
     }
@@ -695,8 +701,24 @@ pub fn show_chooser(
     let fn_accept = filename_entry.clone();
     let model_accept = model.clone();
     let d_accept = dlg.clone();
+    let le_accept = location_entry.clone();
     accept_btn.connect_clicked(move |_| {
         let current_dir = model_accept.current_path();
+        // A location typed but not gone to (Enter) isn't where this would
+        // save or what it would choose: say so, rather than use the folder
+        // shown before.
+        let typed = le_accept.text().trim().to_string();
+        if !typed.is_empty() {
+            let typed = wayfinder::path_complete::clean(&wayfinder::path_complete::expand_tilde(&typed));
+            if typed != wayfinder::path_complete::clean(&current_dir) {
+                d_accept.announce(
+                    &format!("{typed} isn't open yet: press Enter in the location to go there"),
+                    AccessibleAnnouncementPriority::High,
+                );
+                le_accept.grab_focus();
+                return;
+            }
+        }
         let send = {
             let tx = tx_accept.clone();
             let d = d_accept.clone();
@@ -738,6 +760,8 @@ pub fn show_chooser(
             // (Checking may touch a slow mount: not on the main thread.)
             let check = full_path.clone();
             let d = d_accept.clone();
+            let d_slow = d_accept.clone();
+            let waiting = wayfinder::background::waiting_message(&check);
             wayfinder::background::run(
                 move || std::path::Path::new(&check).exists(),
                 move |exists| {
@@ -758,7 +782,11 @@ pub fn show_chooser(
                         }
                     });
                 },
-                || {},
+                move || {
+                    if let Some(msg) = waiting {
+                        d_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                    }
+                },
             );
             return;
         }

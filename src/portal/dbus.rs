@@ -141,6 +141,7 @@ pub fn save_files_names(options: &HashMap<String, OwnedValue>) -> Vec<String> {
             let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
             String::from_utf8_lossy(&b[..end]).to_string()
         })
-        .filter(|n| !n.is_empty())
+        // Empty names stay: one URI per file, in order (they get a
+        // stand-in name).
         .collect()
 }

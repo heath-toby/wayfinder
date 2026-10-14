@@ -804,14 +804,18 @@ impl WayfinderWindowInner {
                 );
                 return;
             }
-            if wayfinder::sidebar::add_bookmark(&path) {
-                w.imp().sidebar.refresh_bookmarks();
-                w.announce(
-                    &format!("Bookmarked {path}"),
-                    AccessibleAnnouncementPriority::Medium,
-                );
-            } else {
-                w.announce("Already bookmarked", AccessibleAnnouncementPriority::Medium);
+            match wayfinder::sidebar::add_bookmark(&path) {
+                Ok(true) => {
+                    wayfinder::sidebar::refresh_all_bookmarks(None);
+                    w.announce(
+                        &format!("Bookmarked {path}"),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                }
+                Ok(false) => {
+                    w.announce("Already bookmarked", AccessibleAnnouncementPriority::Medium)
+                }
+                Err(e) => w.announce(&e, AccessibleAnnouncementPriority::High),
             }
         });
         window.add_action(&action);
