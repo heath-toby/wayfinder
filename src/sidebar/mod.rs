@@ -162,11 +162,12 @@ fn remove_bookmark_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
     let Some(path) = name.strip_prefix("bookmark:") else {
         return;
     };
-    // Said by the name it's shown (and read) by, not its folder's.
-    let display = load_bookmarks()
-        .into_iter()
-        .find(|(uri, _)| bookmark_path(uri).as_deref() == Some(path))
-        .map(|(_, name)| name)
+    // Said by the name its row shows (and Orca read), not its folder's.
+    let display = row
+        .child()
+        .and_then(|b| b.last_child())
+        .and_downcast::<gtk::Label>()
+        .map(|l| l.text().to_string())
         .unwrap_or_else(|| {
             std::path::Path::new(path)
                 .file_name()
@@ -993,23 +994,12 @@ impl WayfinderSidebar {
 
     pub fn rebuild(&self) {
         let list = &self.imp().places_list;
-        // (Focus in this list — or nowhere, its row just gone from under
-        // a closing dialog — goes back to that row, or near it, after.)
-        let refocus = list
-            .root()
-            .is_none_or(|r| r.focus().is_none_or(|f| f.is_ancestor(list)))
-            .then(|| list.selected_row())
-            .flatten()
-            .map(|r| (r.widget_name().to_string(), r.index()));
         while let Some(child) = list.first_child() {
             list.remove(&child);
         }
         self.populate_places();
         // The new Bin row needs its menu again.
         self.wire_trash_right_click();
-        if let Some((name, index)) = refocus {
-            refocus_row(list, &name, index);
-        }
     }
 
     pub fn connect_sidebar_edit_menu(&self, parent_window: &gtk::Window) {

@@ -167,9 +167,10 @@
 - **Copying onto a name that can't be checked** (a mount erroring) — asks, as for a name taken, instead of merging into the folder there; "Keep both" says why it can't (no free number, a name too long, the mount's error) instead of merging into the existing folder.
 - **Keeping a folder offline again** — if the old offline copy can't be removed, it says so, instead of downloading beside it and reporting success.
 - **Properties** — a link's Created and Last Opened dates are shown; an item in the Bin shows its Original Location; Apply with an invalid octal number says so instead of applying the last valid one.
-- **Go to Location** — Tab on `~` completes to `~/`.
+- **Go to Location** — Tab on `~` completes to `~/`; Escape closes it from its buttons too.
+- **Hiding the sidebar** (F3) with focus in it — focus goes to the files, instead of nowhere.
 - **Context menus** — Down with no item focused goes to the first item, not the second.
-- **Sidebar** — the Menu key (or Shift+F10) on the Bin opens its own menu with Empty Bin, as right-click does; after Edit Sidebar's Done, focus is back on the sidebar row instead of nowhere; removing a bookmark names it as it's shown.
+- **Sidebar** — the Menu key (or Shift+F10) on the Bin opens its own menu with Empty Bin, as right-click does; removing a bookmark names it as it's shown.
 
 ### Development
 

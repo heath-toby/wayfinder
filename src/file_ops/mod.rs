@@ -341,14 +341,17 @@ pub fn delete_with_progress(
     // Cancel, the window stays until the item being deleted is done, rather
     // than going while it's deleted unseen. (Closed when done by destroy.)
     let cancelled_for_close = cancelled.clone();
+    // (Closed again while cancelling — an item stuck on a frozen mount —
+    // it goes: not kept up for good.)
     dlg.connect_close_request(move |d| {
-        if !cancelled_for_close.swap(true, Ordering::Relaxed) {
-            d.set_title(Some("Cancelling..."));
-            d.announce(
-                "Cancelling. The item being deleted is finished first.",
-                AccessibleAnnouncementPriority::Medium,
-            );
+        if cancelled_for_close.swap(true, Ordering::Relaxed) {
+            return glib::Propagation::Proceed;
         }
+        d.set_title(Some("Cancelling..."));
+        d.announce(
+            "Cancelling. The item being deleted is finished first.",
+            AccessibleAnnouncementPriority::Medium,
+        );
         glib::Propagation::Stop
     });
 
@@ -1403,6 +1406,25 @@ fn get_unique_dest(dest: &gio::File) -> Result<gio::File, glib::Error> {
 
 #[cfg(test)]
 mod tests {
+    /// Keep both: the next free number, never the taken name; a name
+    /// that can't be checked (too long with its number) is an error.
+    #[test]
+    fn keep_both_finds_a_free_number_or_says_why_not() {
+        let d = std::env::temp_dir().join(format!("wayfinder-unique-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.txt"), "").unwrap();
+        std::fs::write(d.join("a (2).txt"), "").unwrap();
+        let long = format!("{}.txt", "x".repeat(250));
+        std::fs::write(d.join(&long), "").unwrap();
+        let dir = gio::File::for_path(&d);
+        let got = super::get_unique_dest(&dir.child("a.txt")).map(|f| f.path());
+        let too_long = super::get_unique_dest(&dir.child(&long));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(got.unwrap(), Some(d.join("a (3).txt")));
+        assert!(too_long.is_err());
+    }
+
     #[test]
     fn a_folder_move_stops_at_a_pipe_and_a_copy_leaves_it_out() {
         let d = std::env::temp_dir().join(format!("wayfinder-fifo-{}", std::process::id()));

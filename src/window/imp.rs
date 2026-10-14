@@ -287,7 +287,13 @@ impl ObjectImpl for WayfinderWindowInner {
         let w = window.clone();
         self.sidebar_toggle.connect_toggled(move |btn| {
             let visible = btn.is_active();
+            // (Hidden with focus in it: focus to the files, not nowhere.)
+            let focus_inside =
+                gtk::prelude::GtkWindowExt::focus(&w).is_some_and(|f| f.is_ancestor(&revealer));
             revealer.set_reveal_child(visible);
+            if !visible && focus_inside {
+                w.restore_focus_to_selected();
+            }
             wayfinder::state::save_sidebar_visible(visible);
             let msg = if visible {
                 "Sidebar shown"
@@ -960,6 +966,19 @@ impl WayfinderWindowInner {
             vbox.append(&button_box);
 
             dlg.set_child(Some(&vbox));
+
+            // Escape from its buttons too (the entry's own is below).
+            let esc_ctrl = gtk::EventControllerKey::new();
+            let d = dlg.clone();
+            esc_ctrl.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    d.close();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            dlg.add_controller(esc_ctrl);
 
             // Tab autocomplete + Escape to cancel
             let tab_ctrl = gtk::EventControllerKey::new();
