@@ -176,6 +176,7 @@
 - **The Bin in several windows** — emptying it, or restoring from it, in one window shows in the others when you go to them.
 - **Delete pressed again** while a file is still going to the Bin (on a slow drive) says so, instead of nothing; Shift+Delete leaves such a file alone instead of deleting it at the same time.
 - **Open Terminal Here in the offline copy** is refused, as other changes there are.
+- **Compress** — Enter in the archive name creates it, as in the Rename and New Folder dialogs.
 
 ### Development
 

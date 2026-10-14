@@ -150,10 +150,11 @@ impl WayfinderWindow {
         // Asked for with this load only: if it fails or is overtaken, it's
         // dropped, not shown on some later visit.
         let properties = self.imp().pending_properties.take();
+        let show_requested = self.imp().show_requested.take();
         self.imp()
             .model
             .load_directory(path, resolve, move |result| {
-                w.finish_open_directory(&requested, result, properties)
+                w.finish_open_directory(&requested, result, properties, show_requested)
             });
         self.notify_if_waiting(path);
     }
@@ -173,11 +174,9 @@ impl WayfinderWindow {
         requested: &str,
         live_result: Result<u32, String>,
         properties: Option<(String, String)>,
+        show_requested: Option<(String, String)>,
     ) {
         let imp = self.imp();
-        // Asked for with this load only, whatever comes of it: not shown
-        // on some later visit.
-        let show_requested = imp.show_requested.take();
         // A folder that no longer exists resolves to its nearest parent.
         let resolved = imp.model.current_path();
         // Walked up from a folder on a drive that's been unmounted (to its
@@ -309,7 +308,6 @@ impl WayfinderWindow {
                 let remembered = imp.last_position.borrow().get(path).cloned();
                 let mut selected_pos: u32 = 0;
                 let requested = show_requested
-                    .clone()
                     .filter(|(folder, _)| folder == path)
                     .map(|(_, name)| name);
                 if let Some(name) = &requested {
@@ -404,6 +402,9 @@ impl WayfinderWindow {
     }
 
     fn open_special_uri(&self, uri: &str) {
+        // (A request to show a file came with another load: not this one's.)
+        self.imp().show_requested.take();
+        self.imp().pending_properties.take();
         self.leave_location(uri);
         self.note_session_location(uri);
         self.show_location(uri, false);

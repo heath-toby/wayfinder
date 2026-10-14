@@ -570,6 +570,13 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
         .collect::<Vec<_>>();
     let parent = parent_window.clone();
     let entry_for_focus = name_entry.clone();
+    // Enter in the name creates it, as in the Rename and New Folder dialogs.
+    {
+        let create = create_btn.clone();
+        name_entry.connect_activate(move |_| {
+            create.emit_clicked();
+        });
+    }
     create_btn.connect_clicked(move |_| {
         let stem = name_entry.text().trim().to_string();
         // A name, in the folder of the files — not a hidden `.zip`, nor a
