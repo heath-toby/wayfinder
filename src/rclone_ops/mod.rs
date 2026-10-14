@@ -476,10 +476,9 @@ pub fn copyto_args(src_spec: &str, dst_spec: &str) -> Vec<String> {
 /// a file with `copyto`/`moveto`, without them. Checked off the main thread
 /// (it may be on a mount).
 pub fn fit_to_kind(mut args: Vec<String>, src_local: &str) -> Vec<String> {
-    // (A link is itself, not the folder it leads to; one that can't be
-    // looked at goes as a file: `copyto` copes with a folder too, only
-    // without its empty subfolders.)
-    if std::fs::symlink_metadata(src_local).is_ok_and(|m| m.is_dir()) {
+    // (One that can't be looked at goes as a file: `copyto` copes with a
+    // folder too, only without its empty subfolders.)
+    if std::path::Path::new(src_local).is_dir() {
         if let Some(verb) = args.first_mut() {
             match verb.as_str() {
                 "copyto" => *verb = "copy".to_string(),
@@ -643,20 +642,6 @@ fn fit_steps(steps: Vec<(String, Vec<String>)>, sources: &[String]) -> Vec<(Stri
         .zip(sources)
         .map(|((label, args), src)| (label, fit_to_kind(args, src)))
         .collect()
-}
-
-/// After moving `sources`: a folder moved to another kind of place leaves
-/// its own, emptied, folder behind (rclone removes only those inside it):
-/// remove it. Off the main thread (it may be on a mount).
-fn tidy_moved_folders(sources: &[String]) {
-    for src in sources {
-        let path = std::path::Path::new(src);
-        let empty = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
-            && std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_none());
-        if empty {
-            let _ = std::fs::remove_dir(path);
-        }
-    }
 }
 
 /// Run a sequence of rclone invocations one after another. Forwards Started
@@ -1026,9 +1011,6 @@ pub fn move_paths_with_progress(
         move |tx, cancel| {
             let steps = fit_steps(steps, &sources);
             let result = run_serial(steps, &tx, &cancel);
-            if result.success {
-                tidy_moved_folders(&sources);
-            }
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
         },
     );
@@ -1069,9 +1051,6 @@ pub fn rename_with_progress(
         move |tx, cancel| {
             let steps = fit_steps(steps, std::slice::from_ref(&old_path));
             let result = run_serial(steps, &tx, &cancel);
-            if result.success {
-                tidy_moved_folders(std::slice::from_ref(&old_path));
-            }
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
         },
     );
@@ -1125,9 +1104,6 @@ pub fn batch_rename_with_progress(
         move |tx, cancel| {
             let steps = fit_steps(steps, &olds);
             let result = run_serial(steps, &tx, &cancel);
-            if result.success {
-                tidy_moved_folders(&olds);
-            }
             let _ = tx.send(RcloneEvent::Finished(Ok(result)));
         },
     );

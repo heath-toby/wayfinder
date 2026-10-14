@@ -631,6 +631,19 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
     entry_for_focus.grab_focus();
 }
 
+/// Whether `tar` is GNU tar (whose exit status 1 is a warning; busybox's
+/// and bsdtar's is a failure). Asked once.
+fn is_gnu_tar() -> bool {
+    static GNU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GNU.get_or_init(|| {
+        std::process::Command::new("tar")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
+    })
+}
+
 /// `tar`: the tar to run (`bsdtar`, or GNU `tar`: both take these options).
 fn build_compress_command(
     ext: &str,
@@ -659,7 +672,7 @@ fn build_compress_command(
             let cmd = format!("{tar} {options} {quoted_archive} {quoted_files}");
             // GNU tar's 1 is a warning (a file changed as it was read): the
             // archive is made.
-            if tar == "tar" {
+            if tar == "tar" && is_gnu_tar() {
                 format!("{cmd} || [ $? -eq 1 ]")
             } else {
                 cmd
@@ -828,10 +841,15 @@ mod tests {
             build_compress_command("tar.zst", "x.tar.zst", &names, "bsdtar"),
             "bsdtar --zstd -cf './x.tar.zst' './a'"
         );
-        // GNU tar: a warning (1) isn't a failure.
+        // GNU tar: a warning (1) isn't a failure. (Any other tar's 1 is.)
+        let expected = if super::is_gnu_tar() {
+            "tar cJf './x.tar.xz' './a' || [ $? -eq 1 ]"
+        } else {
+            "tar cJf './x.tar.xz' './a'"
+        };
         assert_eq!(
             build_compress_command("tar.xz", "x.tar.xz", &names, "tar"),
-            "tar cJf './x.tar.xz' './a' || [ $? -eq 1 ]"
+            expected
         );
     }
 
