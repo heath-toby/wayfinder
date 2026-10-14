@@ -707,17 +707,17 @@ pub fn show_chooser(
         // A location typed but not gone to (Enter) isn't where this would
         // save or what it would choose: say so, rather than use the folder
         // shown before.
-        let typed = le_accept.text().trim().to_string();
-        if !typed.is_empty() {
-            let typed = wayfinder::path_complete::clean(&wayfinder::path_complete::expand_tilde(&typed));
-            if typed != wayfinder::path_complete::clean(&current_dir) {
-                d_accept.announce(
-                    &format!("{typed} isn't open yet: press Enter in the location to go there"),
-                    AccessibleAnnouncementPriority::High,
-                );
-                le_accept.grab_focus();
-                return;
-            }
+        let typed = le_accept.text().to_string();
+        if location_not_open(&typed, &current_dir) {
+            d_accept.announce(
+                &format!(
+                    "{} isn't open yet: press Enter in the location to go there",
+                    typed.trim()
+                ),
+                AccessibleAnnouncementPriority::High,
+            );
+            le_accept.grab_focus();
+            return;
         }
         let send = {
             let tx = tx_accept.clone();
@@ -893,4 +893,30 @@ fn load_dir(
         status_label.set_text(&msg);
         window.announce(&msg, AccessibleAnnouncementPriority::Medium);
     });
+}
+
+/// Whether the location typed (`typed`) is somewhere other than the folder
+/// shown (`current`): typed but not gone to. As written or trimmed (a
+/// folder's name may end in a space; a stray one typed is no matter).
+fn location_not_open(typed: &str, current: &str) -> bool {
+    use wayfinder::path_complete::{clean, expand_tilde};
+    if typed.trim().is_empty() {
+        return false;
+    }
+    let current = clean(current);
+    clean(&expand_tilde(typed)) != current && clean(&expand_tilde(typed.trim())) != current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::location_not_open;
+
+    #[test]
+    fn a_typed_location_counts_only_if_its_somewhere_else() {
+        assert!(!location_not_open("", "/home/u"));
+        assert!(!location_not_open("/home/u/", "/home/u"));
+        assert!(!location_not_open("/home/u ", "/home/u"));
+        assert!(!location_not_open("/home/u/Project ", "/home/u/Project "));
+        assert!(location_not_open("/home/u/Projects", "/home/u"));
+    }
 }

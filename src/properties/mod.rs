@@ -390,7 +390,19 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
         row += 1;
 
         let content_type = file.mime_type();
-        let apps = gio::AppInfo::all_for_type(&content_type);
+        let mut apps = gio::AppInfo::all_for_type(&content_type);
+        // The app remembered for this file opens it even if it isn't one
+        // for its type (as opening it looks it up among all apps): list it.
+        if let Some(id) = wayfinder::state::load_file_app(&file.path()) {
+            if !apps.iter().any(|a| a.id().is_some_and(|i| i == id)) {
+                if let Some(app) = gio::AppInfo::all()
+                    .into_iter()
+                    .find(|a| a.id().is_some_and(|i| i == id))
+                {
+                    apps.push(app);
+                }
+            }
+        }
         let default_app = gio::AppInfo::default_for_type(&content_type, false);
         let default_name = default_app.as_ref().map(|a| a.name().to_string());
 
@@ -411,8 +423,8 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
             let per_file_app = wayfinder::state::load_file_app(&file_path);
             let mut selected_idx = 0u32;
 
-            // (A per-file app that's gone, or not for this type, isn't
-            // what opens it: show the default then, not the first app.)
+            // (A per-file app that's no longer installed isn't what opens
+            // it: show the default then, not the first app.)
             let per_file_idx = per_file_app.as_ref().and_then(|per_file_id| {
                 apps.iter()
                     .position(|app| app.id().map(|id| id.to_string()).as_ref() == Some(per_file_id))

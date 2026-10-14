@@ -27,7 +27,11 @@ pub fn load_bookmarks() -> Vec<(String, String)> {
 /// read (or isn't UTF-8) — writing it back would lose them all, other
 /// apps' too.
 fn read_bookmarks() -> Result<Vec<(String, String)>, String> {
-    let contents = match std::fs::read_to_string(bookmarks_file()) {
+    read_bookmarks_from(&bookmarks_file())
+}
+
+fn read_bookmarks_from(file: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    let contents = match std::fs::read_to_string(file) {
         Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("Couldn't read the bookmarks: {e}")),
@@ -68,7 +72,10 @@ fn save_bookmarks(bookmarks: &[(String, String)]) -> Result<(), String> {
         .map(|(uri, name)| format!("{uri} {name}"))
         .collect::<Vec<_>>()
         .join("\n");
-    crate::state::write_atomically(&bookmarks_file(), contents.as_bytes())
+    // Through a link (to a dotfiles folder, say), to the file it leads to.
+    let file = bookmarks_file();
+    let file = std::fs::canonicalize(&file).unwrap_or(file);
+    crate::state::write_atomically(&file, contents.as_bytes())
         .map_err(|e| format!("Couldn't save the bookmarks: {e}"))
 }
 
@@ -150,32 +157,19 @@ fn remove_bookmark_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string());
     let idx = row.index();
-    list.remove(row);
-    // The last one gone: its separator goes too.
-    let names = row_names(list);
-    if !names.iter().any(|n| n.starts_with("bookmark:")) {
-        let mut child = list.first_child();
-        while let Some(widget) = child {
-            child = widget.next_sibling();
-            if widget.widget_name() == "bookmark-separator" {
-                list.remove(&widget);
-            }
-        }
-    }
-    let this = live_sidebars()
-        .into_iter()
-        .find(|s| s.imp().places_list == *list);
-    refresh_all_bookmarks(this.as_ref());
-    // A neighbour that can take focus (not a separator), or else the first
-    // row that can.
-    let next = [idx, idx - 1]
-        .into_iter()
-        .filter(|i| *i >= 0)
-        .filter_map(|i| list.row_at_index(i))
-        .find(|r| r.is_selectable())
+    // Every sidebar, this one too, shows the bookmarks as they are now
+    // (another entry for the same folder goes as well, and the separator
+    // with the last one).
+    refresh_all_bookmarks(None);
+    // Focus where it was: the row now there, or the nearest one before it
+    // that can take focus (not a separator).
+    let next = list
+        .row_at_index(idx)
+        .filter(|r| r.is_selectable())
         .or_else(|| {
-            (0..)
-                .map_while(|i| list.row_at_index(i))
+            (0..idx)
+                .rev()
+                .filter_map(|i| list.row_at_index(i))
                 .find(|r| r.is_selectable())
         });
     if let Some(next) = next {
@@ -682,6 +676,13 @@ impl WayfinderSidebar {
 
     pub fn refresh_bookmarks(&self) {
         let list = &self.imp().places_list;
+        // A bookmark's row with focus is about to be remade: keep focus on
+        // it (or near it, if it's gone).
+        let focused = list.focus_child().and_then(|c| {
+            let name = c.widget_name().to_string();
+            let row = c.downcast::<gtk::ListBoxRow>().ok()?;
+            name.starts_with("bookmark:").then(|| (name, row.index()))
+        });
 
         // Remove existing bookmark rows and bookmark separator
         let mut child = list.first_child();
@@ -704,6 +705,9 @@ impl WayfinderSidebar {
             .filter_map(|(uri, name)| bookmark_path(uri).map(|p| (p, name)))
             .collect();
         if local.is_empty() {
+            if let Some((name, index)) = focused {
+                refocus_row(list, &name, index);
+            }
             return;
         }
 
@@ -749,6 +753,9 @@ impl WayfinderSidebar {
             ))]);
 
             list.insert(&row, insert_pos + 1 + i as i32);
+        }
+        if let Some((name, index)) = focused {
+            refocus_row(list, &name, index);
         }
     }
 
@@ -1636,7 +1643,19 @@ impl Default for WayfinderSidebar {
 
 #[cfg(test)]
 mod tests {
-    use super::{bookmark_path, bookmarks_insert_pos, volumes_insert_pos};
+    use super::{bookmark_path, bookmarks_insert_pos, read_bookmarks_from, volumes_insert_pos};
+
+    #[test]
+    fn a_bookmarks_file_that_cant_be_read_isnt_taken_for_none() {
+        let d = std::env::temp_dir().join(format!("wayfinder-bm-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        // Not there yet: no bookmarks, fine to write.
+        assert_eq!(read_bookmarks_from(&d.join("none")), Ok(Vec::new()));
+        // There, but not UTF-8: an error, so it isn't written over.
+        std::fs::write(d.join("latin1"), b"file:///home/u/Caf%C3%A9 Caf\xe9\n").unwrap();
+        assert!(read_bookmarks_from(&d.join("latin1")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

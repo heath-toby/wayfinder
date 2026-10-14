@@ -12,7 +12,13 @@ pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Res
     }
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let part = path.with_extension(format!("{}-{n}.wayfinder-part", std::process::id()));
-    let result = fs::write(&part, contents).and_then(|()| fs::rename(&part, path));
+    let result = fs::write(&part, contents)
+        // The file's permissions stay as they were (a private one private).
+        .and_then(|()| match fs::metadata(path) {
+            Ok(meta) => fs::set_permissions(&part, meta.permissions()),
+            Err(_) => Ok(()),
+        })
+        .and_then(|()| fs::rename(&part, path));
     if result.is_err() {
         let _ = fs::remove_file(&part);
     }
