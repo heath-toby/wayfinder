@@ -81,6 +81,13 @@ fn main() {
             let save_files = request
                 .is_save_files
                 .then(|| dbus::save_files_names(&request.options));
+            // Asked to save no files (a request not understood): failed, at
+            // once — not after the user has chosen a folder.
+            if save_files.as_ref().is_some_and(|names| names.is_empty()) {
+                log::warn!("SaveFiles request with no file names");
+                let _ = request.response_tx.send((2, HashMap::new()));
+                continue;
+            }
 
             chooser::show_chooser(
                 &request.title,
@@ -102,17 +109,19 @@ fn main() {
                         let uris =
                             gtk::gio::spawn_blocking(move || save_files_uris(&folder, &names))
                                 .await
-                                .ok()
-                                .flatten();
+                                .unwrap_or_else(|_| {
+                                    Err("the names couldn't be checked".to_string())
+                                });
                         match uris {
-                            Some(uris) => result.uris = uris,
+                            Ok(uris) => result.uris = uris,
                             // No safe names: the app is told it failed, and
-                            // the user (the chooser has closed) by an alert.
-                            None => {
+                            // the user (the chooser has closed) by an alert,
+                            // saying why.
+                            Err(why) => {
                                 failed = true;
                                 gtk::AlertDialog::builder()
                                     .message("The files weren't saved")
-                                    .detail("The folder chosen couldn't be checked for files of the same names, so they could have been written over. Try another folder.")
+                                    .detail(format!("{why}."))
                                     .build()
                                     .show(None::<&gtk::Window>);
                             }
@@ -150,15 +159,19 @@ fn main() {
 /// overwritten without being asked.
 /// `None` if a name that's surely free can't be found for every file (the
 /// folder can't be looked in): the save fails rather than risk one.
-fn save_files_uris(folder_uri: &str, names: &[String]) -> Option<Vec<String>> {
+/// An error, saying why, if a name that's surely free can't be found for
+/// every file: the save fails rather than risk one.
+fn save_files_uris(folder_uri: &str, names: &[String]) -> Result<Vec<String>, String> {
     use gtk::gio::prelude::FileExt;
     // (No names asked for — a request not understood — is no save either.)
     if names.is_empty() {
-        return None;
+        return Err("No files were asked to be saved".to_string());
     }
     let folder = gtk::gio::File::for_uri(folder_uri);
-    let dir = folder.path()?;
-    let mut taken: Vec<std::path::PathBuf> = Vec::new();
+    let dir = folder
+        .path()
+        .ok_or_else(|| "The folder chosen isn't one on this computer".to_string())?;
+    let mut taken: Vec<String> = Vec::new();
     names
         .iter()
         // Only a name, in the folder the user chose: an app's
@@ -167,14 +180,28 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Option<Vec<String>> {
         // step with the app's.)
         .map(|name| plain_name(name).unwrap_or_else(|| "file".to_string()))
         .map(|name| {
-            // (Taken: anything there, a link leading nowhere included, or
-            // that can't be looked at — only "not found" is free.)
+            // (Taken: anything there, a link leading nowhere included — and
+            // a name given to an earlier file, in any case: some drives
+            // take Report and report for one.) Only "not found" is free; a
+            // name that can't be checked stops it, saying why.
+            let error = std::cell::RefCell::new(None);
             let path = free_name(&dir, &name, |p| {
-                let free = wayfinder::file_ops::name_free(p).ok()?;
-                Some(!free || taken.contains(&p.to_path_buf()))
+                let free = match wayfinder::file_ops::name_free(p) {
+                    Ok(free) => free,
+                    Err(e) => {
+                        *error.borrow_mut() = Some(e.to_string());
+                        return None;
+                    }
+                };
+                let lower = p.to_string_lossy().to_lowercase();
+                Some(!free || taken.contains(&lower))
+            })
+            .ok_or_else(|| match error.take() {
+                Some(e) => format!("{name} couldn't be checked in the folder chosen ({e})"),
+                None => format!("Every name for {name} is taken in the folder chosen"),
             })?;
-            taken.push(path.clone());
-            Some(gtk::gio::File::for_path(&path).uri().to_string())
+            taken.push(path.to_string_lossy().to_lowercase());
+            Ok(gtk::gio::File::for_path(&path).uri().to_string())
         })
         .collect()
 }
@@ -220,7 +247,20 @@ fn free_name(
 
 #[cfg(test)]
 mod tests {
-    use super::{free_name, plain_name};
+    #[test]
+    fn saving_no_files_or_names_differing_in_case() {
+        assert!(save_files_uris("file:///tmp", &[]).is_err());
+        let d = std::env::temp_dir().join(format!("wayfinder-savefiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let uri = gtk::gio::prelude::FileExt::uri(&gtk::gio::File::for_path(&d)).to_string();
+        let got = save_files_uris(&uri, &["Report.pdf".into(), "report.pdf".into()]).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        // Not one file for both, even on a drive that ignores case.
+        assert_ne!(got[0].to_lowercase(), got[1].to_lowercase());
+    }
+
+    use super::{free_name, plain_name, save_files_uris};
 
     #[test]
     fn a_folder_with_every_number_taken_still_gets_a_new_name() {
