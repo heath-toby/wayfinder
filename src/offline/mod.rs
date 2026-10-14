@@ -472,16 +472,13 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let size = if meta.is_dir() { 0 } else { meta.len() };
 
     let dest = cache_path_for(&entry.original_path);
-    let record = load_record()?;
-    // Unchanged: nothing to do — once the copy is recorded (until then,
-    // it's refreshed so that it will be).
-    if mtime == entry.last_synced_mtime
-        && size == entry.last_synced_size
-        && !entry.is_directory
-        && record.pins.contains(&dest)
-    {
+    if mtime == entry.last_synced_mtime && size == entry.last_synced_size && !entry.is_directory {
+        // Unchanged: nothing to do. A copy without a record gets one, if
+        // it's as fetched (if not, it's the user's edit: left alone).
+        record_if_unchanged(&dest, &meta);
         return Ok(false);
     }
+    let record = load_record()?;
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -536,7 +533,7 @@ pub fn sync_all() -> (usize, usize) {
     }
     // The test builds' list of kept items has done its job once every copy
     // is recorded.
-    if let Ok(record) = load_record() {
+    if let (false, Ok(record)) = (manifest.is_empty(), load_record()) {
         if manifest
             .keys()
             .all(|p| record.pins.contains(&cache_path_for(p)))
@@ -722,6 +719,11 @@ fn save_record(record: &Record) -> Result<(), String> {
 fn update_record(root: &Path, fetched: Base, complete: bool) -> Result<(), String> {
     let _lock = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut record = load_record()?;
+    merge_record(&mut record, root, fetched, complete);
+    save_record(&record)
+}
+
+fn merge_record(record: &mut Record, root: &Path, fetched: Base, complete: bool) {
     if complete {
         record.stamps.retain(|path, _| !path.starts_with(root));
     }
@@ -731,7 +733,23 @@ fn update_record(root: &Path, fetched: Base, complete: bool) -> Result<(), Strin
     if complete {
         record.pins.insert(root.to_path_buf());
     }
-    save_record(&record)
+}
+
+/// Record the single-file copy `dest` as fetched if it isn't recorded yet
+/// and matches the remote's file (`src_meta`).
+fn record_if_unchanged(dest: &Path, src_meta: &std::fs::Metadata) {
+    let Ok(record) = load_record() else {
+        return;
+    };
+    if record.pins.contains(dest) {
+        return;
+    }
+    let Ok(meta) = dest.symlink_metadata() else {
+        return;
+    };
+    if meta.is_file() && meta.len() == src_meta.len() && mtime_secs(&meta) == mtime_secs(src_meta) {
+        let _ = update_record(dest, [(dest.to_path_buf(), stamp(&meta))].into(), true);
+    }
 }
 
 /// Record `root` (a fresh download: all of it the remote's) as fetched.
@@ -827,7 +845,9 @@ impl Refresh {
                 .unwrap_or(true)
     }
 
-    /// Whether `path`, not on the remote, is to be left as it is.
+    /// Whether `path`, not on the remote (or not of its kind there), is to
+    /// be left as it is. Without a record, nothing is: what's there may be
+    /// the user's.
     fn keeps_extra(&self, path: &Path) -> bool {
         self.unrecorded || self.users(path)
     }
@@ -855,13 +875,21 @@ impl Refresh {
 /// Suffix for a download in progress; renamed into place when complete.
 const PART_SUFFIX: &str = ".wayfinder-part";
 
+/// A download's part file, or rclone's own temporary file for one
+/// (`name.wayfinder-part.<hash>.partial`), left by a fetch cut short.
+fn is_leftover_part(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.ends_with(PART_SUFFIX)
+        || (name.contains(&format!("{PART_SUFFIX}.")) && name.ends_with(".partial"))
+}
+
 /// Bring `dst` in line with the directory `src`. Returns true if anything
 /// was copied or removed.
 fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, r: &mut Refresh) -> Result<bool, String> {
     // A file here that's a folder on the remote now: make way for it —
     // unless it's the user's.
     if dst.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
-        if r.users(dst) {
+        if r.keeps_extra(dst) {
             r.keep(dst);
             return Ok(false);
         }
@@ -909,8 +937,8 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, r: &mut Refresh) -> Re
         }
         let path = entry.path();
         // A download cut short (the app killed, say): ours, not the user's.
-        let part = entry.file_type().is_ok_and(|t| t.is_file())
-            && entry.file_name().to_string_lossy().ends_with(PART_SUFFIX);
+        let part =
+            entry.file_type().is_ok_and(|t| t.is_file()) && is_leftover_part(&entry.file_name());
         if !part && r.keeps_extra(&path) {
             r.keep(&path);
             continue;
@@ -938,7 +966,7 @@ fn sync_file(
         if dst_meta.is_dir() {
             // A folder here that's a file on the remote now: make way —
             // unless something in it is the user's.
-            if r.users(dst) {
+            if r.keeps_extra(dst) {
                 r.keep(dst);
                 return Ok(false);
             }
@@ -1041,8 +1069,8 @@ fn remote_child(remote: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_downloaded, format_record, parse_record, paths_overlap, sync_dir, sync_file,
-        walk_stamps, Base, Record, Refresh, Stamp,
+        check_downloaded, format_record, is_leftover_part, merge_record, parse_record,
+        paths_overlap, sync_dir, sync_file, walk_stamps, Base, Record, Refresh, Stamp,
     };
     use std::collections::HashSet;
     use std::path::Path;
@@ -1180,6 +1208,29 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_is_recorded_only_after_a_complete_refresh() {
+        let root = Path::new("/c/Docs");
+        let fetched: Base = [(root.join("a.txt"), Stamp::File(1, 1))].into();
+        let mut record = Record::default();
+        merge_record(&mut record, root, fetched.clone(), false);
+        assert!(!record.pins.contains(root));
+        assert!(record.stamps.contains_key(&root.join("a.txt")));
+        merge_record(&mut record, root, fetched, true);
+        assert!(record.pins.contains(root));
+    }
+
+    #[test]
+    fn leftover_downloads_are_told_from_the_users_files() {
+        use std::ffi::OsStr;
+        assert!(is_leftover_part(OsStr::new("big.iso.wayfinder-part")));
+        assert!(is_leftover_part(OsStr::new(
+            "big.iso.wayfinder-part.a1b2c3.partial"
+        )));
+        assert!(!is_leftover_part(OsStr::new("backup.wayfinder-part-old")));
+        assert!(!is_leftover_part(OsStr::new("notes.txt")));
+    }
+
+    #[test]
     fn a_copy_without_a_record_loses_nothing() {
         let d = dir("unrecorded");
         let (src, dst) = (d.join("remote"), d.join("copy"));
@@ -1188,11 +1239,23 @@ mod tests {
         std::fs::write(dst.join("made-here.txt"), "mine").unwrap();
         std::fs::write(dst.join("x.wayfinder-part"), "half").unwrap();
         std::fs::create_dir_all(dst.join("backup.wayfinder-part-old")).unwrap();
+        // Swapped on the remote: a file where a folder of the user's is,
+        // a folder where their file is.
+        std::fs::create_dir_all(dst.join("Notes")).unwrap();
+        std::fs::write(dst.join("Notes/todo.txt"), "mine").unwrap();
+        std::fs::write(src.join("Notes"), "remote file").unwrap();
+        std::fs::write(dst.join("report.odt"), "edited").unwrap();
+        std::fs::create_dir_all(src.join("report.odt")).unwrap();
         let mut r = Refresh::new(Record::default(), &dst, HashSet::new);
         sync_dir(&src, &dst, None, &mut r).unwrap();
         assert!(dst.join("made-here.txt").exists());
         assert!(!dst.join("x.wayfinder-part").exists());
         assert!(dst.join("backup.wayfinder-part-old").exists());
+        assert!(dst.join("Notes/todo.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dst.join("report.odt")).unwrap(),
+            "edited"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
