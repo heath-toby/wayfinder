@@ -702,7 +702,7 @@ pub fn show_chooser(
     let model_accept = model.clone();
     let d_accept = dlg.clone();
     let le_accept = location_entry.clone();
-    let checking_accept = std::rc::Rc::new(std::cell::Cell::new(false));
+    let checking_accept = std::rc::Rc::new(std::cell::Cell::new(0u64));
     accept_btn.connect_clicked(move |_| {
         let current_dir = model_accept.current_path();
         // A location typed but not gone to (Enter) isn't where this would
@@ -763,11 +763,11 @@ pub fn show_chooser(
             let d = d_accept.clone();
             let d_slow = d_accept.clone();
             let waiting = wayfinder::background::waiting_message(&check);
-            // Pressed again while a slow mount is checked: once is enough
-            // (two Replace questions would open).
-            if checking_accept.replace(true) {
-                return;
-            }
+            // Pressed again while a slow mount is checked (the name
+            // corrected, say): only the latest press's check acts, so two
+            // Replace questions don't open, and the correction wins.
+            let press = checking_accept.get() + 1;
+            checking_accept.set(press);
             let checking_done = checking_accept.clone();
             wayfinder::background::run(
                 // What's there by that name: a folder, a link leading
@@ -788,7 +788,9 @@ pub fn show_chooser(
                     })
                 },
                 move |found| {
-                    checking_done.set(false);
+                    if checking_done.get() != press {
+                        return;
+                    }
                     let Some(refused) = found else {
                         send(&full_path);
                         return;
