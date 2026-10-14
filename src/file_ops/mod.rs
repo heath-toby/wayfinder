@@ -183,27 +183,38 @@ pub fn empty_trash() -> Result<u32, glib::Error> {
 }
 
 pub fn rename_file(file: &gio::File, new_name: &str) -> Result<gio::File, glib::Error> {
-    // Only the case changing: on a drive that ignores case (FAT, exFAT, a
-    // Windows share) the new name is "taken" by the file itself, and GIO
-    // refuses. Through a name of its own first.
+    let direct = file.set_display_name(new_name, gio::Cancellable::NONE);
+    // Only the case changing, on a drive that ignores case (FAT, exFAT, a
+    // Windows share): the new name is "taken" by the file itself, and GIO
+    // refuses. Then through a name of its own.
     let old_name = file.basename().map(|n| n.to_string_lossy().to_string());
-    if old_name
+    let case_only = old_name
         .as_deref()
-        .is_some_and(|old| is_case_only_change(old, new_name))
-    {
-        let step = format!(".{new_name}.wayfinder-renaming");
-        let between = file.set_display_name(&step, gio::Cancellable::NONE)?;
-        return between
-            .set_display_name(new_name, gio::Cancellable::NONE)
-            .inspect_err(|_| {
-                // Put it back as it was.
-                if let Some(old) = &old_name {
-                    let _ = between.set_display_name(old, gio::Cancellable::NONE);
-                }
-            });
+        .is_some_and(|old| is_case_only_change(old, new_name));
+    match direct {
+        Err(e) if case_only && e.matches(gio::IOErrorEnum::Exists) => {
+            let step = format!(".{new_name}.wayfinder-renaming");
+            let between = file.set_display_name(&step, gio::Cancellable::NONE)?;
+            between
+                .set_display_name(new_name, gio::Cancellable::NONE)
+                .map_err(|e| {
+                    // Put it back as it was; if even that fails, say where
+                    // it is (hidden, by that name).
+                    let back = old_name
+                        .as_deref()
+                        .map(|old| between.set_display_name(old, gio::Cancellable::NONE));
+                    if matches!(back, Some(Ok(_))) {
+                        e
+                    } else {
+                        glib::Error::new(
+                            gio::IOErrorEnum::Failed,
+                            &format!("{e} (the file is now named {step})"),
+                        )
+                    }
+                })
+        }
+        other => other,
     }
-    let new_file = file.set_display_name(new_name, gio::Cancellable::NONE)?;
-    Ok(new_file)
 }
 
 /// Callback fired when `delete_with_progress` finishes: receives
