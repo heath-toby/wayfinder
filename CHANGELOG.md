@@ -106,7 +106,9 @@
 - **Open With** — pressing Enter on "Open With" moves focus into the submenu.
 - **Right-click** — right-clicking a file opens the menu for that file; it used to act on whichever file was selected before.
 - **After renaming** — the renamed file stays selected, so a key pressed next acts on it and not on its neighbour.
-- **Drives in the sidebar** — Eject is in the sidebar's menu (Menu key or Shift+F10 on a drive), since the eject button can't be reached from the keyboard; ejecting says whether it worked, and focus stays in the sidebar when the drive's row goes. Drives that need a password to mount now ask for it.
+- **Marked files hidden by a search** — copy, cut, delete, Move to Bin, restore and custom actions say the marked files are hidden (and how to show or unmark them), instead of silently doing nothing.
+- **Two-way sync with a drive mounted inside** — "Sync now" is refused while a drive is mounted inside the synced folder, as setting up the sync already was.
+- **Ejecting drives** — Eject is in the sidebar's menu (Menu key or Shift+F10 on a drive), since the eject button can't be reached from the keyboard; ejecting says whether it worked, and focus stays in the sidebar when the drive's row goes. Drives that need a password to mount now ask for it.
 - **Sidebar order** — with File System hidden, new bookmarks no longer appear below the Bin; drives are listed above Recent instead of between a separator and Recent.
 - **Bookmarking the Bin or Recent Files** — Ctrl+D there says only folders can be bookmarked, instead of adding a bookmark that opens nothing.
 - **Escape** — closes the Properties, Compress and Edit Sidebar windows, as in the other dialogs.
