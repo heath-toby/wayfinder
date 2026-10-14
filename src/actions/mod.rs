@@ -180,7 +180,7 @@ fn parse_desktop_action(path: &Path, base_dir: &Path) -> Option<CustomAction> {
                 };
                 // (Quoted: the folder may have a space in its name.)
                 let abs = base_dir.join(first);
-                format!("{}{}", shell_quote(&abs.to_string_lossy()), tail)
+                format!("{}{}", exec_quote(&abs.to_string_lossy()), tail)
             } else {
                 val.to_string()
             };
@@ -706,10 +706,13 @@ fn execute_desktop_action(
         // extractions into the same folder, or password prompts, would
         // collide. Stop at the first failure.
         let mut msg = Ok(());
-        for cmd_str in &commands {
-            msg = match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd_str)
+        for argv in &commands {
+            let Some((program, args)) = argv.split_first() else {
+                msg = Err("the action's Exec is empty".to_string());
+                break;
+            };
+            msg = match std::process::Command::new(program)
+                .args(args)
                 .current_dir(&work_dir)
                 .output()
             {
@@ -762,41 +765,149 @@ fn file_uri(path: &str) -> String {
     gtk::gio::File::for_path(path).uri().to_string()
 }
 
-/// The shell commands to run a desktop entry's `Exec=` on `files`, per the
-/// desktop-entry spec: `%F`/`%U` take every file at once, `%f`/`%u` one,
-/// so the command runs once per file. Other field codes are dropped
-/// before files go in, so a `%c` in a file name stays.
-fn desktop_commands(exec: &str, files: &[String]) -> Vec<String> {
-    let exec = exec.replace("%i", "").replace("%c", "").replace("%k", "");
-    let quoted_paths = || files.iter().map(|f| shell_quote(f)).collect::<Vec<_>>();
-    let quoted_uris = || {
+/// `Exec=` split into its arguments, as GLib reads it: separated by
+/// spaces; in double quotes, spaces are kept and `\` escapes `"`, `` ` ``,
+/// `$` and `\`; in single quotes everything is kept as it is (so an
+/// `sh -c '…'` script is one argument); outside quotes `\` escapes the
+/// next character.
+fn split_exec(exec: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut arg = String::new();
+    let mut in_arg = false;
+    let mut chars = exec.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_arg = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => match chars.peek() {
+                            Some('"' | '`' | '$' | '\\') => arg.push(chars.next().unwrap()),
+                            _ => arg.push('\\'),
+                        },
+                        c => arg.push(c),
+                    }
+                }
+            }
+            '\'' => {
+                in_arg = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    arg.push(c);
+                }
+            }
+            '\\' => {
+                in_arg = true;
+                if let Some(c) = chars.next() {
+                    arg.push(c);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_arg {
+                    args.push(std::mem::take(&mut arg));
+                    in_arg = false;
+                }
+            }
+            c => {
+                in_arg = true;
+                arg.push(c);
+            }
+        }
+    }
+    if in_arg {
+        args.push(arg);
+    }
+    args
+}
+
+/// `s` as one `Exec=` argument (quoted, as `split_exec` reads it).
+fn exec_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// The commands (each its arguments) to run a desktop entry's `Exec=` on
+/// `files`, per the desktop-entry spec: `%F`/`%U` (an argument of their
+/// own) take every file at once, `%f`/`%u` one, so the command runs once
+/// per file. Field codes are replaced in each argument after it's split
+/// out, and the command is run directly, not by a shell: a file's name is
+/// only ever data (one with `$(…)` in it runs nothing), quoted or not.
+/// Other field codes are dropped; a `%c` in a file name stays.
+fn desktop_commands(exec: &str, files: &[String]) -> Vec<Vec<String>> {
+    // Field codes, without the ones that take no file.
+    let fill = |arg: &str, file: Option<&str>, uri: Option<&str>| -> String {
+        let mut out = String::new();
+        let mut chars = arg.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            // (Only the codes that stand for files, or take none; any other
+            // `%` is left as written — a script's `${name%.tar.gz}`.)
+            match chars.clone().next() {
+                Some('f') => out.push_str(file.unwrap_or("")),
+                Some('u') => out.push_str(uri.unwrap_or("")),
+                Some('i' | 'c' | 'k') => {}
+                _ => {
+                    out.push('%');
+                    continue;
+                }
+            }
+            chars.next();
+        }
+        out
+    };
+    let args = split_exec(exec);
+    let uris: Vec<String> = files.iter().map(|f| file_uri(f)).collect();
+    let has = |code: &str| args.iter().any(|a| a.contains(code));
+    let drop_empty = |argv: Vec<String>, template: &[String]| -> Vec<String> {
+        // An argument that was only a dropped code (`%i`) goes.
+        argv.into_iter()
+            .zip(template)
+            .filter(|(a, t)| !a.is_empty() || t.is_empty())
+            .map(|(a, _)| a)
+            .collect()
+    };
+    if has("%F") || has("%U") {
+        let mut argv = Vec::new();
+        for a in &args {
+            match a.as_str() {
+                "%F" => argv.extend(files.iter().cloned()),
+                "%U" => argv.extend(uris.iter().cloned()),
+                _ => {
+                    let filled = fill(a, None, None);
+                    if !filled.is_empty() || a.is_empty() {
+                        argv.push(filled);
+                    }
+                }
+            }
+        }
+        vec![argv]
+    } else if has("%f") || has("%u") {
         files
             .iter()
-            .map(|f| shell_quote(&file_uri(f)))
-            .collect::<Vec<_>>()
-    };
-    if exec.contains("%F") {
-        vec![exec.replace("%F", &quoted_paths().join(" "))]
-    } else if exec.contains("%U") {
-        vec![exec.replace("%U", &quoted_uris().join(" "))]
-    } else if exec.contains("%f") {
-        quoted_paths()
-            .iter()
-            .map(|f| exec.replace("%f", f))
-            .collect()
-    } else if exec.contains("%u") {
-        quoted_uris()
-            .iter()
-            .map(|u| exec.replace("%u", u))
+            .zip(&uris)
+            .map(|(f, u)| {
+                let argv = args.iter().map(|a| fill(a, Some(f), Some(u))).collect();
+                drop_empty(argv, &args)
+            })
             .collect()
     } else {
-        // No placeholder: append the files.
-        let mut cmd = exec;
-        for f in quoted_paths() {
-            cmd.push(' ');
-            cmd.push_str(&f);
-        }
-        vec![cmd]
+        // No placeholder: the files after it.
+        let mut argv = drop_empty(args.iter().map(|a| fill(a, None, None)).collect(), &args);
+        argv.extend(files.iter().cloned());
+        vec![argv]
     }
 }
 
@@ -841,7 +952,10 @@ fn execute_nautilus_script(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_compress_command, desktop_commands, matches_mime, CustomAction};
+    use super::{
+        build_compress_command, desktop_commands, exec_quote, matches_mime, split_exec,
+        CustomAction,
+    };
 
     #[test]
     fn tar_archives_with_either_tar() {
@@ -892,35 +1006,110 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn single_file_codes_run_once_per_file() {
         let cmds = desktop_commands("sha256sum %f", &files(&["/a/x", "/a/y"]));
-        assert_eq!(cmds, vec!["sha256sum '/a/x'", "sha256sum '/a/y'"]);
+        assert_eq!(
+            cmds,
+            vec![argv(&["sha256sum", "/a/x"]), argv(&["sha256sum", "/a/y"])]
+        );
     }
 
     #[test]
     fn multi_file_codes_take_every_file() {
         let cmds = desktop_commands("tool %F", &files(&["/a/x", "/a/y z"]));
-        assert_eq!(cmds, vec!["tool '/a/x' '/a/y z'"]);
+        assert_eq!(cmds, vec![argv(&["tool", "/a/x", "/a/y z"])]);
     }
 
     /// `%c` in a file name is part of the name, not a field code.
     #[test]
     fn field_codes_in_file_names_are_kept() {
         let cmds = desktop_commands("open %i %c %f", &files(&["/d/caf%c3%a9.pdf"]));
-        assert_eq!(cmds, vec!["open   '/d/caf%c3%a9.pdf'"]);
+        assert_eq!(cmds, vec![argv(&["open", "/d/caf%c3%a9.pdf"])]);
+    }
+
+    /// A file's name is data: quoted in Exec or not, nothing in it runs.
+    #[test]
+    fn a_files_name_never_runs_anything() {
+        let cmds = desktop_commands("xdg-open \"%f\"", &files(&["/d/$(echo INJECTED) it's.txt"]));
+        assert_eq!(
+            cmds,
+            vec![argv(&["xdg-open", "/d/$(echo INJECTED) it's.txt"])]
+        );
+        let cmds = desktop_commands("sh -c 'x' \"%f\"", &files(&["/d/My File.txt"]));
+        assert_eq!(cmds, vec![argv(&["sh", "-c", "x", "/d/My File.txt"])]);
+    }
+
+    /// Every bundled action splits into a program and its arguments, the
+    /// file among them (or none, for one that takes none).
+    #[test]
+    fn bundled_actions_split_sensibly() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/actions");
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            let Some(exec) = text.lines().find_map(|l| l.strip_prefix("Exec=")) else {
+                continue;
+            };
+            if exec.starts_with("__") {
+                continue;
+            }
+            let cmds = desktop_commands(exec, &files(&["/d/My $(x) file.tar.gz"]));
+            let name = entry.file_name();
+            assert!(!cmds.is_empty() && !cmds[0].is_empty(), "{name:?}");
+            let argv = &cmds[0];
+            assert!(!argv[0].contains(' '), "{name:?}: {argv:?}");
+            assert!(
+                argv.iter().any(|a| a.contains("/d/My $(x) file.tar.gz")),
+                "{name:?}: {argv:?}"
+            );
+            if argv[0] == "sh" {
+                assert_eq!(argv.len(), 5, "{name:?}: {argv:?}");
+            }
+        }
+    }
+
+    /// The bundled actions: an `sh -c '…'` script, `%` in it kept.
+    #[test]
+    fn script_actions_get_their_script_whole() {
+        let exec = "sh -c 'stem=\"${1%.tar.gz}\"; echo \"$stem\"' _ %f";
+        let cmds = desktop_commands(exec, &files(&["/d/a b.tar.gz"]));
+        assert_eq!(
+            cmds,
+            vec![argv(&[
+                "sh",
+                "-c",
+                "stem=\"${1%.tar.gz}\"; echo \"$stem\"",
+                "_",
+                "/d/a b.tar.gz"
+            ])]
+        );
+        let out = std::process::Command::new(&cmds[0][0])
+            .args(&cmds[0][1..])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/d/a b\n");
     }
 
     #[test]
-    fn quotes_in_names_are_escaped() {
-        let cmds = desktop_commands("cat %f", &files(&["/d/it's.txt"]));
-        assert_eq!(cmds, vec!["cat '/d/it'\\''s.txt'"]);
+    fn exec_arguments_split_as_the_spec_says() {
+        assert_eq!(
+            split_exec("app \"two words\" plain \"a\\\"q\" 100%% 'it''s' a\\ b"),
+            argv(&["app", "two words", "plain", "a\"q", "100%%", "its", "a b"])
+        );
+        assert_eq!(
+            split_exec(&exec_quote("/x/My Tools/run$.sh")),
+            argv(&["/x/My Tools/run$.sh"])
+        );
     }
 
     #[test]
     fn uris_are_percent_encoded() {
         let cmds = desktop_commands("app %u", &files(&["/d/My File #1.txt"]));
-        assert_eq!(cmds, vec!["app 'file:///d/My%20File%20%231.txt'"]);
+        assert_eq!(cmds, vec![argv(&["app", "file:///d/My%20File%20%231.txt"])]);
     }
 
     /// A name starting with `-` mustn't be read as an option.
