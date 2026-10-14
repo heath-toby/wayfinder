@@ -546,6 +546,7 @@ impl DirectoryModel {
         if listing.is_fuse {
             loader::store(&listing, since);
         }
+        let mut changed_folders = Vec::new();
         match apply {
             Apply::Replace => self.replace_all(&listing),
             Apply::Diff | Apply::Revalidate => {
@@ -560,7 +561,7 @@ impl DirectoryModel {
                     .filter(|(_, &n)| n > events)
                     .map(|(path, _)| path.clone())
                     .collect();
-                self.apply_diff(&listing, &newer)
+                changed_folders = self.apply_diff(&listing, &newer);
             }
         }
 
@@ -569,8 +570,24 @@ impl DirectoryModel {
             // the mount on this thread (the window refreshes them when it
             // regains focus instead), and sizes would mean walking the
             // remote, so they keep showing a dash.
-            self.setup_monitor(&gio::File::for_path(&listing.path));
-            self.calculate_folder_sizes();
+            if apply == Apply::Replace || self.monitor.borrow().is_none() {
+                self.setup_monitor(&gio::File::for_path(&listing.path));
+            }
+            if apply == Apply::Replace {
+                self.calculate_folder_sizes();
+            } else if !changed_folders.is_empty() {
+                // A refresh: only the folders it changed, as part of the
+                // sizes job under way (not starting every one again).
+                let token = self.size_job.load(std::sync::atomic::Ordering::SeqCst);
+                spawn_size_job(
+                    &self.store,
+                    &self.sort_model,
+                    self.current_path(),
+                    changed_folders,
+                    remote_mountpoints(),
+                    SizeJob(self.size_job.clone(), token),
+                );
+            }
         }
         on_done(Some(Ok(self.store.n_items())));
         if apply == Apply::Replace && self.refresh_after_load.replace(false) {
@@ -616,7 +633,13 @@ impl DirectoryModel {
     }
 
     /// `keep`: paths the store has newer than the listing, left as they are.
-    fn apply_diff(&self, listing: &Listing, keep: &std::collections::HashSet<String>) {
+    /// Returns the folders it added or changed, by (path, name): their
+    /// sizes are to be worked out (again).
+    fn apply_diff(
+        &self,
+        listing: &Listing,
+        keep: &std::collections::HashSet<String>,
+    ) -> Vec<(String, String)> {
         // Keyed by full path: Recent can hold equal names from different folders.
         let mut fresh: std::collections::HashMap<String, FileObject> = listing
             .entries
@@ -628,6 +651,7 @@ impl DirectoryModel {
             .collect();
         fresh.retain(|path, _| !keep.contains(path));
         let mut updated: Vec<FileObject> = Vec::new();
+        let mut folders: Vec<(String, String)> = Vec::new();
         for i in (0..self.store.n_items()).rev() {
             let Some(fo) = self.store.item(i).and_downcast::<FileObject>() else {
                 continue;
@@ -639,20 +663,33 @@ impl DirectoryModel {
                 None => self.store.remove(i),
                 Some(new) => {
                     if new.is_directory() != fo.is_directory() {
+                        if new.is_directory() {
+                            folders.push((new.path(), new.name()));
+                        }
                         self.store.splice(i, 1, &[new]);
                     } else if new.modified() != fo.modified()
                         || (!new.is_directory() && new.size() != fo.size())
                         || new.mime_type() != fo.mime_type()
                     {
                         fo.update_from(&new);
+                        if fo.is_directory() {
+                            folders.push((fo.path(), fo.name()));
+                        }
                         updated.push(fo);
                     }
                 }
             }
         }
+        folders.extend(
+            fresh
+                .values()
+                .filter(|fo| fo.is_directory())
+                .map(|fo| (fo.path(), fo.name())),
+        );
         let added: Vec<glib::Object> = fresh.into_values().map(|fo| fo.upcast()).collect();
         self.store.splice(self.store.n_items(), 0, &added);
         resort_if_needed(&self.sort_model, &updated);
+        folders
     }
 
     fn calculate_folder_sizes(&self) {

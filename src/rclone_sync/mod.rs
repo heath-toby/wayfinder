@@ -117,6 +117,17 @@ pub fn pair_for(local_path: &str) -> Option<SyncPair> {
 /// for rclone FUSE mounts this should be the offline cache path.
 pub fn set_pair(local_path: &str, sync_local_path: &str, remote: &str) -> Result<(), String> {
     let mut pairs = load_pairs();
+    // A mount's folder syncs through its offline copy, which holds the old
+    // remote's files: a first sync with another remote would merge the two.
+    if let Some(old) = pairs.get(local_path) {
+        if old.remote != remote
+            && std::path::Path::new(&old.sync_local_path).starts_with(crate::offline::cache_root())
+        {
+            return Err(
+                "this folder is synced with another remote; remove the pairing first".to_string(),
+            );
+        }
+    }
     // A pair whose ends changed is a new pair: its first sync must
     // establish a fresh baseline (--resync), and it hasn't synced yet.
     let existing = pairs

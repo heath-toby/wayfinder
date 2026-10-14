@@ -201,6 +201,13 @@ pub fn record_pin(original_path: &str) -> Result<(), String> {
     // cancelled or skipped.
     let cached = cache_path_for(original_path);
     check_downloaded(&meta, &cached)?;
+    // Its mount is one whose offline copies are shown when it's down, even
+    // if it was mounted after Wayfinder started.
+    for mount in crate::rclone_ops::current_rclone_fuse_mountpoints() {
+        if Path::new(original_path).starts_with(&mount) {
+            record_mountpoint(&mount);
+        }
+    }
     // All of it as fetched, so a refresh can tell the user's changes from
     // it. (If this can't be saved, the copy is refreshed as one pinned
     // before the record existed.)
@@ -219,6 +226,30 @@ pub fn record_pin(original_path: &str) -> Result<(), String> {
             },
         );
     })
+}
+
+/// Remove what a download for pinning `original_path` left, if it was
+/// cancelled or failed: not a pin, so not an offline copy to be shown (an
+/// incomplete one, at that). Left alone if it's pinned after all, or two-
+/// way sync's. May take a while: not on the main thread.
+pub fn discard_download(original_path: &str) {
+    let cached = cache_path_for(original_path);
+    if is_pinned(original_path) || in_sync_folder(&cached) {
+        return;
+    }
+    let removed = if cached.is_dir() {
+        std::fs::remove_dir_all(&cached)
+    } else {
+        std::fs::remove_file(&cached)
+    };
+    if let Err(e) = removed {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(
+                "Couldn't remove the partial download {}: {e}",
+                cached.display()
+            );
+        }
+    }
 }
 
 /// Whether the offline copy at `cached` is complete for a source with
@@ -447,6 +478,11 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
 /// existing offline copy. What was changed here is kept (see `Base`).
 pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let _refreshing = Refreshing::new(&entry.original_path);
+    // Unpinned since the list of pins was read (before this was marked
+    // as being refreshed): nothing to download.
+    if is_unpinning(&entry.original_path) || !is_pinned(&entry.original_path) {
+        return Ok(false);
+    }
     // Pins live on rclone mounts. If the mount isn't up, the path may still
     // exist as an empty mountpoint directory, and syncing from it would
     // delete the offline copy just when it's needed.

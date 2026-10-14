@@ -330,15 +330,28 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
                             Some(Box::new(move |downloaded| {
                                 // A cancelled or failed download isn't a pin
-                                // (the progress dialog has said what happened).
+                                // (the progress dialog has said what happened),
+                                // and what it left isn't an offline copy.
                                 if !downloaded {
+                                    let path = pin_path_str.clone();
+                                    w_done.run_blocking(
+                                        &pin_path_str,
+                                        move || wayfinder::offline::discard_download(&path),
+                                        |_, ()| {},
+                                    );
                                     return;
                                 }
                                 // Recording the pin stats the original on the mount.
                                 let path = pin_path_str.clone();
                                 w_done.run_blocking(
                                     &pin_path_str,
-                                    move || wayfinder::offline::record_pin(&path),
+                                    move || {
+                                        let result = wayfinder::offline::record_pin(&path);
+                                        if result.is_err() {
+                                            wayfinder::offline::discard_download(&path);
+                                        }
+                                        result
+                                    },
                                     |w, result| match result {
                                         Ok(()) => w.announce(
                                             "Available offline",

@@ -101,6 +101,8 @@ pub fn show_dialog(
         .hexpand(true)
         .activates_default(true)
         .build();
+    // Asked for once (it runs rclone).
+    let remotes = list_remotes();
     if let Some(ref existing) = existing {
         remote_entry.set_text(&existing.remote);
     } else {
@@ -115,7 +117,6 @@ pub fn show_dialog(
         if let Some(suggestion) = suggest_remote_for_local(local_path) {
             remote_entry.set_text(&suggestion);
         } else {
-            let remotes = list_remotes();
             if let Some(first) = remotes.first() {
                 let basename = std::path::Path::new(local_path)
                     .file_name()
@@ -132,7 +133,6 @@ pub fn show_dialog(
     vbox.append(&remote_entry);
 
     // Show available remotes for reference
-    let remotes = list_remotes();
     if !remotes.is_empty() {
         let hint = gtk::Label::builder()
             .label(format!(
@@ -186,8 +186,11 @@ pub fn show_dialog(
     button_box.set_margin_top(12);
 
     let cancel_btn = gtk::Button::with_label("Close");
+    cancel_btn.update_property(&[gtk::accessible::Property::Label("Close")]);
     let remove_btn = gtk::Button::with_label("Remove pairing");
+    remove_btn.update_property(&[gtk::accessible::Property::Label("Remove pairing")]);
     let sync_btn = gtk::Button::with_label("Save and sync now");
+    sync_btn.update_property(&[gtk::accessible::Property::Label("Save and sync now")]);
     sync_btn.add_css_class("suggested-action");
 
     if editing {

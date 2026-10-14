@@ -178,8 +178,9 @@ fn parse_desktop_action(path: &Path, base_dir: &Path) -> Option<CustomAction> {
                     Some(idx) => (&rest[..idx], &rest[idx..]),
                     None => (rest, ""),
                 };
+                // (Quoted: the folder may have a space in its name.)
                 let abs = base_dir.join(first);
-                format!("{}{}", abs.to_string_lossy(), tail)
+                format!("{}{}", shell_quote(&abs.to_string_lossy()), tail)
             } else {
                 val.to_string()
             };
@@ -379,6 +380,9 @@ fn show_action_progress(
     // an editor): let the user put this window away and carry on — the
     // result is still announced when it's done.
     let hide_btn = gtk::Button::with_label("Continue in background");
+    hide_btn.update_property(&[gtk::accessible::Property::Label(
+        "Continue in background (the result is announced when done)",
+    )]);
     hide_btn.set_halign(gtk::Align::End);
     let d = dlg.clone();
     hide_btn.connect_clicked(move |_| d.close());
@@ -531,7 +535,9 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
     button_box.set_margin_top(8);
 
     let cancel_btn = gtk::Button::with_label("Cancel");
+    cancel_btn.update_property(&[gtk::accessible::Property::Label("Cancel")]);
     let create_btn = gtk::Button::with_label("Create");
+    create_btn.update_property(&[gtk::accessible::Property::Label("Create archive")]);
     create_btn.add_css_class("suggested-action");
 
     button_box.append(&cancel_btn);
