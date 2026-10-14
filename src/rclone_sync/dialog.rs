@@ -391,7 +391,25 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
     .to_string_lossy()
     .trim_end_matches('/')
     .to_string();
+    // Its sync side an rclone mount (a pairing made or edited oddly):
+    // that would sync the remote with itself. Or inside a drive that isn't
+    // mounted: that would sync an empty mountpoint, deleting it all on the
+    // remote.
+    if crate::rclone_ops::is_rclone_fuse_path(&sync_local) {
+        parent_window.announce(
+            "Refusing to sync: this folder's local side is the rclone mount itself, which would sync the remote with itself.",
+            AccessibleAnnouncementPriority::High,
+        );
+        return;
+    }
     let on_mount = crate::rclone_ops::is_fuse_path(&sync_local);
+    if !on_mount && crate::offline::path_is_in_known_mountpoint(&sync_local) {
+        parent_window.announce(
+            "Refusing to sync: the drive this folder is on isn't mounted.",
+            AccessibleAnnouncementPriority::High,
+        );
+        return;
+    }
     if on_mount {
         // (nothing: see above)
     } else if let Err(e) = std::fs::create_dir_all(&pair.sync_local_path) {

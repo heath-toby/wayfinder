@@ -109,13 +109,32 @@ pub fn pair_for(local_path: &str) -> Option<SyncPair> {
     load_pairs().get(local_path).cloned()
 }
 
-/// Whether pairing `old`'s folder with `remote` instead is refused: a
-/// mount's folder syncs through its offline copy, which holds the old
-/// remote's files (some, even if its first sync didn't finish), and a
-/// first sync with another remote would merge them into it. (Compared as
-/// written: `server:` and `server:/` may be different places.)
-fn refuses_new_remote(old: &SyncPair, remote: &str, cache_root: &std::path::Path) -> bool {
-    old.remote != remote && std::path::Path::new(&old.sync_local_path).starts_with(cache_root)
+/// Why pairing a folder whose sync side is `sync_local` with `remote` is
+/// refused, if it is. A mount's folder syncs through its offline copy,
+/// which holds the files of the remote it's mounted from (`mount_remote`;
+/// if the mount is down, the remote it was paired with, `old_remote`):
+/// synced with any other remote, they'd be merged into it — however the
+/// pairing came about.
+fn remote_refusal(
+    sync_local: &std::path::Path,
+    remote: &str,
+    mount_remote: Option<&str>,
+    old_remote: Option<&str>,
+    cache_root: &std::path::Path,
+) -> Option<String> {
+    if !sync_local.starts_with(cache_root) {
+        return None;
+    }
+    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    match (mount_remote, old_remote) {
+        (Some(m), _) if !same(m, remote) => Some(format!(
+            "this folder is on a drive mounted from {m}: it can only be synced with that"
+        )),
+        (None, Some(old)) if old != remote => Some(format!(
+            "this folder is synced with {old}, and its offline copy holds that remote's files: it can't be synced with another"
+        )),
+        _ => None,
+    }
 }
 
 /// Add or update a sync pair. Does not run a sync — the user must trigger
@@ -126,13 +145,32 @@ fn refuses_new_remote(old: &SyncPair, remote: &str, cache_root: &std::path::Path
 /// for rclone FUSE mounts this should be the offline cache path.
 pub fn set_pair(local_path: &str, sync_local_path: &str, remote: &str) -> Result<(), String> {
     let mut pairs = load_pairs();
-    if let Some(old) = pairs.get(local_path) {
-        if refuses_new_remote(old, remote, &crate::offline::cache_root()) {
-            return Err(format!(
-                "this folder is synced with {}, and its offline copy holds that remote's files: it can't be synced with another",
-                old.remote
-            ));
+    // A mount's folder edited while its drive is down: its sync side is
+    // still the offline copy, not the bare (empty) mountpoint.
+    let cache_root = crate::offline::cache_root();
+    let sync_local_path = match pairs.get(local_path) {
+        Some(old)
+            if std::path::Path::new(&old.sync_local_path).starts_with(&cache_root)
+                && !std::path::Path::new(sync_local_path).starts_with(&cache_root) =>
+        {
+            old.sync_local_path.clone()
         }
+        _ => sync_local_path.to_string(),
+    };
+    let sync_local_path = sync_local_path.as_str();
+    let mount_remote = crate::rclone_ops::rclone_for_path(
+        &crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(local_path))
+            .to_string_lossy(),
+    )
+    .map(|t| t.full_remote_spec);
+    if let Some(why) = remote_refusal(
+        std::path::Path::new(sync_local_path),
+        remote,
+        mount_remote.as_deref(),
+        pairs.get(local_path).map(|p| p.remote.as_str()),
+        &cache_root,
+    ) {
+        return Err(why);
     }
     // A pair whose ends changed is a new pair: its first sync must
     // establish a fresh baseline (--resync), and it hasn't synced yet.
@@ -239,29 +277,33 @@ pub fn count_conflicts(stdout: &str, stderr: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{refuses_new_remote, SyncPair};
+    use super::remote_refusal;
     use std::path::Path;
 
     #[test]
-    fn a_mount_folders_sync_keeps_its_remote() {
-        let pair = |sync_local: &str| SyncPair {
-            local_path: "/home/u/proton/Work".into(),
-            sync_local_path: sync_local.into(),
-            remote: "Proton:Work".into(),
-            last_sync_time: 0,
-            initial_resync_done: false,
-        };
+    fn a_mount_folders_sync_is_with_its_own_remote_only() {
         let cache = Path::new("/home/u/.cache/wayfinder/offline");
-        let mount = pair("/home/u/.cache/wayfinder/offline/home/u/proton/Work");
-        // Even if it never finished syncing: some files may be there.
-        assert!(refuses_new_remote(&mount, "Proton:Personal", cache));
-        assert!(refuses_new_remote(&mount, "Proton:Work/", cache));
-        assert!(!refuses_new_remote(&mount, "Proton:Work", cache));
-        // A folder of the user's own may sync with another remote.
-        assert!(!refuses_new_remote(
-            &pair("/home/u/Work"),
+        let copy = Path::new("/home/u/.cache/wayfinder/offline/home/u/proton/Work");
+        // Mounted: its own remote only, however written — even with no
+        // pairing before (one removed and set up again).
+        assert!(remote_refusal(copy, "Proton:Work/", Some("Proton:Work"), None, cache).is_none());
+        assert!(
+            remote_refusal(copy, "Proton:Personal", Some("Proton:Work"), None, cache).is_some()
+        );
+        // Not mounted: the remote it was paired with.
+        assert!(
+            remote_refusal(copy, "Proton:Personal", None, Some("Proton:Work"), cache).is_some()
+        );
+        assert!(remote_refusal(copy, "Proton:Work", None, Some("Proton:Work"), cache).is_none());
+        // A folder of the user's own may sync with any remote.
+        let own = Path::new("/home/u/Work");
+        assert!(remote_refusal(
+            own,
             "Proton:Personal",
+            Some("Proton:Work"),
+            Some("X:"),
             cache
-        ));
+        )
+        .is_none());
     }
 }

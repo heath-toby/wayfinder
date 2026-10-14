@@ -362,14 +362,7 @@ impl WayfinderWindow {
     /// Open the Bin or Recent Files, as a step in the history (so Back
     /// returns to the folder before it).
     pub fn load_special_uri(&self, uri: &str) {
-        // As the rest expects them, however written (`trash:`, `recent://`).
-        let uri = if uri.starts_with("trash:") {
-            "trash:///"
-        } else if uri.starts_with("recent:") {
-            "recent:///"
-        } else {
-            uri
-        };
+        let uri = special_uri_root(uri);
         self.imp().nav.borrow_mut().navigate_to(PathBuf::from(uri));
         self.open_special_uri(uri);
     }
@@ -3697,6 +3690,18 @@ fn script_command(dir: &std::path::Path, path: &str) -> String {
     )
 }
 
+/// The Bin's or Recent Files' URI as the rest expects it, however
+/// written (`trash:`, `recent://`); any other as it is.
+fn special_uri_root(uri: &str) -> &str {
+    if uri.starts_with("trash:") {
+        "trash:///"
+    } else if uri.starts_with("recent:") {
+        "recent:///"
+    } else {
+        uri
+    }
+}
+
 /// How many characters of `name` come before its extension: what Rename
 /// selects. (In characters, as the entry counts: `Résumé.pdf` is 6.) A
 /// leading dot isn't an extension's: all of `.bashrc` is selected, as is
@@ -3713,6 +3718,14 @@ fn stem_chars(name: &str, is_dir: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_bin_and_recent_files_have_one_uri_each() {
+        assert_eq!(super::special_uri_root("trash:"), "trash:///");
+        assert_eq!(super::special_uri_root("recent://"), "recent:///");
+        assert_eq!(super::special_uri_root("trash:///"), "trash:///");
+        assert_eq!(super::special_uri_root("sftp://h/x"), "sftp://h/x");
+    }
+
     #[test]
     fn zoom_is_of_the_themes_font_size() {
         assert_eq!(super::font_size("Cantarell 11"), Some((11.0, "pt")));

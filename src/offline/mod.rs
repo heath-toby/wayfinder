@@ -318,9 +318,6 @@ impl Drop for Unpinning {
 }
 
 pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
-    // Marked first, then checked: a refresh starting meanwhile marks
-    // itself, then sees this (each sees the other).
-    let _unpinning = Unpinning::new(original_path);
     // Deleting a copy the startup refresh is writing into would leave a
     // stray part of it behind.
     // (A refresh that's only just begun sees this and stops at once: give
@@ -336,6 +333,9 @@ pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
     while refreshing() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    // Marked, then checked again: a refresh starting meanwhile marks
+    // itself, then sees this (each sees the other).
+    let _unpinning = Unpinning::new(original_path);
     if refreshing() {
         return Err("it's being refreshed right now; try again in a moment".to_string());
     }
