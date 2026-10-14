@@ -163,6 +163,12 @@
 - **Back to a folder that's gone** — when its parent opens instead, Forward no longer stays on, going to the same folder.
 - **Recent Files** — with a cloud drive that has dropped, the list no longer waits needlessly before showing.
 - **Changes made by other programs** — a file written while the folder was being refreshed no longer goes unseen until the next refresh.
+- **Closing a progress window** (Alt+F4) — stops the copy, move or delete, as Cancel does (it went on, unseen).
+- **Copying onto a name that can't be checked** (a mount erroring) — asks, as for a name taken, instead of merging into the folder there; "Keep both" with no free number left says so instead of merging into the existing folder, and a restore from the Bin with none fails, saying why.
+- **Keeping a folder offline again** — if the old offline copy can't be removed, it says so, instead of downloading beside it and reporting success.
+- **Properties** — a link's Created and Last Opened dates are shown; an item in the Bin shows its Original Location; Apply with an invalid octal number says so instead of applying the last valid one.
+- **Go to Location** — Tab on `~` completes to `~/`.
+- **Context menus** — Down with no item focused goes to the first item, not the second.
 
 ### Development
 

@@ -142,7 +142,12 @@ pub fn restore_from_trash(file: &gio::File) -> Result<String, glib::Error> {
         let _ = parent.make_directory_with_parents(gio::Cancellable::NONE);
     }
 
-    let dest = get_unique_dest(&dest);
+    let dest = get_unique_dest(&dest).ok_or_else(|| {
+        glib::Error::new(
+            gio::IOErrorEnum::Exists,
+            "No free name to restore it under in its original folder",
+        )
+    })?;
     file.move_(
         &dest,
         gio::FileCopyFlags::NONE,
@@ -337,6 +342,12 @@ pub fn delete_with_progress(
         // closes with consistent state.
         dlg_for_cancel.set_title(Some("Cancelling..."));
     });
+    // Closing the window (Alt+F4) stops it too: not deleting on unseen.
+    let cancelled_for_close = cancelled.clone();
+    dlg.connect_close_request(move |_| {
+        cancelled_for_close.store(true, Ordering::Relaxed);
+        glib::Propagation::Proceed
+    });
 
     dlg.present();
     status_entry.grab_focus();
@@ -482,6 +493,7 @@ fn show_conflict_dialog(
         .build();
 
     let dest = dest.clone();
+    let parent = parent_window.clone();
     dialog.choose(Some(parent_window), gio::Cancellable::NONE, move |result| {
         match result {
             Ok(2) => callback(ConflictChoice::Replace),
@@ -490,7 +502,16 @@ fn show_conflict_dialog(
                 // on a slow mount.
                 crate::background::run(
                     move || get_unique_dest(&dest),
-                    move |renamed| callback(ConflictChoice::Rename(renamed)),
+                    move |renamed| match renamed {
+                        Some(renamed) => callback(ConflictChoice::Rename(renamed)),
+                        None => {
+                            parent.announce(
+                                "No free name was found to keep both",
+                                AccessibleAnnouncementPriority::High,
+                            );
+                            callback(ConflictChoice::Skip);
+                        }
+                    },
                     || {},
                 );
             }
@@ -1014,6 +1035,13 @@ fn run_with_progress(
         c.cancel();
         d.close();
     });
+    // Closing the window (Alt+F4) cancels too. (Closed when done, it's too
+    // late to: the result is already in.)
+    let c = cancellable.clone();
+    dlg.connect_close_request(move |_| {
+        c.cancel();
+        glib::Propagation::Proceed
+    });
 
     dlg.present();
     status_entry.grab_focus();
@@ -1317,12 +1345,18 @@ pub fn name_free(path: &std::path::Path) -> std::io::Result<bool> {
 }
 
 /// Whether something is at `file` — a link too, even one leading nowhere
-/// (`query_exists` follows links, so a broken one looks free).
+/// (`query_exists` follows links, so a broken one looks free). One that
+/// can't be checked counts as there, as in `name_free`: what's there
+/// mustn't be merged into or written over unasked.
 fn exists_here(file: &gio::File) -> bool {
-    file.query_file_type(
+    match file.query_info(
+        "standard::type",
         gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
         gio::Cancellable::NONE,
-    ) != gio::FileType::Unknown
+    ) {
+        Ok(_) => true,
+        Err(e) => !e.matches(gio::IOErrorEnum::NotFound),
+    }
 }
 
 /// `name` numbered: `a (2).txt`. A leading dot isn't an extension's
@@ -1334,28 +1368,17 @@ pub fn numbered_name(name: &str, i: u32) -> String {
     }
 }
 
-/// If dest already exists, append " (2)", " (3)", etc.
-fn get_unique_dest(dest: &gio::File) -> gio::File {
+/// If dest already exists, append " (2)", " (3)", etc. `None` if no free
+/// name is found: never the taken one, which would be merged into.
+fn get_unique_dest(dest: &gio::File) -> Option<gio::File> {
     if !exists_here(dest) {
-        return dest.clone();
+        return Some(dest.clone());
     }
-
-    let Some(parent) = dest.parent() else {
-        return dest.clone();
-    };
-    let Some(basename) = dest.basename() else {
-        return dest.clone();
-    };
-    let name = basename.to_string_lossy();
-
-    for i in 2..100 {
-        let candidate = parent.child(numbered_name(&name, i));
-        if !exists_here(&candidate) {
-            return candidate;
-        }
-    }
-
-    dest.clone()
+    let parent = dest.parent()?;
+    let name = dest.basename()?.to_string_lossy().to_string();
+    (2..1000)
+        .map(|i| parent.child(numbered_name(&name, i)))
+        .find(|candidate| !exists_here(candidate))
 }
 
 #[cfg(test)]

@@ -96,6 +96,10 @@ fn contract_with(path: &str, home: &Path) -> String {
 }
 
 fn complete_with(partial: &str, home: Option<&Path>) -> Completion {
+    // `~` alone is the home folder, not a name to find in its parent.
+    if partial == "~" && home.is_some() {
+        return Completion::Text("~/".to_string());
+    }
     let expanded = expand_with(partial, home);
     // Only a full path: a relative one would be looked up from wherever
     // Wayfinder was started (as in the Bin, which isn't a folder to start
@@ -177,6 +181,14 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lone_tilde_completes_to_the_home_folder() {
+        assert!(matches!(
+            super::complete_with("~", Some(std::path::Path::new("/nonexistent/u"))),
+            super::Completion::Text(t) if t == "~/"
+        ));
+    }
+
     #[test]
     fn relative_text_isnt_completed_from_the_working_folder() {
         assert!(matches!(

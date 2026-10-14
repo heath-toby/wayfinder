@@ -16,6 +16,8 @@ struct Details {
     /// `None` if the file's metadata couldn't be read; the permissions
     /// section is left out then.
     mode: Option<u32>,
+    /// For an item in the Bin, the folder it came from.
+    came_from: Option<String>,
 }
 
 /// setuid, setgid and sticky.
@@ -30,7 +32,7 @@ fn gather_details(path: &str) -> Result<Details, String> {
     };
     let info = file
         .query_info(
-            "time::modified",
+            "time::modified,trash::orig-path",
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
             gio::Cancellable::NONE,
         )
@@ -46,6 +48,13 @@ fn gather_details(path: &str) -> Result<Details, String> {
                 .to_string()
         })
         .unwrap_or_else(|| "Unknown".to_string());
+    let came_from = info
+        .attribute_byte_string("trash::orig-path")
+        .and_then(|p| {
+            std::path::Path::new(p.as_str())
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+        });
     // The item itself, as Modified is: for a link, not what it leads to.
     let metadata = std::fs::symlink_metadata(path).ok();
     Ok(Details {
@@ -57,6 +66,7 @@ fn gather_details(path: &str) -> Result<Details, String> {
         mode: metadata
             .filter(|m| !m.file_type().is_symlink())
             .map(|m| m.permissions().mode()),
+        came_from,
     })
 }
 
@@ -141,41 +151,47 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
         row += 1;
     }
 
-    let parent_path = std::path::Path::new(&file.path())
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    add_info_row(&grid, row, "Location", &parent_path);
+    // (In the Bin: where it came from, and would be restored to.)
+    if let Some(came_from) = &details.came_from {
+        add_info_row(&grid, row, "Original Location", came_from);
+    } else {
+        let parent_path = std::path::Path::new(&file.path())
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        add_info_row(&grid, row, "Location", &parent_path);
+    }
     row += 1;
 
     // Modified from GIO
     add_info_row(&grid, row, "Modified", &details.modified);
     row += 1;
 
-    // Created and Accessed from std::fs metadata
+    // Created and Accessed from std::fs metadata (a link's own too: only
+    // its permissions are left out)
+    if let Some(created) = details.created {
+        let dt: chrono::DateTime<chrono::Local> = created.into();
+        add_info_row(
+            &grid,
+            row,
+            "Created",
+            &dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        );
+        row += 1;
+    }
+
+    if let Some(accessed) = details.accessed {
+        let dt: chrono::DateTime<chrono::Local> = accessed.into();
+        add_info_row(
+            &grid,
+            row,
+            "Last Opened",
+            &dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        );
+        row += 1;
+    }
+
     if let Some(mode) = details.mode {
-        if let Some(created) = details.created {
-            let dt: chrono::DateTime<chrono::Local> = created.into();
-            add_info_row(
-                &grid,
-                row,
-                "Created",
-                &dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            );
-            row += 1;
-        }
-
-        if let Some(accessed) = details.accessed {
-            let dt: chrono::DateTime<chrono::Local> = accessed.into();
-            add_info_row(
-                &grid,
-                row,
-                "Last Opened",
-                &dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            );
-            row += 1;
-        }
-
         let original_mode = mode;
 
         // --- Permissions section ---
@@ -326,6 +342,7 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
         let fp = file.path();
         let cbs_apply = checkboxes.clone();
         let special_apply = special.clone();
+        let octal_apply = octal_entry.clone();
         // Results are said from the dialog, which has focus: Orca may not
         // speak for the window behind it.
         apply_btn.connect_clicked(move |btn| {
@@ -338,6 +355,17 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
                     "This is an offline copy. Its permissions can't be changed here.",
                     AccessibleAnnouncementPriority::High,
                 );
+                return;
+            }
+            // (The boxes follow only a valid number: one typed wrong would
+            // otherwise apply the last valid one, unsaid.)
+            let typed = octal_apply.text();
+            if !u32::from_str_radix(typed.trim(), 8).is_ok_and(|m| m <= 0o7777) {
+                btn.announce(
+                    "Octal permissions: not a valid number. Use up to four digits, 0 to 7.",
+                    AccessibleAnnouncementPriority::High,
+                );
+                octal_apply.grab_focus();
                 return;
             }
             let bits: u32 = cbs_apply.iter()

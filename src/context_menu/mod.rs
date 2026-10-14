@@ -61,23 +61,24 @@ fn install_menu_nav(
             return glib::Propagation::Proceed;
         }
 
-        let current = focused_index(&buttons).unwrap_or(0);
+        // (None focused — the menu itself: Down goes to the first item,
+        // Up to the last.)
+        let current = focused_index(&buttons);
 
         match keyval {
             gdk::Key::Up => {
-                let next = if current == 0 {
-                    buttons.len() - 1
-                } else {
-                    current - 1
+                let next = match current {
+                    Some(0) | None => buttons.len() - 1,
+                    Some(c) => c - 1,
                 };
                 focus_button(&buttons, next);
                 glib::Propagation::Stop
             }
             gdk::Key::Down => {
-                let next = if current >= buttons.len() - 1 {
-                    0
-                } else {
-                    current + 1
+                let next = match current {
+                    None => 0,
+                    Some(c) if c >= buttons.len() - 1 => 0,
+                    Some(c) => c + 1,
                 };
                 focus_button(&buttons, next);
                 glib::Propagation::Stop
@@ -392,13 +393,29 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                             w.run_blocking(
                                 &p,
                                 move || {
+                                    // (Not cleared: no pin — the copy would
+                                    // land beside the stale one, or ask.)
                                     if old_copy.is_dir() {
-                                        let _ = std::fs::remove_dir_all(&old_copy);
-                                    } else if old_copy.exists() {
-                                        let _ = std::fs::remove_file(&old_copy);
+                                        std::fs::remove_dir_all(&old_copy)
+                                    } else if old_copy.symlink_metadata().is_ok() {
+                                        std::fs::remove_file(&old_copy)
+                                    } else {
+                                        Ok(())
                                     }
                                 },
-                                move |w, ()| {
+                                move |w, cleared| {
+                                    if let Err(e) = cleared {
+                                        w.announce(
+                                            &format!(
+                                                "Pin failed: the old offline copy couldn't be removed: {e}"
+                                            ),
+                                            gtk::AccessibleAnnouncementPriority::High,
+                                        );
+                                        if let Some(cb) = on_complete {
+                                            cb(false);
+                                        }
+                                        return;
+                                    }
                                     let parent_window: gtk::Window = w.clone().upcast();
                                     wayfinder::file_ops::copy_with_outcome(
                                         &gio::File::for_path(&source_path),
