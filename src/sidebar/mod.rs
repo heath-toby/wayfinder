@@ -638,8 +638,10 @@ impl WayfinderSidebar {
                     return glib::Propagation::Stop;
                 }
 
-                // Refresh and re-focus
-                sidebar.refresh_bookmarks();
+                // Refresh and re-focus — here, not by the refresh: the
+                // moved row is to get focus with its "Moved" label, or
+                // Orca reads its old one.
+                sidebar.remake_bookmark_rows(false);
                 refresh_all_bookmarks(Some(&sidebar));
 
                 // Find and focus the moved bookmark row, with announcement as label
@@ -675,10 +677,14 @@ impl WayfinderSidebar {
     }
 
     pub fn refresh_bookmarks(&self) {
+        self.remake_bookmark_rows(true);
+    }
+
+    /// `keep_focus`: a bookmark's row with focus is about to be remade:
+    /// keep focus on it (or near it, if it's gone).
+    fn remake_bookmark_rows(&self, keep_focus: bool) {
         let list = &self.imp().places_list;
-        // A bookmark's row with focus is about to be remade: keep focus on
-        // it (or near it, if it's gone).
-        let focused = list.focus_child().and_then(|c| {
+        let focused = list.focus_child().filter(|_| keep_focus).and_then(|c| {
             let name = c.widget_name().to_string();
             let row = c.downcast::<gtk::ListBoxRow>().ok()?;
             name.starts_with("bookmark:").then(|| (name, row.index()))

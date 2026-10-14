@@ -68,6 +68,8 @@ pub struct DirectoryModel {
     /// a newer one has been applied is stale and dropped.
     next_seq: Rc<Cell<u64>>,
     applied_seq: Rc<Cell<u64>>,
+    /// Changes the file monitor has applied to the store.
+    monitor_events: Rc<Cell<u64>>,
     /// True while a navigation is waiting with nothing to show yet.
     loading: Rc<Cell<bool>>,
     /// Called when a background refresh changed the store on its own.
@@ -156,6 +158,7 @@ impl DirectoryModel {
             generation: Rc::new(Cell::new(0)),
             next_seq: Rc::new(Cell::new(0)),
             applied_seq: Rc::new(Cell::new(0)),
+            monitor_events: Rc::new(Cell::new(0)),
             loading: Rc::new(Cell::new(false)),
             on_background_update: Rc::new(RefCell::new(None)),
             on_background_error: Rc::new(RefCell::new(None)),
@@ -407,6 +410,7 @@ impl DirectoryModel {
         let seq = self.next_seq.get() + 1;
         self.next_seq.set(seq);
         let since = loader::changes();
+        let events = self.monitor_events.get();
         let rx = if apply == Apply::Replace {
             loader::spawn(job)
         } else {
@@ -431,10 +435,10 @@ impl DirectoryModel {
         };
         if apply == Apply::Replace {
             match rx.recv_timeout(SYNC_WAIT) {
-                Ok(result) => return self.finish(gen, seq, since, result, apply, on_done),
+                Ok(result) => return self.finish(gen, seq, since, events, result, apply, on_done),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     let failed = Err("listing failed".into());
-                    return self.finish(gen, seq, since, failed, apply, on_done);
+                    return self.finish(gen, seq, since, events, failed, apply, on_done);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => self.loading.set(true),
             }
@@ -458,19 +462,21 @@ impl DirectoryModel {
                 }
             };
             if let (Some(result), Some(on_done)) = (result, on_done.take()) {
-                model.finish(gen, seq, since, result, apply, on_done);
+                model.finish(gen, seq, since, events, result, apply, on_done);
             }
             glib::ControlFlow::Break
         });
     }
 
-    /// Apply a finished listing job, begun at the cache mark `since`.
+    /// Apply a finished listing job, begun at the cache mark `since` and
+    /// the monitor's count `events`.
     #[allow(clippy::too_many_arguments)]
     fn finish(
         &self,
         gen: u64,
         seq: u64,
         since: u64,
+        events: u64,
         result: loader::ListResult,
         apply: Apply,
         on_done: LoadDone,
@@ -517,6 +523,15 @@ impl DirectoryModel {
                 return;
             }
         };
+
+        if apply == Apply::Diff && self.monitor_events.get() != events {
+            // The file monitor changed the store while this was listed:
+            // the store is newer than the listing, which would bring back
+            // what was deleted meanwhile and drop what was made.
+            log::debug!("skipping listing older than the monitor's changes");
+            on_done(Some(Ok(self.store.n_items())));
+            return;
+        }
 
         log::debug!("listed {}: {} entries", listing.path, listing.entries.len());
         *self.current_path.borrow_mut() = listing.path.clone();
@@ -644,9 +659,9 @@ impl DirectoryModel {
             Ok(mon) => {
                 let store = self.store.clone();
                 let current_path = self.current_path.clone();
-                let sorter = self.sorter.clone();
                 let sort_model = self.sort_model.clone();
                 let size_job = self.size_job.clone();
+                let monitor_events = self.monitor_events.clone();
 
                 mon.connect_changed(move |_mon, file, _other, event| {
                     let path = current_path.borrow().clone();
@@ -657,6 +672,7 @@ impl DirectoryModel {
                     {
                         return;
                     }
+                    monitor_events.set(monitor_events.get() + 1);
 
                     // Get the basename of the changed file for matching
                     let changed_name = file
@@ -687,8 +703,10 @@ impl DirectoryModel {
                                 gio::Cancellable::NONE,
                             ) {
                                 let file_obj = FileObject::from_file_info(&path, &info);
+                                // (The sort model puts it in its place:
+                                // re-sorting everything would make Orca
+                                // lose its place.)
                                 store.append(&file_obj);
-                                sorter.changed(gtk::SorterChange::Different);
                                 // It says "Calculating...": do so.
                                 if file_obj.is_directory() {
                                     // Part of the current listing's job:
@@ -828,28 +846,36 @@ fn spawn_size_job(
     let store = store.clone();
     let sort_model = sort_model.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        let mut updated = Vec::new();
+        let mut results = Vec::new();
         let finished = loop {
             match rx.try_recv() {
-                Ok((path, size)) => {
-                    let fo = (0..store.n_items())
-                        .filter_map(|i| store.item(i).and_downcast::<FileObject>())
-                        .find(|fo| fo.path() == path);
-                    if let Some(fo) = fo {
-                        match size {
-                            Some(size) => {
-                                fo.set_size(size);
-                                fo.set_size_display(crate::file_object::format_size(size));
-                            }
-                            None => fo.set_size_display("\u{2014}".to_string()),
-                        }
-                        updated.push(fo);
-                    }
-                }
+                Ok(result) => results.push(result),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break false,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
             }
         };
+        let mut updated = Vec::new();
+        if !results.is_empty() {
+            // The folders shown, by path: looked up once per batch, not
+            // once per result (thousands of folders would freeze it).
+            let folders: HashMap<String, FileObject> = (0..store.n_items())
+                .filter_map(|i| store.item(i).and_downcast::<FileObject>())
+                .filter(|fo| fo.is_directory())
+                .map(|fo| (fo.path(), fo))
+                .collect();
+            for (path, size) in results {
+                if let Some(fo) = folders.get(&path).cloned() {
+                    match size {
+                        Some(size) => {
+                            fo.set_size(size);
+                            fo.set_size_display(crate::file_object::format_size(size));
+                        }
+                        None => fo.set_size_display("\u{2014}".to_string()),
+                    }
+                    updated.push(fo);
+                }
+            }
+        }
         // Sorted by size, folders move to their places as sizes arrive.
         resort_if_needed(&sort_model, &updated);
         if finished {
@@ -868,12 +894,20 @@ fn resort_if_needed(sort_model: &SortListModel, changed: &[FileObject]) {
     let Some(sorter) = sort_model.sorter() else {
         return;
     };
+    if changed.is_empty() {
+        return;
+    }
+    let changed: std::collections::HashSet<&FileObject> = changed.iter().collect();
     let n = sort_model.n_items();
-    let out_of_order = changed.iter().any(|fo| {
-        let Some(pos) = (0..n).find(|&i| sort_model.item(i).as_ref() == Some(fo.upcast_ref()))
-        else {
+    // One pass over the list for all of them.
+    let out_of_order = (0..n).any(|pos| {
+        let Some(fo) = sort_model.item(pos).and_downcast::<FileObject>() else {
             return false;
         };
+        if !changed.contains(&fo) {
+            return false;
+        }
+        let fo = &fo;
         let before = pos
             .checked_sub(1)
             .and_then(|i| sort_model.item(i))
@@ -894,7 +928,12 @@ fn resort_if_needed(sort_model: &SortListModel, changed: &[FileObject]) {
 pub fn query_file(path: &str) -> Option<(String, crate::file_object::FileInfoData)> {
     let info = gio::File::for_path(path)
         .query_info(
-            loader::attrs_for(crate::rclone_ops::is_fuse_path(path)),
+            // Where it really is: through a link into a mount, it's on the
+            // mount (and mustn't have its contents sniffed).
+            loader::attrs_for(crate::rclone_ops::is_fuse_path(
+                &crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(path))
+                    .to_string_lossy(),
+            )),
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
             gio::Cancellable::NONE,
         )

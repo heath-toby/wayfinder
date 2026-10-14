@@ -560,7 +560,7 @@ fn transfer_with_progress(
     let waiting = crate::background::waiting_message(&dest_path);
     let dest_for_check = dest.clone();
     crate::background::run(
-        move || dest_for_check.query_exists(gio::Cancellable::NONE),
+        move || exists_here(&dest_for_check),
         move |exists| {
             if exists {
                 let dialog_name = display_name.clone();
@@ -724,12 +724,15 @@ fn delete_tree_cancellable(
 }
 
 /// Recursively copy a directory and its contents.
+/// `moving`: for a move (as copy, then delete), so everything about each
+/// item is kept — dates and all — as a move would.
 fn copy_directory_recursive(
     source: &gio::File,
     dest: &gio::File,
     cancellable: &gio::Cancellable,
     progress: &Arc<Mutex<(i64, i64)>>,
     replace: bool,
+    moving: bool,
 ) -> Result<(), glib::Error> {
     // When replacing, delete the existing destination directory first so we
     // get a true replacement instead of a merge.
@@ -740,8 +743,9 @@ fn copy_directory_recursive(
         );
         if dest_type == gio::FileType::Directory {
             delete_recursive_gio(dest, cancellable)?;
-        } else if dest_type == gio::FileType::SymbolicLink {
-            // Replace the link itself, not what's in the folder it leads to.
+        } else if dest_type != gio::FileType::Unknown {
+            // A file (a folder is replacing it), or a link — the link
+            // itself, not what's in the folder it leads to.
             dest.delete(Some(cancellable))?;
         }
     }
@@ -754,11 +758,16 @@ fn copy_directory_recursive(
         Err(e) => return Err(e),
     }
 
+    let metadata = if moving {
+        gio::FileCopyFlags::ALL_METADATA
+    } else {
+        gio::FileCopyFlags::NONE
+    };
     let flags = if replace {
         gio::FileCopyFlags::OVERWRITE
     } else {
         gio::FileCopyFlags::NONE
-    };
+    } | metadata;
 
     let enumerator = source.enumerate_children(
         "standard::name,standard::type",
@@ -778,12 +787,26 @@ fn copy_directory_recursive(
         let child_dest = dest.child(info.name());
 
         if info.file_type() == gio::FileType::Directory {
-            copy_directory_recursive(&child_source, &child_dest, cancellable, progress, replace)?;
+            copy_directory_recursive(
+                &child_source,
+                &child_dest,
+                cancellable,
+                progress,
+                replace,
+                moving,
+            )?;
         } else {
             copy_keeping_links(&child_source, &child_dest, flags, cancellable, progress)?;
         }
     }
 
+    // The folder's own permissions (a private one stays private), and for
+    // a move its dates: set last, as writing into it changes them (and a
+    // read-only one couldn't be written into). Not getting them is no
+    // reason to fail, as for files.
+    if let Err(e) = source.copy_attributes(dest, metadata, Some(cancellable)) {
+        log::warn!("Couldn't copy the attributes of {}: {e}", source.uri());
+    }
     Ok(())
 }
 
@@ -997,8 +1020,36 @@ fn run_with_progress(
         // as a folder reached through a link is the same folder.
         let refusal = real_placement_refusal(&source_path, &dest_path_str, is_move, replace);
 
+        // Replacing something of the other kind (a file with a folder, or
+        // a folder with a file): GIO won't put one over the other, so the
+        // old one goes first. (A folder over a folder is replaced whole by
+        // the copy itself.)
+        let kind = |f: &gio::File| {
+            f.query_file_type(
+                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                gio::Cancellable::NONE,
+            )
+        };
+        let clear = if refusal.is_none() && replace {
+            let (src_kind, dst_kind) = (kind(&src), kind(&dst));
+            let is_dir = |k| k == gio::FileType::Directory;
+            if dst_kind != gio::FileType::Unknown && is_dir(src_kind) != is_dir(dst_kind) {
+                if is_dir(dst_kind) {
+                    delete_recursive_gio(&dst, &cancellable_clone)
+                } else {
+                    dst.delete(Some(&cancellable_clone))
+                }
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
+
         let result = if let Some(msg) = refusal {
             Err(glib::Error::new(gio::IOErrorEnum::InvalidArgument, &msg))
+        } else if let Err(e) = clear {
+            Err(e)
         } else if is_move {
             let move_result = src.move_(
                 &dst,
@@ -1033,12 +1084,19 @@ fn run_with_progress(
                                     &cancellable_clone,
                                     &ps,
                                     replace,
+                                    true,
                                 )
                             })
                             .and_then(|()| delete_recursive_gio(&src, &cancellable_clone))
                     } else {
-                        copy_keeping_links(&src, &dst, flags, &cancellable_clone, &ps)
-                            .and_then(|()| src.delete(Some(&cancellable_clone)))
+                        copy_keeping_links(
+                            &src,
+                            &dst,
+                            flags | gio::FileCopyFlags::ALL_METADATA,
+                            &cancellable_clone,
+                            &ps,
+                        )
+                        .and_then(|()| src.delete(Some(&cancellable_clone)))
                     }
                 }
                 other => other,
@@ -1049,7 +1107,7 @@ fn run_with_progress(
                 gio::Cancellable::NONE,
             );
             if file_type == gio::FileType::Directory {
-                copy_directory_recursive(&src, &dst, &cancellable_clone, &ps, replace)
+                copy_directory_recursive(&src, &dst, &cancellable_clone, &ps, replace, false)
             } else {
                 copy_keeping_links(&src, &dst, flags, &cancellable_clone, &ps)
             }
@@ -1155,8 +1213,26 @@ fn format_time_remaining(seconds: f64) -> String {
 }
 
 /// If dest already exists, append " (2)", " (3)", etc.
+/// Whether something is at `file` — a link too, even one leading nowhere
+/// (`query_exists` follows links, so a broken one looks free).
+fn exists_here(file: &gio::File) -> bool {
+    file.query_file_type(
+        gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+        gio::Cancellable::NONE,
+    ) != gio::FileType::Unknown
+}
+
+/// `name` numbered: `a (2).txt`. A leading dot isn't an extension's
+/// (`.bashrc (2)`, still hidden).
+fn numbered_name(name: &str, i: u32) -> String {
+    match name.rfind('.').filter(|&dot| dot > 0) {
+        Some(dot) => format!("{} ({i}){}", &name[..dot], &name[dot..]),
+        None => format!("{name} ({i})"),
+    }
+}
+
 fn get_unique_dest(dest: &gio::File) -> gio::File {
-    if !dest.query_exists(gio::Cancellable::NONE) {
+    if !exists_here(dest) {
         return dest.clone();
     }
 
@@ -1168,19 +1244,9 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
     };
     let name = basename.to_string_lossy();
 
-    let (stem, ext) = if let Some(dot_pos) = name.rfind('.') {
-        (&name[..dot_pos], Some(&name[dot_pos..]))
-    } else {
-        (name.as_ref(), None)
-    };
-
     for i in 2..100 {
-        let new_name = match ext {
-            Some(ext) => format!("{stem} ({i}){ext}"),
-            None => format!("{stem} ({i})"),
-        };
-        let candidate = parent.child(&new_name);
-        if !candidate.query_exists(gio::Cancellable::NONE) {
+        let candidate = parent.child(numbered_name(&name, i));
+        if !exists_here(&candidate) {
             return candidate;
         }
     }
@@ -1190,10 +1256,63 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_keeping_links, in_drive_bin, placement, Placement};
+    use super::{
+        copy_directory_recursive, copy_keeping_links, in_drive_bin, numbered_name, placement,
+        Placement,
+    };
     use gtk::gio;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn copied_and_moved_folders_keep_their_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("wayfinder-copydir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let src = d.join("Private");
+        std::fs::create_dir_all(src.join("keys")).unwrap();
+        std::fs::write(src.join("keys/id"), "secret").unwrap();
+        std::fs::set_permissions(src.join("keys"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400);
+        std::fs::File::options()
+            .write(true)
+            .open(src.join("keys/id"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new((0, 0)));
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        for (name, moving) in [("copy", false), ("moved", true)] {
+            let dst = d.join(name);
+            copy_directory_recursive(
+                &gio::File::for_path(&src),
+                &gio::File::for_path(&dst),
+                &gio::Cancellable::new(),
+                &progress,
+                false,
+                moving,
+            )
+            .unwrap();
+            assert_eq!(mode(&dst.join("keys")), 0o700);
+            assert_eq!(
+                std::fs::read_to_string(dst.join("keys/id")).unwrap(),
+                "secret"
+            );
+            if moving {
+                assert_eq!(mtime(&dst.join("keys/id")), mtime(&src.join("keys/id")));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn numbered_names_keep_extensions_and_hidden_files_hidden() {
+        assert_eq!(numbered_name("a.txt", 2), "a (2).txt");
+        assert_eq!(numbered_name("archive.tar.gz", 3), "archive.tar (3).gz");
+        assert_eq!(numbered_name(".bashrc", 2), ".bashrc (2)");
+        assert_eq!(numbered_name("README", 2), "README (2)");
+    }
 
     #[test]
     fn mounts_in_a_drives_bin_are_found() {

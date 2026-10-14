@@ -6,17 +6,30 @@ use std::path::PathBuf;
 /// own (two saves at once mustn't share one), then renamed into place,
 /// creating the folder if need be. A reader never sees it half written.
 pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let part = path.with_extension(format!("{}-{n}.wayfinder-part", std::process::id()));
-    let result = fs::write(&part, contents)
-        // The file's permissions stay as they were (a private one private).
-        .and_then(|()| match fs::metadata(path) {
-            Ok(meta) => fs::set_permissions(&part, meta.permissions()),
-            Err(_) => Ok(()),
+    // Made with the file's permissions from the start: a private one is
+    // never readable by others, even for a moment.
+    let existing = fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777);
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        // (A new file: as any, less the umask.)
+        .mode(existing.unwrap_or(0o666))
+        .open(&part)
+        .and_then(|mut f| f.write_all(contents))
+        // The umask may have taken bits off the file's own: put them back.
+        .and_then(|()| match existing {
+            Some(mode) => fs::set_permissions(&part, fs::Permissions::from_mode(mode)),
+            None => Ok(()),
         })
         .and_then(|()| fs::rename(&part, path));
     if result.is_err() {
@@ -328,6 +341,25 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saved_files_keep_their_permissions_and_new_ones_follow_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("wayfinder-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let private = d.join("private");
+        super::write_atomically(&private, b"one").unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // New: never writable by others.
+        assert_eq!(mode(&private) & 0o002, 0);
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+        super::write_atomically(&private, b"two").unwrap();
+        assert_eq!(mode(&private), 0o600);
+        assert_eq!(std::fs::read(&private).unwrap(), b"two");
+        // No part file left behind.
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     use super::parse_file_app;
 
     #[test]
