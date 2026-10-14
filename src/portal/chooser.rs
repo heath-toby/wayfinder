@@ -771,11 +771,13 @@ pub fn show_chooser(
             let waiting = wayfinder::background::waiting_message(&check);
             // (Only the latest press's check acts: see checking_accept.)
             let checking_done = checking_accept.clone();
-            let checking_slow = checking_accept.clone();
-            let checking_choice = checking_accept.clone();
-            let still_current = {
+            // Whether this press's check may still act: the latest press,
+            // the dialog open, and the folder (no other typed in the
+            // location) and name it checked still the ones shown.
+            let still_current = std::rc::Rc::new({
                 let model = model_accept.clone();
                 let name_entry = fn_accept.clone();
+                let location = le_accept.clone();
                 let d = d_accept.clone();
                 let target = full_path.clone();
                 let checking = checking_accept.clone();
@@ -784,35 +786,47 @@ pub fn show_chooser(
                         .as_ref()
                         .map(|e| e.text().to_string())
                         .unwrap_or_default();
+                    let folder = model.current_path();
                     checking.get() == press
                         && d.is_visible()
-                        && std::path::Path::new(&model.current_path()).join(name)
-                            == std::path::Path::new(&target)
+                        && !location_not_open(&location.text(), &folder)
+                        && std::path::Path::new(&folder).join(name) == std::path::Path::new(&target)
                 }
-            };
+            });
+            let still_current_choice = still_current.clone();
+            let still_current_slow = still_current.clone();
             wayfinder::background::run(
                 // What's there by that name: a folder, a link leading
                 // nowhere, or a file (a link to one counts, as in GTK's).
                 // (Err: it couldn't be told — not taken for free, or an
                 // existing file would be written over unasked.)
-                move || match std::fs::symlink_metadata(&check) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(e.to_string()),
-                    Ok(_) => Ok(Some({
-                        // (Only a file is replaced: not a folder, nor a pipe
-                        // or a device, which the app would hang writing to.)
-                        match std::fs::metadata(&check) {
-                            Ok(m) if m.is_dir() => Some("a folder".to_string()),
-                            Ok(m) if m.is_file() => None,
-                            Ok(_) => Some("not a regular file".to_string()),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Some("a link that leads nowhere".to_string())
-                            }
-                            Err(e) => Some(format!("a link that can't be followed ({e})")),
+                // (Only a file is replaced: not a folder, nor a pipe or a
+                // device, which the app would hang writing to.)
+                move || {
+                    let kind = |m: &std::fs::Metadata| {
+                        if m.is_dir() {
+                            Some("a folder".to_string())
+                        } else if m.is_file() {
+                            None
+                        } else {
+                            Some("not a regular file".to_string())
                         }
-                    })),
+                    };
+                    match std::fs::symlink_metadata(&check) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                        Err(e) => Err(e.to_string()),
+                        Ok(m) if !m.file_type().is_symlink() => Ok(Some(kind(&m))),
+                        Ok(_) => match std::fs::metadata(&check) {
+                            Ok(m) => Ok(Some(kind(&m))),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Ok(Some(Some("a link that leads nowhere".to_string())))
+                            }
+                            Err(e) => Ok(Some(Some(format!("a link that can't be followed ({e})")))),
+                        },
+                    }
                 },
                 move |found| {
+                    // (A newer press, or the dialog gone: that's that.)
                     if checking_done.get() != press || !d.is_visible() {
                         return;
                     }
@@ -858,13 +872,13 @@ pub fn show_chooser(
                         .build();
                     confirm.choose(Some(&d), gio::Cancellable::NONE, move |choice| {
                         // (Another press meanwhile: that one decides.)
-                        if choice == Ok(1) && checking_choice.get() == press {
+                        if choice == Ok(1) && still_current_choice() {
                             send(&full_path);
                         }
                     });
                 },
                 move || {
-                    if checking_slow.get() != press {
+                    if !still_current_slow() {
                         return;
                     }
                     if let Some(msg) = waiting {
