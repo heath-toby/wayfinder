@@ -85,7 +85,14 @@ impl WayfinderWindow {
             );
             return;
         }
-        self.imp().nav.borrow_mut().navigate_to(PathBuf::from(path));
+        if self.imp().just_made.replace(false) {
+            self.imp()
+                .nav
+                .borrow_mut()
+                .replace_current(PathBuf::from(path));
+        } else {
+            self.imp().nav.borrow_mut().navigate_to(PathBuf::from(path));
+        }
         self.open_directory(path, true);
     }
 
@@ -1013,7 +1020,11 @@ impl WayfinderWindow {
                 let focused_went = restored
                     .iter()
                     .any(|(_, uri, _)| Some(uri.as_str()) == focused.as_deref());
-                w.imp().file_selection.borrow_mut().clear();
+                // The marks were in the Bin: if the user has gone on and
+                // marked files elsewhere, those stay.
+                if w.imp().model.generation() == generation {
+                    w.imp().file_selection.borrow_mut().clear();
+                }
                 // Showing the Bin (again, perhaps): list it afresh — it has
                 // no monitor. Move focus only if it's the same view.
                 if w.is_in_trash() {
@@ -1778,15 +1789,18 @@ impl WayfinderWindow {
     /// In the Bin or Recent Files, which aren't folders, say that files
     /// can't be `what` (pasted, created…) here and return true.
     fn refuse_in_special_location(&self, what: &str) -> bool {
+        self.refuse_in_special_location_with(|place| format!("Files can't be {what} in {place}"))
+    }
+
+    /// If the location isn't a folder (Recent Files, the Bin), say
+    /// `message(its name)` and return true.
+    fn refuse_in_special_location_with(&self, message: impl FnOnce(&str) -> String) -> bool {
         let location = self.imp().model.current_path();
         if !location.contains("://") {
             return false;
         }
         let place = wayfinder::file_model::display_name(&location);
-        self.announce(
-            &format!("Files can't be {what} in {place}"),
-            AccessibleAnnouncementPriority::Medium,
-        );
+        self.announce(&message(&place), AccessibleAnnouncementPriority::Medium);
         true
     }
 
@@ -2101,11 +2115,7 @@ impl WayfinderWindow {
             file.name()
         ))]);
         // Select the name without extension for convenience
-        if let Some(dot_pos) = file.name().rfind('.') {
-            entry.select_region(0, dot_pos as i32);
-        } else {
-            entry.select_region(0, -1);
-        }
+        entry.select_region(0, stem_chars(&file.name()));
 
         let dlg = gtk::Window::builder()
             .title(format!("Rename {}", file.name()))
@@ -2849,6 +2859,12 @@ impl WayfinderWindow {
     }
 
     pub fn open_terminal_here(&self) {
+        // Recent Files and the Bin aren't folders a terminal can be in.
+        if self.refuse_in_special_location_with(|place| {
+            format!("A terminal can't be opened in {place}")
+        }) {
+            return;
+        }
         let path = self.imp().model.current_path();
         // Try common terminals in order
         let terminals: &[(&str, &[&str])] = &[
@@ -3635,8 +3651,26 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
     }
 }
 
+/// How many characters of `name` come before its extension: what Rename
+/// selects. (In characters, as the entry counts: `Résumé.pdf` is 6.) A
+/// leading dot isn't an extension's: all of `.bashrc` is selected.
+fn stem_chars(name: &str) -> i32 {
+    match name.rfind('.').filter(|&dot| dot > 0) {
+        Some(dot) => name[..dot].chars().count() as i32,
+        None => -1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rename_selects_the_name_before_the_extension_in_characters() {
+        assert_eq!(super::stem_chars("Résumé.pdf"), 6);
+        assert_eq!(super::stem_chars("a.tar.gz"), 5);
+        assert_eq!(super::stem_chars(".bashrc"), -1);
+        assert_eq!(super::stem_chars("README"), -1);
+    }
+
     use super::{
         dropped_paths, duplicate_target, has_duplicate, holds_link, landing_paths,
         position_near_removed, rename_clash,

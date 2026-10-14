@@ -262,11 +262,17 @@ pub fn matches_mime(action: &CustomAction, mime_type: &str) -> bool {
         return true; // no restriction = matches all
     }
     let matches = |pattern: &str| {
-        // Any type, as file-manager actions write it.
-        if matches!(pattern, "*" | "*/*" | "all/all" | "all/allfiles") {
+        // Any type, as file-manager actions write it; all/allfiles is
+        // any file, not a folder.
+        if matches!(pattern, "*" | "*/*" | "all/all") {
             return true;
         }
-        if pattern == mime_type {
+        if pattern == "all/allfiles" {
+            return mime_type != "inode/directory";
+        }
+        // The type itself, or one that's a kind of it (text/x-python is a
+        // text/plain).
+        if pattern == mime_type || gtk::gio::content_type_is_a(mime_type, pattern) {
             return true;
         }
         // Support wildcard like "application/*"
@@ -626,8 +632,9 @@ fn execute_desktop_action(
     tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let commands = desktop_commands(&action.exec, files);
-    let current_dir = current_dir.to_string();
+    let candidates = work_dir_candidates(current_dir, files);
     std::thread::spawn(move || {
+        let work_dir = existing_dir(&candidates);
         // One command per file for %f/%u, one after another: run at once,
         // extractions into the same folder, or password prompts, would
         // collide. Stop at the first failure.
@@ -636,7 +643,7 @@ fn execute_desktop_action(
             msg = match std::process::Command::new("sh")
                 .arg("-c")
                 .arg(cmd_str)
-                .current_dir(&current_dir)
+                .current_dir(&work_dir)
                 .output()
             {
                 Ok(output) if output.status.success() => Ok(()),
@@ -652,6 +659,30 @@ fn execute_desktop_action(
         }
         let _ = tx.send(msg);
     });
+}
+
+/// Where an action may run, best first: the folder shown, the first
+/// file's folder, home (the folder shown may have been deleted meanwhile).
+fn work_dir_candidates(current_dir: &str, files: &[String]) -> Vec<std::path::PathBuf> {
+    let mut out = vec![std::path::PathBuf::from(current_dir)];
+    out.extend(
+        files
+            .first()
+            .and_then(|f| Path::new(f).parent())
+            .map(Path::to_path_buf),
+    );
+    out.extend(dirs::home_dir());
+    out
+}
+
+/// The first of `candidates` that's a folder (checked off the main thread:
+/// it may be on a slow mount); `/` if none is.
+fn existing_dir(candidates: &[std::path::PathBuf]) -> std::path::PathBuf {
+    candidates
+        .iter()
+        .find(|d| d.is_dir())
+        .cloned()
+        .unwrap_or_else(|| "/".into())
 }
 
 /// Single-quote `s` for `sh`.
@@ -717,9 +748,10 @@ fn execute_nautilus_script(
     let current_uri = file_uri(current_dir);
 
     let exec = action.exec.clone();
-    let current_dir = current_dir.to_string();
+    let candidates = work_dir_candidates(current_dir, files);
     let args = files.to_vec();
     std::thread::spawn(move || {
+        let current_dir = existing_dir(&candidates);
         // The files as arguments too, as Nautilus passes them ("$@").
         let result = std::process::Command::new(&exec)
             .args(&args)
@@ -754,6 +786,7 @@ mod tests {
         };
         assert!(matches_mime(&action(&["*/*"]), "text/plain"));
         assert!(matches_mime(&action(&["all/allfiles"]), "image/png"));
+        assert!(!matches_mime(&action(&["all/allfiles"]), "inode/directory"));
         assert!(matches_mime(&action(&["image/*"]), "image/png"));
         assert!(!matches_mime(&action(&["image/*"]), "text/plain"));
         assert!(!matches_mime(

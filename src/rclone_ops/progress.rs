@@ -142,9 +142,10 @@ pub fn show<W>(
             let start = buf.start_iter();
             let end = buf.end_iter();
             let text = buf.text(&start, &end, true).to_string();
+            // To the nanosecond: saving twice in a second makes two logs.
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
+                .map(|d| d.as_nanos())
                 .unwrap_or(0);
             // In the user's own cache folder, readable by them alone (it
             // names their files), and never over something already there.

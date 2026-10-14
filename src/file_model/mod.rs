@@ -73,6 +73,9 @@ pub struct DirectoryModel {
     /// begun before that is older there than the store, and leaves it be.
     monitor_events: Rc<Cell<u64>>,
     monitor_touched: Rc<RefCell<HashMap<String, u64>>>,
+    /// The monitor's count when each refresh still running began: what
+    /// it touched before the oldest of them matters to none, and goes.
+    refresh_starts: Rc<RefCell<Vec<u64>>>,
     /// True while a navigation is waiting with nothing to show yet.
     loading: Rc<Cell<bool>>,
     /// Called when a background refresh changed the store on its own.
@@ -163,6 +166,7 @@ impl DirectoryModel {
             applied_seq: Rc::new(Cell::new(0)),
             monitor_events: Rc::new(Cell::new(0)),
             monitor_touched: Rc::new(RefCell::new(HashMap::new())),
+            refresh_starts: Rc::new(RefCell::new(Vec::new())),
             loading: Rc::new(Cell::new(false)),
             on_background_update: Rc::new(RefCell::new(None)),
             on_background_error: Rc::new(RefCell::new(None)),
@@ -395,6 +399,7 @@ impl DirectoryModel {
         self.is_fuse.set(is_fuse);
         *self.monitor.borrow_mut() = None;
         self.monitor_touched.borrow_mut().clear();
+        self.refresh_starts.borrow_mut().clear();
         // Sizes of the folder left behind aren't wanted any more (the new
         // one may be on a mount, or have no folders, and start no job).
         self.size_job
@@ -416,6 +421,9 @@ impl DirectoryModel {
         self.next_seq.set(seq);
         let since = loader::changes();
         let events = self.monitor_events.get();
+        if apply != Apply::Replace {
+            self.refresh_starts.borrow_mut().push(events);
+        }
         let rx = if apply == Apply::Replace {
             loader::spawn(job)
         } else {
@@ -486,6 +494,9 @@ impl DirectoryModel {
         apply: Apply,
         on_done: LoadDone,
     ) {
+        if apply != Apply::Replace {
+            self.finish_refresh(events);
+        }
         if gen != self.generation.get() {
             log::debug!("dropping listing for a location left behind (generation {gen})");
             on_done(None);
@@ -589,6 +600,19 @@ impl DirectoryModel {
             })
             .collect();
         self.store.splice(0, self.store.n_items(), &objects);
+    }
+
+    /// A refresh begun at the monitor's count `events` is over (about to be
+    /// applied, or dropped): forget what the monitor touched before it and
+    /// every refresh still running began.
+    fn finish_refresh(&self, events: u64) {
+        let mut starts = self.refresh_starts.borrow_mut();
+        if let Some(i) = starts.iter().position(|&s| s == events) {
+            starts.remove(i);
+        }
+        // (Newer than this one's start too: it's about to be applied.)
+        let oldest = starts.iter().copied().fold(events, u64::min);
+        self.monitor_touched.borrow_mut().retain(|_, n| *n > oldest);
     }
 
     /// `keep`: paths the store has newer than the listing, left as they are.
