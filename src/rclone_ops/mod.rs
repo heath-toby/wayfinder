@@ -89,10 +89,7 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     // remotes in another config, which this user's rclone would read as
     // its own.)
     // (Not known: none, rather than root's.)
-    let Some(uid) = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| effective_uid(&s))
-    else {
+    let Some(uid) = current_uid() else {
         return Vec::new();
     };
     let found = match Command::new("ps")
@@ -108,6 +105,11 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     };
     *last = Some((std::time::Instant::now(), fuse_mounts, found.clone()));
     found
+}
+
+/// This process's effective user id; `None` if it can't be read.
+pub fn current_uid() -> Option<u32> {
+    effective_uid(&std::fs::read_to_string("/proc/self/status").ok()?)
 }
 
 /// The effective user id in `/proc/self/status` text.
@@ -652,8 +654,10 @@ fn fstype_in(contents: &str, path: &str) -> Option<String> {
         }
         let mountpoint = decode_mount_path(parts[1]);
         let fstype = parts[2];
-        // (By whole parts: `/a/bc` isn't in `/a/b`; everything is in `/`.)
-        let is_prefix = Path::new(path).starts_with(&mountpoint);
+        // (`/a/bc` isn't in `/a/b`. Nor is anything in `/` but `/`: a
+        // root that's FUSE — in a container, say — isn't taken for a slow
+        // mount everywhere.)
+        let is_prefix = path == mountpoint || path.starts_with(&format!("{mountpoint}/"));
         // (`>=`: of two at one place, the one listed later is on top — an
         // automount's real mount over its autofs stand-in.)
         if is_prefix && mountpoint.len() >= best_len {
@@ -674,17 +678,24 @@ pub fn spec_for_path(local_path: &str) -> String {
 }
 
 /// `steps` fitted, each, to its source in `sources` (see `fit_to_kind`).
-/// A folder copied is made first: rclone copies what's in it, and makes no
-/// destination at all for an empty one.
+/// A folder copied is made first, and one moved if it's empty: rclone
+/// makes no destination at all for an empty one.
 fn fit_steps(steps: Vec<(String, Vec<String>)>, sources: &[String]) -> Vec<(String, Vec<String>)> {
     steps
         .into_iter()
         .zip(sources)
         .flat_map(|((label, args), src)| {
             let args = fit_to_kind(args, src);
-            // (An empty folder copied or moved would otherwise not be
-            // made at all — and a move's source then removed.)
-            let make = matches!(args.first().map(String::as_str), Some("copy" | "move"))
+            // (An empty folder copied or moved would otherwise not be made
+            // at all — and a move's source then removed. For a move only
+            // an empty one: made beforehand, rclone couldn't move a full
+            // one whole on the server, and would move it file by file.)
+            let make = match args.first().map(String::as_str) {
+                Some("copy") => true,
+                Some("move") => std::fs::read_dir(src).is_ok_and(|mut d| d.next().is_none()),
+                _ => false,
+            };
+            let make = make
                 .then(|| args.get(2).cloned())
                 .flatten()
                 .map(|dst| (format!("Making {dst}"), vec!["mkdir".to_string(), dst]));
@@ -1403,27 +1414,30 @@ mod fit_tests {
         assert!(!copied_file.iter().any(|a| a.contains("empty-src-dirs")));
     }
 
-    /// A folder copied or moved is made first (rclone makes none for an
-    /// empty one); a file isn't.
+    /// A folder copied is made first (rclone makes none for an empty one),
+    /// and one moved if it's empty — a full one is left for rclone to move
+    /// whole; a file isn't.
     #[test]
     fn folders_are_made_before_rclone_fills_them() {
         let d = std::env::temp_dir().join(format!("wayfinder-steps-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(d.join("dir")).unwrap();
+        std::fs::create_dir_all(d.join("empty")).unwrap();
+        std::fs::create_dir_all(d.join("full")).unwrap();
+        std::fs::write(d.join("full/x"), "").unwrap();
         std::fs::write(d.join("file"), "").unwrap();
-        let dir = d.join("dir").to_string_lossy().to_string();
-        let file = d.join("file").to_string_lossy().to_string();
+        let at = |n: &str| d.join(n).to_string_lossy().to_string();
         let steps = super::fit_steps(
             vec![
                 ("m".into(), moveto_args("a:x", "a:y")),
+                ("m".into(), moveto_args("a:p", "a:q")),
                 ("c".into(), copyto_args("a:x", "a:z")),
                 ("f".into(), copyto_args("a:f", "a:g")),
             ],
-            &[dir.clone(), dir, file],
+            &[at("empty"), at("full"), at("full"), at("file")],
         );
         let _ = std::fs::remove_dir_all(&d);
         let verbs: Vec<&str> = steps.iter().map(|(_, a)| a[0].as_str()).collect();
-        assert_eq!(verbs, ["mkdir", "move", "mkdir", "copy", "copyto"]);
+        assert_eq!(verbs, ["mkdir", "move", "move", "mkdir", "copy", "copyto"]);
         assert_eq!(steps[0].1[1], "a:y");
     }
 
@@ -1436,7 +1450,7 @@ mod fit_tests {
             super::fstype_in(mounts, "/mnt/d/f").as_deref(),
             Some("fuse.rclone")
         );
-        assert_eq!(super::fstype_in(mounts, "/home").as_deref(), Some("ext4"));
+        assert_eq!(super::fstype_in(mounts, "/home"), None);
     }
 
     #[test]

@@ -48,8 +48,7 @@ pub fn refuse_mounts_in_bin() -> Result<(), glib::Error> {
         .map(|bin| std::fs::canonicalize(&bin).unwrap_or(bin));
     // The Bin also holds what was binned on other drives, in their own
     // `.Trash-<uid>` (or `.Trash/<uid>`) folders.
-    use std::os::unix::fs::MetadataExt;
-    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    let uid = crate::rclone_ops::current_uid();
     let mounts = crate::rclone_ops::mountpoints_inside("/");
     let found = mounts.iter().find(|m| {
         home_bin

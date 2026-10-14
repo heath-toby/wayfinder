@@ -2881,6 +2881,55 @@ impl WayfinderWindow {
         entry.grab_focus();
     }
 
+    /// Shift+Space: start a range at the selected file, or finish one
+    /// started, marking every file between.
+    pub(crate) fn range_select(&self) {
+        let imp = self.imp();
+        let pos = imp.selection.selected();
+        let n = imp.selection.n_items();
+        let path_at = |i: u32| {
+            imp.selection
+                .item(i)
+                .and_downcast::<FileObject>()
+                .map(|f| f.path())
+        };
+        // (No row selected — a search matching nothing, say: a range
+        // started is kept for when there is one.)
+        let Some(here) = (pos < n).then(|| path_at(pos)).flatten() else {
+            self.announce("No file selected", AccessibleAnnouncementPriority::Medium);
+            return;
+        };
+        let anchor = imp.file_selection.borrow().range_anchor.clone();
+        let range = anchor
+            .as_deref()
+            .map(|a| range_from_anchor(n, path_at, a, pos));
+        let Some(Some((start, end))) = range else {
+            imp.file_selection.borrow_mut().range_anchor = Some(here);
+            // (One started from a file no longer listed: said, not
+            // silently begun again.)
+            let msg = if range.is_some() {
+                "The file the selection started on is gone. Selection started here"
+            } else {
+                "Selection started"
+            };
+            self.announce(msg, AccessibleAnnouncementPriority::Medium);
+            return;
+        };
+        let count = {
+            let mut sel = imp.file_selection.borrow_mut();
+            for path in (start..=end).filter_map(path_at) {
+                sel.selected.insert(path);
+            }
+            sel.range_anchor = None;
+            sel.count()
+        };
+        self.announce(
+            &format!("Selection finished: {count} files selected"),
+            AccessibleAnnouncementPriority::Medium,
+        );
+        self.update_status();
+    }
+
     pub fn undo_trash(&self) {
         let (paths, since) = self.imp().last_trashed.borrow().clone();
         if paths.is_empty() {
@@ -3535,7 +3584,8 @@ fn newest_trashed(
         std::collections::HashMap::new();
     for (orig, date, name) in items {
         // ISO 8601 local time: later sorts after.
-        if !wanted.contains(orig.as_str()) || date.as_str() < since {
+        // (An item with no date can't be told apart: taken, as before.)
+        if !wanted.contains(orig.as_str()) || (!date.is_empty() && date.as_str() < since) {
             continue;
         }
         if newest.get(&orig).is_none_or(|(d, _)| date > *d) {
@@ -3775,13 +3825,17 @@ fn parent_dir(path: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
-/// The rows a Shift+Space range covers, as indexes into `paths` (the
-/// listed files, in order): from the file it started on — found by path, as
-/// files may have come or gone since — to the selected row `pos`. None if
-/// that file isn't listed any more, or no row is selected.
-fn range_from_anchor(paths: &[String], anchor: &str, pos: u32) -> Option<(usize, usize)> {
-    let pos = usize::try_from(pos).ok().filter(|p| *p < paths.len())?;
-    let start = paths.iter().position(|p| p == anchor)?;
+/// The rows a Shift+Space range covers: from the file it started on —
+/// found by path, as files may have come or gone since — to the selected
+/// row `pos`, of `n` rows (`path_at` gives each one's path). None if that
+/// file isn't listed any more.
+fn range_from_anchor(
+    n: u32,
+    path_at: impl Fn(u32) -> Option<String>,
+    anchor: &str,
+    pos: u32,
+) -> Option<(u32, u32)> {
+    let start = (0..n).find(|i| path_at(*i).as_deref() == Some(anchor))?;
     Some((start.min(pos), start.max(pos)))
 }
 
@@ -4092,14 +4146,11 @@ mod tests {
             .iter()
             .map(|p| p.to_string())
             .collect();
+        let at = |i: u32| paths.get(i as usize).cloned();
         // Started on /d/b (then row 1); now row 2.
-        assert_eq!(super::range_from_anchor(&paths, "/d/b", 4), Some((2, 4)));
-        assert_eq!(super::range_from_anchor(&paths, "/d/b", 0), Some((0, 2)));
-        assert_eq!(super::range_from_anchor(&paths, "/d/gone", 4), None);
-        assert_eq!(
-            super::range_from_anchor(&paths, "/d/b", gtk::INVALID_LIST_POSITION),
-            None
-        );
+        assert_eq!(super::range_from_anchor(5, at, "/d/b", 4), Some((2, 4)));
+        assert_eq!(super::range_from_anchor(5, at, "/d/b", 0), Some((0, 2)));
+        assert_eq!(super::range_from_anchor(5, at, "/d/gone", 4), None);
     }
 
     /// Undo doesn't restore an older item from the same place, binned

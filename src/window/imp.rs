@@ -1141,53 +1141,7 @@ impl WayfinderWindowInner {
                 }
                 glib::Propagation::Stop
             } else if key == gdk::Key::space && mods.contains(gdk::ModifierType::SHIFT_MASK) {
-                // Shift+Space: start or finish range selection
-                let mut sel = imp.file_selection.borrow_mut();
-                let pos = imp.selection.selected();
-                // (The range starts at the file, not its position: the list
-                // may have changed since.)
-                let paths: Vec<String> = (0..imp.selection.n_items())
-                    .map(|i| {
-                        imp.selection
-                            .item(i)
-                            .and_downcast::<FileObject>()
-                            .map(|f| f.path())
-                            .unwrap_or_default()
-                    })
-                    .collect();
-                let range = sel
-                    .range_anchor
-                    .as_deref()
-                    .and_then(|anchor| super::range_from_anchor(&paths, anchor, pos));
-                if let Some((start, end)) = range {
-                    for path in &paths[start..=end] {
-                        if !path.is_empty() {
-                            sel.selected.insert(path.clone());
-                        }
-                    }
-                    let count = sel.count();
-                    sel.range_anchor = None;
-                    drop(sel);
-                    window.announce(
-                        &format!("Selection finished: {count} files selected"),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                    window.update_status();
-                } else {
-                    // (One already started, from a file no longer listed:
-                    // said, not silently begun again.)
-                    let was_started = sel.range_anchor.is_some();
-                    sel.range_anchor = paths.get(pos as usize).cloned();
-                    let msg = match (was_started, sel.range_anchor.is_some()) {
-                        (_, false) => "No file to start a selection from",
-                        (true, true) => {
-                            "The file the selection started on is gone. Selection started here"
-                        }
-                        (false, true) => "Selection started",
-                    };
-                    drop(sel);
-                    window.announce(msg, AccessibleAnnouncementPriority::Medium);
-                }
+                window.range_select();
                 glib::Propagation::Stop
             } else if key == gdk::Key::a && mods.contains(gdk::ModifierType::CONTROL_MASK) {
                 // Ctrl+A: select all files
@@ -1361,52 +1315,7 @@ impl WayfinderWindowInner {
                 }
                 glib::Propagation::Stop
             } else if key == gdk::Key::space && mods.contains(gdk::ModifierType::SHIFT_MASK) {
-                let mut sel = imp.file_selection.borrow_mut();
-                let pos = imp.selection.selected();
-                // (The range starts at the file, not its position: the list
-                // may have changed since.)
-                let paths: Vec<String> = (0..imp.selection.n_items())
-                    .map(|i| {
-                        imp.selection
-                            .item(i)
-                            .and_downcast::<FileObject>()
-                            .map(|f| f.path())
-                            .unwrap_or_default()
-                    })
-                    .collect();
-                let range = sel
-                    .range_anchor
-                    .as_deref()
-                    .and_then(|anchor| super::range_from_anchor(&paths, anchor, pos));
-                if let Some((start, end)) = range {
-                    for path in &paths[start..=end] {
-                        if !path.is_empty() {
-                            sel.selected.insert(path.clone());
-                        }
-                    }
-                    let count = sel.count();
-                    sel.range_anchor = None;
-                    drop(sel);
-                    window.announce(
-                        &format!("Selection finished: {count} files selected"),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                    window.update_status();
-                } else {
-                    // (One already started, from a file no longer listed:
-                    // said, not silently begun again.)
-                    let was_started = sel.range_anchor.is_some();
-                    sel.range_anchor = paths.get(pos as usize).cloned();
-                    let msg = match (was_started, sel.range_anchor.is_some()) {
-                        (_, false) => "No file to start a selection from",
-                        (true, true) => {
-                            "The file the selection started on is gone. Selection started here"
-                        }
-                        (false, true) => "Selection started",
-                    };
-                    drop(sel);
-                    window.announce(msg, AccessibleAnnouncementPriority::Medium);
-                }
+                window.range_select();
                 glib::Propagation::Stop
             } else if key == gdk::Key::a && mods.contains(gdk::ModifierType::CONTROL_MASK) {
                 // Ctrl+A: select all files
