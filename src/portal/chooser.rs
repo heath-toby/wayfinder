@@ -702,20 +702,11 @@ pub fn show_chooser(
     let model_accept = model.clone();
     let d_accept = dlg.clone();
     let le_accept = location_entry.clone();
-    // Bumped by every Save press, every change of location and the
-    // dialog's closing: a Replace check under way acts only if nothing of
-    // the sort has happened since it began (a corrected name, another
-    // folder, a cancel all win).
+    // Save presses, counted: a Replace check under way acts only if it's
+    // the latest press's, the dialog is still open, and it still shows the
+    // folder and name it checked (otherwise a corrected name, another
+    // folder or a cancel would lose to it).
     let checking_accept = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    {
-        let checking = checking_accept.clone();
-        location_entry.connect_changed(move |_| checking.set(checking.get() + 1));
-        let checking = checking_accept.clone();
-        dlg.connect_close_request(move |_| {
-            checking.set(checking.get() + 1);
-            glib::Propagation::Proceed
-        });
-    }
     accept_btn.connect_clicked(move |_| {
         let press = checking_accept.get() + 1;
         checking_accept.set(press);
@@ -781,11 +772,33 @@ pub fn show_chooser(
             // (Only the latest press's check acts: see checking_accept.)
             let checking_done = checking_accept.clone();
             let checking_slow = checking_accept.clone();
+            let checking_choice = checking_accept.clone();
+            let still_current = {
+                let model = model_accept.clone();
+                let name_entry = fn_accept.clone();
+                let d = d_accept.clone();
+                let target = full_path.clone();
+                let checking = checking_accept.clone();
+                move || {
+                    let name = name_entry
+                        .as_ref()
+                        .map(|e| e.text().to_string())
+                        .unwrap_or_default();
+                    checking.get() == press
+                        && d.is_visible()
+                        && std::path::Path::new(&model.current_path()).join(name)
+                            == std::path::Path::new(&target)
+                }
+            };
             wayfinder::background::run(
                 // What's there by that name: a folder, a link leading
                 // nowhere, or a file (a link to one counts, as in GTK's).
-                move || {
-                    std::fs::symlink_metadata(&check).ok().map(|_| {
+                // (Err: it couldn't be told — not taken for free, or an
+                // existing file would be written over unasked.)
+                move || match std::fs::symlink_metadata(&check) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                    Ok(_) => Ok(Some({
                         // (Only a file is replaced: not a folder, nor a pipe
                         // or a device, which the app would hang writing to.)
                         match std::fs::metadata(&check) {
@@ -797,12 +810,31 @@ pub fn show_chooser(
                             }
                             Err(e) => Some(format!("a link that can't be followed ({e})")),
                         }
-                    })
+                    })),
                 },
                 move |found| {
-                    if checking_done.get() != press {
+                    if checking_done.get() != press || !d.is_visible() {
                         return;
                     }
+                    // The folder or name changed meanwhile: not saved where
+                    // it no longer says.
+                    if !still_current() {
+                        d.announce(
+                            "Not saved: the folder or name changed. Press Save again.",
+                            AccessibleAnnouncementPriority::Medium,
+                        );
+                        return;
+                    }
+                    let found = match found {
+                        Ok(found) => found,
+                        Err(e) => {
+                            d.announce(
+                                &format!("Couldn't tell whether {name} exists: {e}"),
+                                AccessibleAnnouncementPriority::High,
+                            );
+                            return;
+                        }
+                    };
                     let Some(refused) = found else {
                         send(&full_path);
                         return;
@@ -825,7 +857,8 @@ pub fn show_chooser(
                         .default_button(0)
                         .build();
                     confirm.choose(Some(&d), gio::Cancellable::NONE, move |choice| {
-                        if choice == Ok(1) {
+                        // (Another press meanwhile: that one decides.)
+                        if choice == Ok(1) && checking_choice.get() == press {
                             send(&full_path);
                         }
                     });
