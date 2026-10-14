@@ -850,8 +850,8 @@ fn split_exec_quoted(exec: &str) -> Vec<(String, bool)> {
                 }
             }
             '\\' => {
+                // (An escaped space or the like: not quoting what's around.)
                 in_arg = true;
-                quoted = true;
                 if let Some(c) = chars.next() {
                     arg.push(c);
                 }
@@ -898,43 +898,16 @@ fn exec_quote(s: &str) -> String {
 fn desktop_commands(exec: &str, files: &[String]) -> Vec<Vec<String>> {
     let args = split_exec_quoted(exec);
     // Field codes are filled in unquoted arguments only (anywhere in one:
-    // `%f`, `%f~`, `--input=%f`). A quoted one is left as written — the
-    // spec leaves codes there undefined, and it's where inline code goes
+    // `%f`, `%f~`, `--input=%f`). Quoted text is left as written — the spec
+    // leaves codes there undefined, and it's where inline code goes
     // (`sh -c '…'`, `python3 -c '…'`): a file's name put in code would be
-    // run (`$(…)` in one). Nor is the code given to a shell or interpreter
-    // to run (`sh -c %f`, `bash -lc %f`) filled. Such a command gets the
-    // files after it instead (a script has them as "$1").
-    const RUNS_CODE: [&str; 11] = [
-        "sh", "bash", "dash", "zsh", "ksh", "fish", "python", "python3", "perl", "ruby", "node",
-    ];
-    // The argument an interpreter runs as code: the one after its own
-    // `-c`/`-e` (`-lc`, `-ec`…), among the options right after it — not a
-    // script file's (`sh ./convert.sh -c %f`).
-    let mut code_arg = vec![false; args.len()];
-    for (k, (program, _)) in args.iter().enumerate() {
-        let interpreter = std::path::Path::new(program)
-            .file_name()
-            .is_some_and(|n| RUNS_CODE.contains(&n.to_string_lossy().as_ref()));
-        if !interpreter {
-            continue;
-        }
-        for j in k + 1..args.len() {
-            let option = &args[j].0;
-            if !option.starts_with('-') || option.starts_with("--") {
-                break;
-            }
-            if option.ends_with('c') || option.ends_with('e') {
-                if j + 1 < args.len() {
-                    code_arg[j + 1] = true;
-                }
-                break;
-            }
-        }
-    }
+    // run (`$(…)` in one); such an action gets the files after it instead
+    // (a script has them as "$1"). (An unquoted code where an interpreter
+    // takes its code — `sh -c %f` — is the action's own doing, as in GLib.)
     // (Quoted, only a code on its own: `"%f"` is one argument either way.)
     let fillable = |i: usize| {
         let (arg, quoted) = &args[i];
-        !code_arg[i] && (!quoted || matches!(arg.as_str(), "%f" | "%u" | "%F" | "%U"))
+        !quoted || matches!(arg.as_str(), "%f" | "%u" | "%F" | "%U")
     };
     // One argument with its codes filled: `%f` the file, `%u` its URI,
     // `%%` a `%`; `%i %c %k` and the deprecated `%d %D %n %N %v %m` go.
@@ -984,8 +957,10 @@ fn desktop_commands(exec: &str, files: &[String]) -> Vec<Vec<String>> {
             match arg.as_str() {
                 "%F" if fillable(i) => argv.extend(files.iter().cloned()),
                 "%U" if fillable(i) => argv.extend(uris.iter().cloned()),
-                // (A single-file code beside them stands for nothing.)
-                _ if has_code(i, &["%f", "%u"]) => {}
+                // (A single-file code beside them is kept as written: an
+                // argument dropped would shift the rest — a file taking an
+                // output's place.)
+                _ if has_code(i, &["%f", "%u"]) => argv.push(arg.clone()),
                 _ => argv.extend(argument(i, "", "")),
             }
         }
@@ -1249,27 +1224,25 @@ mod tests {
         );
         let cmds = desktop_commands("app --icon=%i %f", &files(&["/d/a"]));
         assert_eq!(cmds, vec![argv(&["app", "--icon=", "/d/a"])]);
-        let cmds = desktop_commands("foo %F %f", &files(&["/d/a", "/d/b"]));
-        assert_eq!(cmds, vec![argv(&["foo", "/d/a", "/d/b"])]);
+        // Beside %F, a %f argument stays as written (dropped, the rest would
+        // shift: a file in the output's place).
+        let cmds = desktop_commands("tar -czf %f.tar.gz %F", &files(&["/d/a", "/d/b"]));
+        assert_eq!(
+            cmds,
+            vec![argv(&["tar", "-czf", "%f.tar.gz", "/d/a", "/d/b"])]
+        );
     }
 
-    /// A code that would be the code run (`sh -c %f`) isn't filled.
+    /// A `-c` that's a script file's option is filled as any; `\ ` in an
+    /// unquoted argument doesn't stop its codes being filled.
     #[test]
-    fn a_file_is_never_the_code_run() {
-        for exec in ["sh -c %f", "bash -lc %f", "env sh -c %f", "python3 -c %f"] {
-            let cmds = desktop_commands(exec, &files(&["/d/$(touch PWNED)"]));
-            assert!(
-                cmds.iter()
-                    .all(|argv| !argv.iter().any(|a| a.starts_with("/d/$(touch")
-                        && argv.iter().position(|x| x == a)
-                            == argv.iter().position(|x| x.ends_with('c')).map(|p| p + 1))),
-                "{exec}: {cmds:?}"
-            );
-            assert!(cmds[0].iter().any(|a| a == "%f"), "{exec}: {cmds:?}");
-        }
-        // A `-c` that's a script file's option is filled as any.
+    fn options_and_escaped_spaces_are_filled() {
         let cmds = desktop_commands("sh ./convert.sh -c %f", &files(&["/x"]));
         assert_eq!(cmds, vec![argv(&["sh", "./convert.sh", "-c", "/x"])]);
+        let cmds = desktop_commands("cp %f /mnt/My\\ Backup/%f.bak", &files(&["/x"]));
+        assert_eq!(cmds, vec![argv(&["cp", "/x", "/mnt/My Backup//x.bak"])]);
+        let cmds = desktop_commands("sh -e %f", &files(&["/d/x.sh"]));
+        assert_eq!(cmds, vec![argv(&["sh", "-e", "/d/x.sh"])]);
     }
 
     /// The bundled actions: an `sh -c '…'` script, `%` in it kept.

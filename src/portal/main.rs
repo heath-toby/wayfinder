@@ -174,8 +174,7 @@ fn free_name(
         return first;
     }
     // (Not forever: if every number is "taken" — the folder can't be looked
-    // in, or holds them all — numbers from the time, checked as any; the
-    // name found taken only if even those are.)
+    // in, or holds them all — numbers from the time, checked as any.)
     (2..1000)
         .map(|n| dir.join(wayfinder::file_ops::numbered_name(name, n)))
         .chain((0..3).map(|k| {
@@ -187,7 +186,17 @@ fn free_name(
             dir.join(wayfinder::file_ops::numbered_name(name, n))
         }))
         .find(|p| !taken(p))
-        .unwrap_or(first)
+        // Never the name found taken (an existing file would be written
+        // over): the last tried, which a save there will report if it's no
+        // good either.
+        .unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let n = u32::try_from(now % 1_000_000_000).unwrap_or(0) + 1002;
+            dir.join(wayfinder::file_ops::numbered_name(name, n))
+        })
 }
 
 #[cfg(test)]
@@ -208,8 +217,9 @@ mod tests {
         };
         let got = free_name(dir, "scan.pdf", numbered);
         assert!(!numbered(&got), "{got:?}");
-        // Every name taken (a folder that can't be looked in): the first.
-        assert_eq!(free_name(dir, "scan.pdf", |_| true), dir.join("scan.pdf"));
+        // Every name taken (a folder that can't be looked in): never the
+        // one there already.
+        assert_ne!(free_name(dir, "scan.pdf", |_| true), dir.join("scan.pdf"));
     }
 
     /// An app can't save outside the folder chosen.
