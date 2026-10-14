@@ -472,10 +472,18 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let size = if meta.is_dir() { 0 } else { meta.len() };
 
     let dest = cache_path_for(&entry.original_path);
-    if mtime == entry.last_synced_mtime && size == entry.last_synced_size && !entry.is_directory {
+    if mtime == entry.last_synced_mtime
+        && size == entry.last_synced_size
+        && !entry.is_directory
+        && dest.symlink_metadata().is_ok()
+    {
         // Unchanged: nothing to do. A copy without a record gets one, if
         // it's as fetched (if not, it's the user's edit: left alone).
-        record_if_unchanged(&dest, &meta);
+        update_manifest(|manifest| {
+            if manifest.contains_key(&entry.original_path) {
+                record_if_unchanged(&dest, &meta);
+            }
+        })?;
         return Ok(false);
     }
     let record = load_record()?;
@@ -533,7 +541,10 @@ pub fn sync_all() -> (usize, usize) {
     }
     // The test builds' list of kept items has done its job once every copy
     // is recorded.
-    if let (false, Ok(record)) = (manifest.is_empty(), load_record()) {
+    if manifest.is_empty() {
+        return (updated, errors);
+    }
+    if let Ok(record) = load_record() {
         if manifest
             .keys()
             .all(|p| record.pins.contains(&cache_path_for(p)))
@@ -735,6 +746,11 @@ fn merge_record(record: &mut Record, root: &Path, fetched: Base, complete: bool)
     }
 }
 
+/// Whether a copy is the remote's file as it is now (by size and date).
+fn same_as_remote(copy: &std::fs::Metadata, remote: &std::fs::Metadata) -> bool {
+    copy.len() == remote.len() && mtime_secs(copy) == mtime_secs(remote)
+}
+
 /// Record the single-file copy `dest` as fetched if it isn't recorded yet
 /// and matches the remote's file (`src_meta`).
 fn record_if_unchanged(dest: &Path, src_meta: &std::fs::Metadata) {
@@ -747,7 +763,7 @@ fn record_if_unchanged(dest: &Path, src_meta: &std::fs::Metadata) {
     let Ok(meta) = dest.symlink_metadata() else {
         return;
     };
-    if meta.is_file() && meta.len() == src_meta.len() && mtime_secs(&meta) == mtime_secs(src_meta) {
+    if meta.is_file() && same_as_remote(&meta, src_meta) {
         let _ = update_record(dest, [(dest.to_path_buf(), stamp(&meta))].into(), true);
     }
 }
@@ -972,7 +988,7 @@ fn sync_file(
             }
             std::fs::remove_dir_all(dst).map_err(|e| e.to_string())?;
         } else {
-            if dst_meta.len() == src_meta.len() && mtime_secs(&dst_meta) == mtime_secs(src_meta) {
+            if same_as_remote(&dst_meta, src_meta) {
                 r.fetched(dst, &dst_meta);
                 return Ok(false);
             }
@@ -1070,7 +1086,8 @@ fn remote_child(remote: &str, name: &str) -> String {
 mod tests {
     use super::{
         check_downloaded, format_record, is_leftover_part, merge_record, parse_record,
-        paths_overlap, sync_dir, sync_file, walk_stamps, Base, Record, Refresh, Stamp,
+        paths_overlap, same_as_remote, sync_dir, sync_file, walk_stamps, Base, Record, Refresh,
+        Stamp,
     };
     use std::collections::HashSet;
     use std::path::Path;
@@ -1204,6 +1221,24 @@ mod tests {
             base = r.new_base;
             assert_eq!(std::fs::read_to_string(&dst).unwrap(), "mine");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_copy_is_the_remotes_only_if_size_and_date_match() {
+        let d = dir("same");
+        let (a, b) = (d.join("a"), d.join("b"));
+        std::fs::write(&a, "same").unwrap();
+        std::fs::write(&b, "same").unwrap();
+        set_mtime(&a, 3600);
+        set_mtime(&b, 3600);
+        let meta = |p: &Path| std::fs::metadata(p).unwrap();
+        assert!(same_as_remote(&meta(&a), &meta(&b)));
+        set_mtime(&b, 60);
+        assert!(!same_as_remote(&meta(&a), &meta(&b)));
+        std::fs::write(&b, "longer").unwrap();
+        set_mtime(&b, 3600);
+        assert!(!same_as_remote(&meta(&a), &meta(&b)));
         let _ = std::fs::remove_dir_all(&d);
     }
 
