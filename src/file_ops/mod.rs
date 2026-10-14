@@ -1286,7 +1286,7 @@ fn clear_before_replace(src: gio::FileType, dst: gio::FileType, is_move: bool) -
 }
 
 /// Whether renaming `old` to `new` changes only the case of its letters.
-fn is_case_only_change(old: &str, new: &str) -> bool {
+pub fn is_case_only_change(old: &str, new: &str) -> bool {
     old != new && old.to_lowercase() == new.to_lowercase()
 }
 

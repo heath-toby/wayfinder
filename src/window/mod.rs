@@ -3626,6 +3626,28 @@ fn landing_paths(sources: &[String], dest_dir: &str) -> Vec<String> {
 /// but on a case-sensitive one it's another file, so compare identities.
 fn rename_clash(old: &str, new: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
+    // Only the case changing: taken only if the folder holds something
+    // spelled exactly so (on a drive that ignores case the old name
+    // answers to the new one, perhaps by another inode number).
+    let (old_path, new_path) = (std::path::Path::new(old), std::path::Path::new(new));
+    if let (Some(old_name), Some(new_name), Some(dir)) = (
+        old_path.file_name(),
+        new_path.file_name(),
+        new_path.parent(),
+    ) {
+        if old_path.parent() == Some(dir)
+            && wayfinder::file_ops::is_case_only_change(
+                &old_name.to_string_lossy(),
+                &new_name.to_string_lossy(),
+            )
+        {
+            return std::fs::read_dir(dir)
+                .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+                .map_or(true, |entries| {
+                    entries.iter().any(|e| e.file_name() == new_name)
+                });
+        }
+    }
     let Ok(new_meta) = std::fs::symlink_metadata(new) else {
         return false;
     };
@@ -3741,7 +3763,9 @@ fn special_uri_root(uri: &str) -> &str {
 /// sync folder's working copy), the drive's folder it's a copy of — the
 /// place the user knows; anything else as itself.
 pub(crate) fn bookmark_target(current: &str) -> String {
+    // (The store of copies itself is no drive's folder: as itself.)
     wayfinder::offline::original_of_copy(std::path::Path::new(current))
+        .filter(|original| original != "/")
         .unwrap_or_else(|| current.to_string())
 }
 
@@ -3767,6 +3791,24 @@ fn stem_chars(name: &str, is_dir: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_rename_clashes_only_with_another_file() {
+        let d = std::env::temp_dir().join(format!("wayfinder-rclash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("foo"), "").unwrap();
+        let p = |n: &str| d.join(n).to_string_lossy().to_string();
+        // Only the case: nothing else spelled so.
+        let case_only = super::rename_clash(&p("foo"), &p("Foo"));
+        std::fs::write(d.join("Foo"), "").unwrap();
+        let over_other = super::rename_clash(&p("foo"), &p("Foo"));
+        let free = super::rename_clash(&p("foo"), &p("bar"));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!case_only);
+        assert!(over_other);
+        assert!(!free);
+    }
+
+    #[test]
     fn bookmarks_in_the_offline_copies_are_of_the_folders_they_copy() {
         let copy = wayfinder::offline::cache_root().join("home/u/Drive/Docs/Sub");
         assert_eq!(
@@ -3774,6 +3816,10 @@ mod tests {
             "/home/u/Drive/Docs/Sub"
         );
         assert_eq!(super::bookmark_target("/home/u/Work"), "/home/u/Work");
+        let root = wayfinder::offline::cache_root()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(super::bookmark_target(&root), root);
     }
 
     #[test]
