@@ -768,6 +768,15 @@ impl WayfinderWindow {
         // If the file is executable, run it directly instead of opening
         // it with a text editor (which is GIO's default for scripts).
         if is_executable_file(&path) {
+            // Its folder gone meanwhile: say so (it can't be run there, nor
+            // opened).
+            if let Some(dir) = std::path::Path::new(&path).parent().filter(|d| !d.is_dir()) {
+                self.announce(
+                    &format!("{} is no longer there", dir.display()),
+                    AccessibleAnnouncementPriority::High,
+                );
+                return;
+            }
             match self.execute_file(&path, &file.name()) {
                 Ok(()) => return,
                 Err(e) => {
@@ -795,13 +804,10 @@ impl WayfinderWindow {
     fn execute_file(&self, path: &str, name: &str) -> Result<(), String> {
         let is_text = is_text_executable(path);
         // It runs in its own folder (a script's `./configure` works). (A
-        // local one: files on mounts are opened, not run.) Gone meanwhile:
-        // said as that, not as a missing terminal.
-        let dir = parent_dir(path).unwrap_or_else(|| "/".to_string());
-        let dir = std::path::Path::new(&dir);
-        if !dir.is_dir() {
-            return Err(format!("{} is no longer there", dir.display()));
-        }
+        // local one: files on mounts are opened, not run.)
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("/"));
 
         if is_text {
             // Text script — run in a terminal so output is visible
@@ -814,12 +820,16 @@ impl WayfinderWindow {
             ];
             // Wrap the script in a shell that keeps the terminal open after
             // the script exits so output stays visible.
+            // The shell goes to its folder (a terminal set to start in one
+            // of its own would ignore one it was started in), and doesn't
+            // run it anywhere else.
             let wrapped = format!(
-                "{} ; echo ; echo \"[Press Enter to close]\" ; read",
+                "cd -- {} && {} ; echo ; echo \"[Press Enter to close]\" ; read",
+                shell_quote(&dir.to_string_lossy()),
                 shell_quote(path)
             );
             let tail = ["sh", "-c", wrapped.as_str()];
-            spawn_first(terminals, &tail, Some(dir))?;
+            spawn_first(terminals, &tail)?;
             self.announce(
                 &format!("Running {name} in terminal"),
                 AccessibleAnnouncementPriority::Medium,
@@ -2859,7 +2869,7 @@ impl WayfinderWindow {
 
         // (The folder given to the terminal, which goes there itself: it
         // may be on a slow mount.)
-        match spawn_first(terminals, &[path.as_str()], None) {
+        match spawn_first(terminals, &[path.as_str()]) {
             Ok(()) => self.announce(
                 &format!("Opened terminal in {path}"),
                 AccessibleAnnouncementPriority::Medium,
@@ -3623,20 +3633,14 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 /// Start the first of `programs` (name, its arguments) that's installed,
 /// with `tail` after its arguments. Each is tried in turn: one that isn't
 /// there, or can't be run, fails to start (no `which` waited for first).
-/// `dir`: the folder it runs in (a local one: this waits for it).
-fn spawn_first(
-    programs: &[(&str, &[&str])],
-    tail: &[&str],
-    dir: Option<&std::path::Path>,
-) -> Result<(), String> {
+fn spawn_first(programs: &[(&str, &[&str])], tail: &[&str]) -> Result<(), String> {
     let mut refused = None;
     for (cmd, args) in programs {
-        let mut command = std::process::Command::new(cmd);
-        command.args(*args).args(tail);
-        if let Some(dir) = dir {
-            command.current_dir(dir);
-        }
-        match command.spawn() {
+        match std::process::Command::new(cmd)
+            .args(*args)
+            .args(tail)
+            .spawn()
+        {
             Ok(child) => {
                 reap(child);
                 return Ok(());
