@@ -329,13 +329,13 @@ pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
             .iter()
             .any(|p| paths_overlap(Path::new(p), Path::new(original_path)))
     };
+    // Marked first: a refresh starting meanwhile sees it and stops (each
+    // sees the other).
+    let _unpinning = Unpinning::new(original_path);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
     while refreshing() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    // Marked, then checked again: a refresh starting meanwhile marks
-    // itself, then sees this (each sees the other).
-    let _unpinning = Unpinning::new(original_path);
     if refreshing() {
         return Err("it's being refreshed right now; try again in a moment".to_string());
     }

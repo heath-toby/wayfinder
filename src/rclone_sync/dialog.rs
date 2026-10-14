@@ -366,6 +366,16 @@ pub fn show_dialog(
 /// Run a sync via the shared `rclone_ops::progress::show` dialog. Builds
 /// bisync args from the configured pair, dispatches `rclone bisync`, and
 /// reports conflict count in the success announcement.
+/// Whether `path` is in an rclone mountpoint seen before that's now an
+/// empty folder: its drive isn't mounted. (One that holds files now is a
+/// folder the user uses as such.)
+fn in_empty_mountpoint(path: &str) -> bool {
+    crate::offline::known_mountpoints().iter().any(|mp| {
+        (path == mp || path.starts_with(&format!("{mp}/")))
+            && std::fs::read_dir(mp).is_ok_and(|mut entries| entries.next().is_none())
+    })
+}
+
 pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
     let Some(pair) = pair_for(local_path) else {
         parent_window.announce(
@@ -403,7 +413,7 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
         return;
     }
     let on_mount = crate::rclone_ops::is_fuse_path(&sync_local);
-    if !on_mount && crate::offline::path_is_in_known_mountpoint(&sync_local) {
+    if !on_mount && in_empty_mountpoint(&sync_local) {
         parent_window.announce(
             "Refusing to sync: the drive this folder is on isn't mounted.",
             AccessibleAnnouncementPriority::High,
