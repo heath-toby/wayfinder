@@ -68,9 +68,9 @@ fn main() {
                 .and_then(|v| <String>::try_from(v.clone()).ok())
                 .unwrap_or_else(|| {
                     if request.is_save {
-                        "Save".to_string()
+                        "_Save".to_string()
                     } else {
-                        "Open".to_string()
+                        "_Open".to_string()
                     }
                 });
 

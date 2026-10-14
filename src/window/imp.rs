@@ -1174,10 +1174,19 @@ impl WayfinderWindowInner {
                     );
                     window.update_status();
                 } else {
-                    // Start range
+                    // (One already started, from a file no longer listed:
+                    // said, not silently begun again.)
+                    let was_started = sel.range_anchor.is_some();
                     sel.range_anchor = paths.get(pos as usize).cloned();
+                    let msg = match (was_started, sel.range_anchor.is_some()) {
+                        (_, false) => "No file to start a selection from",
+                        (true, true) => {
+                            "The file the selection started on is gone. Selection started here"
+                        }
+                        (false, true) => "Selection started",
+                    };
                     drop(sel);
-                    window.announce("Selection started", AccessibleAnnouncementPriority::Medium);
+                    window.announce(msg, AccessibleAnnouncementPriority::Medium);
                 }
                 glib::Propagation::Stop
             } else if key == gdk::Key::a && mods.contains(gdk::ModifierType::CONTROL_MASK) {
@@ -1384,9 +1393,19 @@ impl WayfinderWindowInner {
                     );
                     window.update_status();
                 } else {
+                    // (One already started, from a file no longer listed:
+                    // said, not silently begun again.)
+                    let was_started = sel.range_anchor.is_some();
                     sel.range_anchor = paths.get(pos as usize).cloned();
+                    let msg = match (was_started, sel.range_anchor.is_some()) {
+                        (_, false) => "No file to start a selection from",
+                        (true, true) => {
+                            "The file the selection started on is gone. Selection started here"
+                        }
+                        (false, true) => "Selection started",
+                    };
                     drop(sel);
-                    window.announce("Selection started", AccessibleAnnouncementPriority::Medium);
+                    window.announce(msg, AccessibleAnnouncementPriority::Medium);
                 }
                 glib::Propagation::Stop
             } else if key == gdk::Key::a && mods.contains(gdk::ModifierType::CONTROL_MASK) {

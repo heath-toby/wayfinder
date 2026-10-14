@@ -151,6 +151,12 @@ pub fn load_manifest() -> HashMap<String, PinnedEntry> {
 }
 
 fn parse_manifest(contents: &str) -> HashMap<String, PinnedEntry> {
+    // (Paths written by 2.5.0 are as they are: only read as escaped from a
+    // manifest that says it's so.)
+    let escaped = contents
+        .lines()
+        .next()
+        .is_some_and(|l| l.starts_with('#') && l.contains(ESCAPED_MARK));
     let mut out = HashMap::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -162,7 +168,11 @@ fn parse_manifest(contents: &str) -> HashMap<String, PinnedEntry> {
         if parts.len() < 4 {
             continue;
         }
-        let original_path = unescape_field(parts[0]);
+        let original_path = if escaped {
+            unescape_field(parts[0])
+        } else {
+            parts[0].to_string()
+        };
         let is_directory = parts[1] == "1" || parts[1].eq_ignore_ascii_case("true");
         let last_synced_mtime: i64 = parts[2].parse().unwrap_or(0);
         let last_synced_size: u64 = parts[3].parse().unwrap_or(0);
@@ -178,6 +188,9 @@ fn parse_manifest(contents: &str) -> HashMap<String, PinnedEntry> {
     }
     out
 }
+
+/// In the manifest's first line: its paths are escaped (`escape_field`).
+const ESCAPED_MARK: &str = "paths escaped";
 
 /// A path as a manifest field: `\`, tab and newline escaped (a name may
 /// hold them; unescaped, the line would split wrongly).
@@ -215,8 +228,8 @@ fn save_manifest(manifest: &HashMap<String, PinnedEntry>) -> Result<(), String> 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut contents = String::from(
-        "# Wayfinder offline pins — tab-separated: path<TAB>is_directory<TAB>mtime<TAB>size\n",
+    let mut contents = format!(
+        "# Wayfinder offline pins ({ESCAPED_MARK}) — tab-separated: path<TAB>is_directory<TAB>mtime<TAB>size\n",
     );
     let mut entries: Vec<&PinnedEntry> = manifest.values().collect();
     entries.sort_by(|a, b| a.original_path.cmp(&b.original_path));
@@ -1170,6 +1183,13 @@ mod tests {
         let path = "/m/Docs/a\tb\nc\\d.txt";
         assert_eq!(super::unescape_field(&super::escape_field(path)), path);
         assert!(!super::escape_field(path).contains('\t'));
+    }
+
+    /// A 2.5.0 manifest (paths as they are) is read as written.
+    #[test]
+    fn old_manifests_are_read_unescaped() {
+        let old = "# Wayfinder offline pins — tab-separated: path<TAB>is_directory<TAB>mtime<TAB>size\n/d/C:\\new.txt\t0\t1\t2\n";
+        assert!(super::parse_manifest(old).contains_key("/d/C:\\new.txt"));
     }
 
     #[test]

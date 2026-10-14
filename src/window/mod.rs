@@ -1452,7 +1452,6 @@ impl WayfinderWindow {
             // Replace or Rename, and copies links.
             let landing = landing_paths(&plan.source_paths, &plan.dest_dir);
             let sources = plan.source_paths.clone();
-            let dest_dir = plan.dest_dir.clone();
             self.run_blocking(
                 &plan.dest_dir.clone(),
                 move || {
@@ -1462,9 +1461,6 @@ impl WayfinderWindow {
                     landing.iter().any(|p| {
                         !wayfinder::file_ops::name_free(std::path::Path::new(p)).unwrap_or(false)
                     }) || has_duplicate(&landing)
-                        // (Also by another case: a remote that ignores it —
-                        // OneDrive, say — takes Report and report for one.)
-                        || name_taken_in_any_case(&dest_dir, &landing)
                         || sources.iter().any(|p| {
                             !wayfinder::rclone_ops::is_fuse_path(p)
                                 && holds_link(std::path::Path::new(p))
@@ -3633,28 +3629,10 @@ fn is_plain_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
-/// Whether two of `paths` are one name — in any case (a remote may take
-/// Report and report for one).
+/// Whether any path appears twice.
 fn has_duplicate(paths: &[String]) -> bool {
     let mut seen = std::collections::HashSet::new();
-    paths.iter().any(|p| !seen.insert(p.to_lowercase()))
-}
-
-/// Whether something in `dir` has one of `paths`' names, in any case (or
-/// `dir` can't be looked in: then it may).
-fn name_taken_in_any_case(dir: &str, paths: &[String]) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return true;
-    };
-    let here: std::collections::HashSet<String> = entries
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_lowercase())
-        .collect();
-    paths.iter().any(|p| {
-        std::path::Path::new(p)
-            .file_name()
-            .is_some_and(|n| here.contains(&n.to_string_lossy().to_lowercase()))
-    })
+    paths.iter().any(|p| !seen.insert(p))
 }
 
 /// Whether `path` is a link, or a folder with one somewhere inside — or
@@ -3767,10 +3745,9 @@ fn rename_check(old: &str, new: &str) -> Result<bool, String> {
 
 /// The new name given to more than one file, if any, in rename `pairs`.
 fn duplicate_target(pairs: &[(String, String)]) -> Option<String> {
-    // (In any case: a remote may take Report and report for one.)
     let mut seen = std::collections::HashSet::new();
     pairs.iter().find_map(|(_, new)| {
-        (!seen.insert(new.to_lowercase())).then(|| {
+        (!seen.insert(new.as_str())).then(|| {
             std::path::Path::new(new)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -3909,28 +3886,6 @@ fn stem_chars(name: &str, is_dir: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn names_differing_only_in_case_are_one_for_a_paste_or_rename() {
-        assert!(super::has_duplicate(&[
-            "/d/Report.txt".into(),
-            "/d/report.txt".into()
-        ]));
-        let pairs = vec![
-            ("/d/aReport.txt".to_string(), "/d/Report.txt".to_string()),
-            ("/d/areport.txt".to_string(), "/d/report.txt".to_string()),
-        ];
-        assert!(super::duplicate_target(&pairs).is_some());
-        let d = std::env::temp_dir().join(format!("wayfinder-anycase-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("Report.txt"), "").unwrap();
-        let dir = d.to_string_lossy().to_string();
-        let taken = super::name_taken_in_any_case(&dir, &[format!("{dir}/report.txt")]);
-        let free = super::name_taken_in_any_case(&dir, &[format!("{dir}/other.txt")]);
-        let _ = std::fs::remove_dir_all(&d);
-        assert!(taken && !free);
-    }
-
     #[test]
     fn a_rename_clashes_only_with_another_file() {
         let d = std::env::temp_dir().join(format!("wayfinder-rclash-{}", std::process::id()));

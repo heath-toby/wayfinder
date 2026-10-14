@@ -88,10 +88,13 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     // (This user's mounts only: another's — a system service's — names
     // remotes in another config, which this user's rclone would read as
     // its own.)
-    use std::os::unix::fs::MetadataExt;
-    let uid = std::fs::metadata("/proc/self")
-        .map(|m| m.uid())
-        .unwrap_or(0);
+    // (Not known: none, rather than root's.)
+    let Some(uid) = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| effective_uid(&s))
+    else {
+        return Vec::new();
+    };
     let found = match Command::new("ps")
         .args(["-o", "args=", "-u"])
         .arg(uid.to_string())
@@ -105,6 +108,17 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     };
     *last = Some((std::time::Instant::now(), fuse_mounts, found.clone()));
     found
+}
+
+/// The effective user id in `/proc/self/status` text.
+fn effective_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 /// `path` with its links resolved, one part at a time, never touching a
@@ -624,7 +638,11 @@ pub fn current_rclone_fuse_mountpoints() -> Vec<String> {
 /// Return the fstype string from `/proc/mounts` for the longest mountpoint
 /// containing `path`, or `None` if no mountpoint matches.
 fn fstype_for_path(path: &str) -> Option<String> {
-    let contents = std::fs::read_to_string("/proc/mounts").ok()?;
+    fstype_in(&std::fs::read_to_string("/proc/mounts").ok()?, path)
+}
+
+/// The type of the mount `path` is on, by the mount table `contents`.
+fn fstype_in(contents: &str, path: &str) -> Option<String> {
     let mut best_len = 0;
     let mut best_fstype: Option<String> = None;
     for line in contents.lines() {
@@ -634,7 +652,8 @@ fn fstype_for_path(path: &str) -> Option<String> {
         }
         let mountpoint = decode_mount_path(parts[1]);
         let fstype = parts[2];
-        let is_prefix = path == mountpoint || path.starts_with(&format!("{mountpoint}/"));
+        // (By whole parts: `/a/bc` isn't in `/a/b`; everything is in `/`.)
+        let is_prefix = Path::new(path).starts_with(&mountpoint);
         // (`>=`: of two at one place, the one listed later is on top — an
         // automount's real mount over its autofs stand-in.)
         if is_prefix && mountpoint.len() >= best_len {
@@ -663,7 +682,9 @@ fn fit_steps(steps: Vec<(String, Vec<String>)>, sources: &[String]) -> Vec<(Stri
         .zip(sources)
         .flat_map(|((label, args), src)| {
             let args = fit_to_kind(args, src);
-            let make = (args.first().map(String::as_str) == Some("copy"))
+            // (An empty folder copied or moved would otherwise not be
+            // made at all — and a move's source then removed.)
+            let make = matches!(args.first().map(String::as_str), Some("copy" | "move"))
                 .then(|| args.get(2).cloned())
                 .flatten()
                 .map(|dst| (format!("Making {dst}"), vec!["mkdir".to_string(), dst]));
@@ -1380,5 +1401,48 @@ mod fit_tests {
         assert!(moved_dir.iter().any(|a| a == "--delete-empty-src-dirs"));
         assert_eq!(copied_file[0], "copyto");
         assert!(!copied_file.iter().any(|a| a.contains("empty-src-dirs")));
+    }
+
+    /// A folder copied or moved is made first (rclone makes none for an
+    /// empty one); a file isn't.
+    #[test]
+    fn folders_are_made_before_rclone_fills_them() {
+        let d = std::env::temp_dir().join(format!("wayfinder-steps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("dir")).unwrap();
+        std::fs::write(d.join("file"), "").unwrap();
+        let dir = d.join("dir").to_string_lossy().to_string();
+        let file = d.join("file").to_string_lossy().to_string();
+        let steps = super::fit_steps(
+            vec![
+                ("m".into(), moveto_args("a:x", "a:y")),
+                ("c".into(), copyto_args("a:x", "a:z")),
+                ("f".into(), copyto_args("a:f", "a:g")),
+            ],
+            &[dir.clone(), dir, file],
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        let verbs: Vec<&str> = steps.iter().map(|(_, a)| a[0].as_str()).collect();
+        assert_eq!(verbs, ["mkdir", "move", "mkdir", "copy", "copyto"]);
+        assert_eq!(steps[0].1[1], "a:y");
+    }
+
+    /// Of two mounts at one place, the later (an automount over its
+    /// autofs stand-in) is the one in use.
+    #[test]
+    fn the_mount_on_top_gives_the_type() {
+        let mounts = "systemd-1 /mnt/d autofs rw 0 0\nr:x /mnt/d fuse.rclone rw 0 0\n/dev/sda1 / ext4 rw 0 0\n";
+        assert_eq!(
+            super::fstype_in(mounts, "/mnt/d/f").as_deref(),
+            Some("fuse.rclone")
+        );
+        assert_eq!(super::fstype_in(mounts, "/home").as_deref(), Some("ext4"));
+    }
+
+    #[test]
+    fn the_effective_user_is_read() {
+        let status = "Name:\tx\nUid:\t1000\t1001\t1000\t1000\nGid:\t1\n";
+        assert_eq!(super::effective_uid(status), Some(1001));
+        assert_eq!(super::effective_uid("Name:\tx\n"), None);
     }
 }
