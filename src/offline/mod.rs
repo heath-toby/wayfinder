@@ -341,6 +341,35 @@ pub fn is_unpinning(original_path: &str) -> bool {
         .any(|p| paths_overlap(Path::new(p), Path::new(original_path)))
 }
 
+/// Pins being downloaded right now (not recorded until done).
+static PINNING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Marks a path as being pinned while alive.
+pub struct Pinning(String);
+
+/// Start pinning `original_path`: `None` if it, or a folder in or around
+/// it, is already being downloaded (two downloads into one copy).
+pub fn start_pinning(original_path: &str) -> Option<Pinning> {
+    let mut list = PINNING.lock().unwrap_or_else(|e| e.into_inner());
+    if list
+        .iter()
+        .any(|p| paths_overlap(Path::new(p), Path::new(original_path)))
+    {
+        return None;
+    }
+    list.push(original_path.to_string());
+    Some(Pinning(original_path.to_string()))
+}
+
+impl Drop for Pinning {
+    fn drop(&mut self) {
+        let mut list = PINNING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = list.iter().position(|p| *p == self.0) {
+            list.swap_remove(i);
+        }
+    }
+}
+
 /// Pins being refreshed right now.
 static REFRESHING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 

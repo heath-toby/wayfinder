@@ -327,6 +327,16 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                             w.announce(msg, gtk::AccessibleAnnouncementPriority::Medium);
                             return;
                         }
+                        // (Pressed again while downloading: not a second
+                        // download into the same copy. Held until the pin is
+                        // recorded, or the download given up.)
+                        let Some(pinning) = wayfinder::offline::start_pinning(&p) else {
+                            w.announce(
+                                "Already being downloaded for offline use",
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            );
+                            return;
+                        };
                         let parent_window: gtk::Window = w.clone().upcast();
                         let pin_path_str = p.clone();
                         let w_done = w.clone();
@@ -335,6 +345,7 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                                 // A cancelled or failed download isn't a pin
                                 // (the progress dialog has said what happened).
                                 if !downloaded {
+                                    drop(pinning);
                                     return;
                                 }
                                 // Recording the pin stats the original on the mount.
@@ -342,15 +353,18 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                                 w_done.run_blocking(
                                     &pin_path_str,
                                     move || wayfinder::offline::record_pin(&path),
-                                    |w, result| match result {
-                                        Ok(()) => w.announce(
-                                            "Available offline",
-                                            gtk::AccessibleAnnouncementPriority::Medium,
-                                        ),
-                                        Err(e) => w.announce(
-                                            &format!("Not available offline: {e}"),
-                                            gtk::AccessibleAnnouncementPriority::High,
-                                        ),
+                                    move |w, result| {
+                                        drop(pinning);
+                                        match result {
+                                            Ok(()) => w.announce(
+                                                "Available offline",
+                                                gtk::AccessibleAnnouncementPriority::Medium,
+                                            ),
+                                            Err(e) => w.announce(
+                                                &format!("Not available offline: {e}"),
+                                                gtk::AccessibleAnnouncementPriority::High,
+                                            ),
+                                        }
                                     },
                                 );
                             }));

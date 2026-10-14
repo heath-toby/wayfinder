@@ -36,17 +36,7 @@ pub fn rclone_for_path(local_path: &str) -> Option<RcloneTarget> {
         return None;
     }
     let mounts = list_rclone_fuse_mounts();
-    let mut best: Option<&(String, String)> = None;
-    let mut best_len = 0;
-    for entry in &mounts {
-        // Match either "<mountpoint>" exactly or "<mountpoint>/..."
-        let is_prefix = local_path == entry.0 || local_path.starts_with(&format!("{}/", entry.0));
-        if is_prefix && entry.0.len() > best_len {
-            best_len = entry.0.len();
-            best = Some(entry);
-        }
-    }
-    let (mountpoint, remote_root) = best?;
+    let (mountpoint, remote_root) = mount_for(local_path, &mounts, &fuse_mountpoints())?;
 
     let rel = local_path.strip_prefix(mountpoint.as_str())?;
     let rel = rel.trim_start_matches('/').to_string();
@@ -62,6 +52,24 @@ pub fn rclone_for_path(local_path: &str) -> Option<RcloneTarget> {
     Some(RcloneTarget {
         full_remote_spec: full,
     })
+}
+
+/// Of the rclone `mounts` (mountpoint, remote) known, the one `path` is on
+/// — only if it's the innermost FUSE mount holding it (of `fuse`): one
+/// inside it that couldn't be named (started with `--config`, say) isn't
+/// the outer mount's remote, and acting there would hit the wrong files.
+fn mount_for<'a>(
+    path: &str,
+    mounts: &'a [(String, String)],
+    fuse: &[String],
+) -> Option<&'a (String, String)> {
+    let holds = |m: &str| path == m || path.starts_with(&format!("{m}/"));
+    let best = mounts
+        .iter()
+        .filter(|(m, _)| holds(m))
+        .max_by_key(|(m, _)| m.len())?;
+    let innermost = fuse.iter().filter(|m| holds(m)).map(|m| m.len()).max();
+    (innermost.unwrap_or(0) <= best.0.len()).then_some(best)
 }
 
 /// Return a list of (mountpoint, remote_root) pairs for currently-running
@@ -1451,6 +1459,19 @@ mod fit_tests {
             Some("fuse.rclone")
         );
         assert_eq!(super::fstype_in(mounts, "/home"), None);
+    }
+
+    /// An rclone mount inside another, not named (unparsed): the outer
+    /// one's remote isn't used for it.
+    #[test]
+    fn an_unnamed_inner_mount_isnt_the_outer_remote() {
+        let mounts = vec![("/h/Proton".to_string(), "Proton:".to_string())];
+        let fuse = vec!["/h/Proton".to_string(), "/h/Proton/Work".to_string()];
+        assert!(super::mount_for("/h/Proton/Work/r", &mounts, &fuse).is_none());
+        assert_eq!(
+            super::mount_for("/h/Proton/Docs", &mounts, &fuse).map(|m| m.1.as_str()),
+            Some("Proton:")
+        );
     }
 
     #[test]

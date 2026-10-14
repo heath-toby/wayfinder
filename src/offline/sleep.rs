@@ -80,9 +80,20 @@ fn wait_child() -> std::io::Result<std::process::ExitStatus> {
             let Some(child) = slot.as_mut() else {
                 return Err(std::io::Error::other("download child went missing"));
             };
-            if let Some(status) = child.try_wait()? {
-                slot.take();
-                return Ok(status);
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    slot.take();
+                    return Ok(status);
+                }
+                Ok(None) => {}
+                // Can't be waited on: stopped, not left running untracked.
+                Err(e) => {
+                    if let Some(mut child) = slot.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return Err(e);
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -121,6 +132,9 @@ pub(super) fn ensure_watching() {
             if let Err(e) = rt.block_on(watch()) {
                 log::warn!("Sleep watcher stopped: {e}");
             }
+            // (Stopped while paused — the bus gone before the wake-up came:
+            // not paused for good.)
+            resume();
         });
     });
 }

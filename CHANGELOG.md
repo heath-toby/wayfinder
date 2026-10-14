@@ -177,6 +177,9 @@
 - **Delete pressed again** while a file is still going to the Bin (on a slow drive) says so, instead of nothing; Shift+Delete leaves such a file alone instead of deleting it at the same time.
 - **Open Terminal Here in the offline copy** is refused, as other changes there are.
 - **Compress** — Enter in the archive name creates it, as in the Rename and New Folder dialogs.
+- **An rclone mount inside another** — when the inner one can't be identified (started with `--config`, say), Wayfinder no longer acts on its files through the outer mount's remote, where a delete would have removed a different folder.
+- **Keep Available Offline pressed again** while it's downloading — says so, instead of starting a second download into the same copy.
+- **Suspend** — if the system bus goes away while offline copies are paused for sleep, they're no longer paused for the rest of the session; a download that can't be waited on is stopped, not left running.
 
 ### Development
 
