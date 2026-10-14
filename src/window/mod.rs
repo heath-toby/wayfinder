@@ -811,7 +811,8 @@ impl WayfinderWindow {
                 shell_quote(path)
             );
             let tail = ["sh", "-c", wrapped.as_str()];
-            spawn_first(terminals, &tail)?;
+            // In the script's own folder (a `./configure` in it works).
+            spawn_first(terminals, &tail, std::path::Path::new(path).parent())?;
             self.announce(
                 &format!("Running {name} in terminal"),
                 AccessibleAnnouncementPriority::Medium,
@@ -819,7 +820,11 @@ impl WayfinderWindow {
             Ok(())
         } else {
             // Binary executable — spawn directly
-            match std::process::Command::new(path).spawn() {
+            let mut command = std::process::Command::new(path);
+            if let Some(dir) = std::path::Path::new(path).parent() {
+                command.current_dir(dir);
+            }
+            match command.spawn() {
                 Ok(child) => {
                     reap(child);
                     self.announce(
@@ -2847,7 +2852,11 @@ impl WayfinderWindow {
             ("konsole", &["--workdir"]),
         ];
 
-        match spawn_first(terminals, &[path.as_str()]) {
+        match spawn_first(
+            terminals,
+            &[path.as_str()],
+            Some(std::path::Path::new(&path)),
+        ) {
             Ok(()) => self.announce(
                 &format!("Opened terminal in {path}"),
                 AccessibleAnnouncementPriority::Medium,
@@ -3611,29 +3620,33 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 /// Start the first of `programs` (name, its arguments) that's installed,
 /// with `tail` after its arguments. Each is tried in turn: one that isn't
 /// there, or can't be run, fails to start (no `which` waited for first).
-fn spawn_first(programs: &[(&str, &[&str])], tail: &[&str]) -> Result<(), String> {
+/// `dir`: the folder it runs in.
+fn spawn_first(
+    programs: &[(&str, &[&str])],
+    tail: &[&str],
+    dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let mut refused = None;
     for (cmd, args) in programs {
-        match std::process::Command::new(cmd)
-            .args(*args)
-            .args(tail)
-            .spawn()
-        {
+        let mut command = std::process::Command::new(cmd);
+        command.args(*args).args(tail);
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        match command.spawn() {
             Ok(child) => {
                 reap(child);
                 return Ok(());
             }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                continue
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // There but not allowed to run: said if no other one starts.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                refused.get_or_insert(format!("Couldn't start {cmd}: {e}"));
             }
             Err(e) => return Err(format!("Couldn't start {cmd}: {e}")),
         }
     }
-    Err("No terminal emulator found".to_string())
+    Err(refused.unwrap_or_else(|| "No terminal emulator found".to_string()))
 }
 
 /// Have the main loop collect `child` when it exits, or it lingers as a

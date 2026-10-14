@@ -6,15 +6,43 @@ use std::path::PathBuf;
 /// own (two saves at once mustn't share one), then renamed into place,
 /// creating the folder if need be. A reader never sees it half written.
 pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    // Through a link (to a dotfiles folder, say) to the file it leads to,
+    // even one not there yet: the link stays. If that can't be written (a
+    // read-only store), the link is replaced, as any file would be.
+    let target = link_target(path);
+    if target != path {
+        if let Ok(()) = write_whole(&target, contents) {
+            return Ok(());
+        }
+    }
+    write_whole(path, contents)
+}
+
+/// Where `path` leads, following links (to a file that may not exist).
+fn link_target(path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = path.to_path_buf();
+    // (A few hops at most: a loop of links leads nowhere.)
+    for _ in 0..8 {
+        match fs::read_link(&path) {
+            Ok(next) => {
+                path = match path.parent() {
+                    Some(parent) if next.is_relative() => parent.join(next),
+                    _ => next,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    path
+}
+
+fn write_whole(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Through a link (to a dotfiles folder, say), to the file it leads to:
-    // the link stays.
-    let path = &fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let part = path.with_extension(format!("{}-{n}.wayfinder-part", std::process::id()));
     // Made with the file's permissions from the start: a private one is
@@ -69,8 +97,10 @@ fn parse_state(contents: &str) -> HashMap<String, String> {
             // A folder's exactly (its name may end in a space); others as
             // `key = value` may be written by hand.
             let key = key.trim();
+            // (A path starts with `/`: what's before it, and a line end
+            // from another system, isn't part of it.)
             let value = if key == "directory" {
-                value
+                value.trim_start().trim_end_matches('\r')
             } else {
                 value.trim()
             };
@@ -361,6 +391,25 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_settings_file_kept_as_a_link_stays_one() {
+        let d = std::env::temp_dir().join(format!("wayfinder-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("dotfiles")).unwrap();
+        // Leading to a file not there yet, too.
+        std::os::unix::fs::symlink("dotfiles/state", d.join("state")).unwrap();
+        super::write_atomically(&d.join("state"), b"zoom=120").unwrap();
+        assert!(std::fs::symlink_metadata(d.join("state"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(d.join("dotfiles/state")).unwrap(),
+            b"zoom=120"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn saved_files_keep_their_permissions_and_new_ones_follow_the_umask() {
         use std::os::unix::fs::PermissionsExt;
         let d = std::env::temp_dir().join(format!("wayfinder-atomic-{}", std::process::id()));
@@ -385,6 +434,8 @@ mod tests {
         assert_eq!(map["directory"], "/home/u/notes ");
         assert_eq!(map["show_hidden"], "true");
         assert_eq!(map["zoom"], "120");
+        let map = parse_state("directory = /home/u/notes\r\n");
+        assert_eq!(map["directory"], "/home/u/notes");
     }
 
     #[test]

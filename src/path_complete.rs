@@ -131,11 +131,7 @@ fn complete_with(partial: &str, home: Option<&Path>) -> Completion {
             if !name.to_lowercase().starts_with(&prefix_lower) {
                 return None;
             }
-            let full = if dir_str.ends_with('/') || dir_str.is_empty() {
-                format!("{dir_str}{name}")
-            } else {
-                format!("{dir_str}/{name}")
-            };
+            let full = format!("{dir_str}{name}");
             // Add trailing / for directories, and links to them
             let file_type = e.file_type().ok()?;
             let is_dir = file_type.is_dir()
