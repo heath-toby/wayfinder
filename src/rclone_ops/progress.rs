@@ -146,8 +146,26 @@ pub fn show<W>(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let path = format!("/tmp/wayfinder-rclone-{stamp}.log");
-            match std::fs::write(&path, &text) {
+            // In the user's own cache folder, readable by them alone (it
+            // names their files), and never over something already there.
+            let dir = dirs::cache_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join("wayfinder");
+            let path = dir
+                .join(format!("rclone-{stamp}.log"))
+                .to_string_lossy()
+                .to_string();
+            let written = std::fs::create_dir_all(&dir).and_then(|()| {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .and_then(|mut f| f.write_all(text.as_bytes()))
+            });
+            match written {
                 Ok(()) => {
                     let msg = format!("Log saved to {path}");
                     parent_for_save.announce(&msg, AccessibleAnnouncementPriority::Medium);
@@ -238,7 +256,15 @@ pub fn show<W>(
                     let mut iter = log_buffer_clone.end_iter();
                     log_buffer_clone.insert(&mut iter, &line);
                     log_buffer_clone.insert(&mut iter, "\n");
-                    let mark = log_buffer_clone.create_mark(None, &iter, false);
+                    // One mark, moved to the end each time (a new one per
+                    // line would pile up for the whole operation).
+                    let mark = match log_buffer_clone.mark("end") {
+                        Some(mark) => {
+                            log_buffer_clone.move_mark(&mark, &iter);
+                            mark
+                        }
+                        None => log_buffer_clone.create_mark(Some("end"), &iter, false),
+                    };
                     log_view_clone.scroll_to_mark(&mark, 0.0, false, 0.0, 1.0);
                     if let Some(short) = summarise(&line) {
                         status_clone.set_text(&short);

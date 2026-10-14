@@ -261,16 +261,34 @@ pub fn matches_mime(action: &CustomAction, mime_type: &str) -> bool {
     if action.mime_types.is_empty() {
         return true; // no restriction = matches all
     }
-    action.mime_types.iter().any(|pattern| {
+    let matches = |pattern: &str| {
+        // Any type, as file-manager actions write it.
+        if matches!(pattern, "*" | "*/*" | "all/all" | "all/allfiles") {
+            return true;
+        }
         if pattern == mime_type {
             return true;
         }
         // Support wildcard like "application/*"
         if let Some(prefix) = pattern.strip_suffix("/*") {
-            return mime_type.starts_with(prefix);
+            return mime_type.starts_with(&format!("{prefix}/"));
         }
         false
-    })
+    };
+    // `!type`: never for that type.
+    if action
+        .mime_types
+        .iter()
+        .any(|p| p.strip_prefix('!').is_some_and(matches))
+    {
+        return false;
+    }
+    let positive: Vec<&String> = action
+        .mime_types
+        .iter()
+        .filter(|p| !p.starts_with('!'))
+        .collect();
+    positive.is_empty() || positive.iter().any(|p| matches(p))
 }
 
 /// Returns true if this action should show the compress dialog.
@@ -289,10 +307,21 @@ pub fn execute_action(
     let action_name = action.name.clone();
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    if action.is_nautilus_script {
-        execute_nautilus_script(action, files, current_dir, tx);
+    // In Recent Files (or the Bin) the location isn't a folder: run it in
+    // the first file's own.
+    let current_dir = if current_dir.contains("://") {
+        files
+            .first()
+            .and_then(|f| Path::new(f).parent())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string())
     } else {
-        execute_desktop_action(action, files, tx);
+        current_dir.to_string()
+    };
+    if action.is_nautilus_script {
+        execute_nautilus_script(action, files, &current_dir, tx);
+    } else {
+        execute_desktop_action(action, files, &current_dir, tx);
     }
 
     show_action_progress(&action_name, parent, rx);
@@ -588,12 +617,16 @@ fn build_compress_command(ext: &str, archive_name: &str, basenames: &[String]) -
     }
 }
 
+/// Runs in the folder shown (`current_dir`), as file managers do: an
+/// `unzip %f` extracts next to the archive, not wherever Wayfinder started.
 fn execute_desktop_action(
     action: &CustomAction,
     files: &[String],
+    current_dir: &str,
     tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     let commands = desktop_commands(&action.exec, files);
+    let current_dir = current_dir.to_string();
     std::thread::spawn(move || {
         // One command per file for %f/%u, one after another: run at once,
         // extractions into the same folder, or password prompts, would
@@ -603,6 +636,7 @@ fn execute_desktop_action(
             msg = match std::process::Command::new("sh")
                 .arg("-c")
                 .arg(cmd_str)
+                .current_dir(&current_dir)
                 .output()
             {
                 Ok(output) if output.status.success() => Ok(()),
@@ -674,18 +708,6 @@ fn execute_nautilus_script(
     current_dir: &str,
     tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
-    // In Recent Files (or the Bin) the location isn't a folder: run it in
-    // the first file's own.
-    let current_dir = if current_dir.contains("://") {
-        files
-            .first()
-            .and_then(|f| Path::new(f).parent())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/".to_string())
-    } else {
-        current_dir.to_string()
-    };
-    let current_dir = current_dir.as_str();
     let paths = files.join("\n");
     let uris: String = files
         .iter()
@@ -696,8 +718,11 @@ fn execute_nautilus_script(
 
     let exec = action.exec.clone();
     let current_dir = current_dir.to_string();
+    let args = files.to_vec();
     std::thread::spawn(move || {
+        // The files as arguments too, as Nautilus passes them ("$@").
         let result = std::process::Command::new(&exec)
+            .args(&args)
             .env("NAUTILUS_SCRIPT_SELECTED_FILE_PATHS", &paths)
             .env("NAUTILUS_SCRIPT_SELECTED_URIS", &uris)
             .env("NAUTILUS_SCRIPT_CURRENT_URI", &current_uri)
@@ -717,7 +742,26 @@ fn execute_nautilus_script(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_compress_command, desktop_commands};
+    use super::{build_compress_command, desktop_commands, matches_mime, CustomAction};
+
+    #[test]
+    fn mime_patterns_as_file_manager_actions_write_them() {
+        let action = |types: &[&str]| CustomAction {
+            name: "a".into(),
+            exec: "true".into(),
+            mime_types: types.iter().map(|t| t.to_string()).collect(),
+            is_nautilus_script: false,
+        };
+        assert!(matches_mime(&action(&["*/*"]), "text/plain"));
+        assert!(matches_mime(&action(&["all/allfiles"]), "image/png"));
+        assert!(matches_mime(&action(&["image/*"]), "image/png"));
+        assert!(!matches_mime(&action(&["image/*"]), "text/plain"));
+        assert!(!matches_mime(
+            &action(&["*", "!inode/directory"]),
+            "inode/directory"
+        ));
+        assert!(matches_mime(&action(&["!inode/directory"]), "text/plain"));
+    }
 
     fn files(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()

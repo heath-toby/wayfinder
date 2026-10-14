@@ -68,11 +68,11 @@ pub struct DirectoryModel {
     /// a newer one has been applied is stale and dropped.
     next_seq: Rc<Cell<u64>>,
     applied_seq: Rc<Cell<u64>>,
-    /// Files the file monitor has added to or removed from the store.
+    /// Changes the file monitor has made to the store, counted, and by
+    /// path the count at its latest change there: a refresh's listing
+    /// begun before that is older there than the store, and leaves it be.
     monitor_events: Rc<Cell<u64>>,
-    /// Refreshes listed again in a row, for being older than the monitor's
-    /// changes.
-    relists: Rc<Cell<u8>>,
+    monitor_touched: Rc<RefCell<HashMap<String, u64>>>,
     /// True while a navigation is waiting with nothing to show yet.
     loading: Rc<Cell<bool>>,
     /// Called when a background refresh changed the store on its own.
@@ -162,7 +162,7 @@ impl DirectoryModel {
             next_seq: Rc::new(Cell::new(0)),
             applied_seq: Rc::new(Cell::new(0)),
             monitor_events: Rc::new(Cell::new(0)),
-            relists: Rc::new(Cell::new(0)),
+            monitor_touched: Rc::new(RefCell::new(HashMap::new())),
             loading: Rc::new(Cell::new(false)),
             on_background_update: Rc::new(RefCell::new(None)),
             on_background_error: Rc::new(RefCell::new(None)),
@@ -394,6 +394,7 @@ impl DirectoryModel {
         *self.current_path.borrow_mut() = location.to_string();
         self.is_fuse.set(is_fuse);
         *self.monitor.borrow_mut() = None;
+        self.monitor_touched.borrow_mut().clear();
         // Sizes of the folder left behind aren't wanted any more (the new
         // one may be on a mount, or have no folders, and start no job).
         self.size_job
@@ -528,29 +529,6 @@ impl DirectoryModel {
             }
         };
 
-        if apply == Apply::Diff
-            && self.monitor_events.get() != events
-            && listing.path.starts_with('/')
-            && self.relists.get() < 3
-        {
-            // The file monitor added or removed files while this was
-            // listed: applied, it would bring back what was deleted
-            // meanwhile and drop what was made. List again. (A few times
-            // at most: in a folder that never stops changing, the last
-            // listing is applied as it is.)
-            log::debug!("listing again: older than the monitor's changes");
-            self.relists.set(self.relists.get() + 1);
-            let location = listing.path.clone();
-            self.run(
-                gen,
-                move || loader::list_dir(&location, false),
-                Apply::Diff,
-                on_done,
-            );
-            return;
-        }
-        self.relists.set(0);
-
         log::debug!("listed {}: {} entries", listing.path, listing.entries.len());
         *self.current_path.borrow_mut() = listing.path.clone();
         self.is_fuse.set(listing.is_fuse);
@@ -559,7 +537,20 @@ impl DirectoryModel {
         }
         match apply {
             Apply::Replace => self.replace_all(&listing),
-            Apply::Diff | Apply::Revalidate => self.apply_diff(&listing),
+            Apply::Diff | Apply::Revalidate => {
+                // What the monitor changed since this was listed is newer
+                // here than the listing: applied, it would bring back what
+                // was deleted meanwhile, drop what was made, or undo an
+                // update.
+                let newer: std::collections::HashSet<String> = self
+                    .monitor_touched
+                    .borrow()
+                    .iter()
+                    .filter(|(_, &n)| n > events)
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                self.apply_diff(&listing, &newer)
+            }
         }
 
         if listing.path.starts_with('/') && !listing.is_fuse {
@@ -600,7 +591,8 @@ impl DirectoryModel {
         self.store.splice(0, self.store.n_items(), &objects);
     }
 
-    fn apply_diff(&self, listing: &Listing) {
+    /// `keep`: paths the store has newer than the listing, left as they are.
+    fn apply_diff(&self, listing: &Listing, keep: &std::collections::HashSet<String>) {
         // Keyed by full path: Recent can hold equal names from different folders.
         let mut fresh: std::collections::HashMap<String, FileObject> = listing
             .entries
@@ -610,11 +602,15 @@ impl DirectoryModel {
                 (fo.path(), fo)
             })
             .collect();
+        fresh.retain(|path, _| !keep.contains(path));
         let mut updated: Vec<FileObject> = Vec::new();
         for i in (0..self.store.n_items()).rev() {
             let Some(fo) = self.store.item(i).and_downcast::<FileObject>() else {
                 continue;
             };
+            if keep.contains(&fo.path()) {
+                continue;
+            }
             match fresh.remove(&fo.path()) {
                 None => self.store.remove(i),
                 Some(new) => {
@@ -680,6 +676,12 @@ impl DirectoryModel {
                 let sort_model = self.sort_model.clone();
                 let size_job = self.size_job.clone();
                 let monitor_events = self.monitor_events.clone();
+                let monitor_touched = self.monitor_touched.clone();
+                let touch = move |path: String| {
+                    let n = monitor_events.get() + 1;
+                    monitor_events.set(n);
+                    monitor_touched.borrow_mut().insert(path, n);
+                };
 
                 mon.connect_changed(move |_mon, file, _other, event| {
                     let path = current_path.borrow().clone();
@@ -724,7 +726,7 @@ impl DirectoryModel {
                                 // re-sorting everything would make Orca
                                 // lose its place.)
                                 store.append(&file_obj);
-                                monitor_events.set(monitor_events.get() + 1);
+                                touch(file_obj.path());
                                 // It says "Calculating...": do so.
                                 if file_obj.is_directory() {
                                     // Part of the current listing's job:
@@ -743,8 +745,10 @@ impl DirectoryModel {
                         }
                         gio::FileMonitorEvent::Deleted => {
                             if let Some(idx) = find_index(&store, &changed_name) {
+                                if let Some(fo) = store.item(idx).and_downcast::<FileObject>() {
+                                    touch(fo.path());
+                                }
                                 store.remove(idx);
-                                monitor_events.set(monitor_events.get() + 1);
                             }
                         }
                         gio::FileMonitorEvent::AttributeChanged
@@ -759,6 +763,7 @@ impl DirectoryModel {
                                     let new_obj = FileObject::from_file_info(&path, &info);
                                     if let Some(fo) = store.item(idx).and_downcast::<FileObject>() {
                                         fo.update_from(&new_obj);
+                                        touch(fo.path());
                                         resort_if_needed(&sort_model, &[fo]);
                                     }
                                 }

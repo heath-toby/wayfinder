@@ -433,6 +433,12 @@ pub fn run_streaming(args: &[String], tx: Sender<RcloneEvent>) -> Result<u32, St
 
 /// Kill a running rclone process by PID. Best-effort.
 pub fn kill(pid: u32) {
+    // Only while it's rclone: a step that has finished leaves its number
+    // free for some other process of the user's to get.
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    if comm.trim() != "rclone" {
+        return;
+    }
     let _ = Command::new("kill")
         .arg(pid.to_string())
         .stdout(std::process::Stdio::null())
