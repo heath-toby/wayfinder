@@ -702,6 +702,7 @@ pub fn show_chooser(
     let model_accept = model.clone();
     let d_accept = dlg.clone();
     let le_accept = location_entry.clone();
+    let checking_accept = std::rc::Rc::new(std::cell::Cell::new(false));
     accept_btn.connect_clicked(move |_| {
         let current_dir = model_accept.current_path();
         // A location typed but not gone to (Enter) isn't where this would
@@ -762,19 +763,32 @@ pub fn show_chooser(
             let d = d_accept.clone();
             let d_slow = d_accept.clone();
             let waiting = wayfinder::background::waiting_message(&check);
+            // Pressed again while a slow mount is checked: once is enough
+            // (two Replace questions would open).
+            if checking_accept.replace(true) {
+                return;
+            }
+            let checking_done = checking_accept.clone();
             wayfinder::background::run(
                 // What's there by that name: a folder, a link leading
                 // nowhere, or a file (a link to one counts, as in GTK's).
                 move || {
                     std::fs::symlink_metadata(&check).ok().map(|_| {
+                        // (Only a file is replaced: not a folder, nor a pipe
+                        // or a device, which the app would hang writing to.)
                         match std::fs::metadata(&check) {
-                            Ok(m) if m.is_dir() => Some("a folder"),
-                            Ok(_) => None,
-                            Err(_) => Some("a link that leads nowhere"),
+                            Ok(m) if m.is_dir() => Some("a folder".to_string()),
+                            Ok(m) if m.is_file() => None,
+                            Ok(_) => Some("not a regular file".to_string()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                Some("a link that leads nowhere".to_string())
+                            }
+                            Err(e) => Some(format!("a link that can't be followed ({e})")),
                         }
                     })
                 },
                 move |found| {
+                    checking_done.set(false);
                     let Some(refused) = found else {
                         send(&full_path);
                         return;

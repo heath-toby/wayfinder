@@ -600,6 +600,13 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
         let existing_name = archive_name.clone();
         let (ext, archive) = (ext.clone(), archive_name.clone());
         std::thread::spawn(move || {
+            // zip would add to an existing archive, tar replace it. (A link
+            // by that name too, even one leading nowhere: they'd write
+            // through it, elsewhere.)
+            if std::fs::symlink_metadata(&archive_path).is_ok() {
+                let _ = tx.send(Err(format!("{existing_name} already exists")));
+                return;
+            }
             // (Asking tar what it is starts it: not on the main thread.)
             let (tar, gnu) = if bsdtar {
                 ("bsdtar", false)
@@ -607,11 +614,6 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
                 ("tar", is_gnu_tar())
             };
             let cmd = build_compress_command(&ext, &archive, &basenames, tar, gnu);
-            // zip would add to an existing archive, tar replace it.
-            if archive_path.exists() {
-                let _ = tx.send(Err(format!("{existing_name} already exists")));
-                return;
-            }
             let result = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)
