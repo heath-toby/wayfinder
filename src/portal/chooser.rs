@@ -802,13 +802,25 @@ pub fn show_chooser(
             let stale_choice = stale.clone();
             let checking_slow = checking_accept.clone();
             let d_choice = d_accept.clone();
+            // "Press Enter in it": focus goes there, as for a press.
+            let say_stale = {
+                let location = le_accept.clone();
+                move |d: &gtk::Window, why: &str| {
+                    d.announce(why, AccessibleAnnouncementPriority::Medium);
+                    if why.contains("location") {
+                        location.grab_focus();
+                    }
+                }
+            };
+            let say_stale_choice = say_stale.clone();
+            let (model_slow, folder_slow) = (model_accept.clone(), current_dir.clone());
             wayfinder::background::run(
                 move || save_target(std::path::Path::new(&check)),
                 move |found| {
                     match stale() {
                         Some("") => return,
                         Some(why) => {
-                            d.announce(why, AccessibleAnnouncementPriority::Medium);
+                            say_stale(&d, why);
                             return;
                         }
                         None => {}
@@ -853,14 +865,18 @@ pub fn show_chooser(
                         match stale_choice() {
                             None => send(&full_path),
                             Some("") => {}
-                            Some(why) => d_choice.announce(why, AccessibleAnnouncementPriority::Medium),
+                            Some(why) => say_stale_choice(&d_choice, why),
                         }
                     });
                 },
                 move || {
-                    // (Said even if the name is being edited meanwhile:
-                    // the check is under way all the same.)
-                    if checking_slow.get() != press || !d_slow.is_visible() {
+                    // (Said even if the name is being edited meanwhile: the
+                    // check is under way all the same — but not once another
+                    // folder is shown, which it isn't about.)
+                    if checking_slow.get() != press
+                        || !d_slow.is_visible()
+                        || model_slow.current_path() != folder_slow
+                    {
                         return;
                     }
                     if let Some(msg) = waiting {
