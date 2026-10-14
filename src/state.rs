@@ -2,6 +2,24 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// Write `contents` to `path` whole or not at all: to a part file, flushed
+/// to disk, then renamed into place (creating the folder if need be). A
+/// reader never sees it half written, nor, after a crash, empty.
+pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let part = path.with_extension("wayfinder-part");
+    let result = fs::File::create(&part)
+        .and_then(|mut f| f.write_all(contents).and_then(|()| f.sync_all()))
+        .and_then(|()| fs::rename(&part, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    result
+}
+
 fn config_dir() -> PathBuf {
     let dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))

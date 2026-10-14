@@ -166,10 +166,7 @@ fn save_manifest(manifest: &HashMap<String, PinnedEntry>) -> Result<(), String> 
             entry.last_synced_size,
         ));
     }
-    // Whole or not at all: a reader mustn't see it half written.
-    let part = path.with_extension("wayfinder-part");
-    std::fs::write(&part, contents).map_err(|e| e.to_string())?;
-    std::fs::rename(&part, &path).map_err(|e| e.to_string())
+    crate::state::write_atomically(&path, contents.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Held while the manifest is read, changed and written back: pins,
@@ -474,11 +471,18 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let mtime = mtime_secs(&meta);
     let size = if meta.is_dir() { 0 } else { meta.len() };
 
-    if mtime == entry.last_synced_mtime && size == entry.last_synced_size && !entry.is_directory {
+    let dest = cache_path_for(&entry.original_path);
+    let record = load_record()?;
+    // Unchanged: nothing to do — once the copy is recorded (until then,
+    // it's refreshed so that it will be).
+    if mtime == entry.last_synced_mtime
+        && size == entry.last_synced_size
+        && !entry.is_directory
+        && record.pins.contains(&dest)
+    {
         return Ok(false);
     }
 
-    let dest = cache_path_for(&entry.original_path);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -487,7 +491,7 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let remote = crate::rclone_ops::rclone_for_path(&entry.original_path)
         .filter(|_| crate::rclone_ops::rclone_available())
         .map(|t| t.full_remote_spec);
-    let mut refresh = Refresh::new(load_record()?, &dest);
+    let mut refresh = Refresh::new(record, &dest, legacy_kept);
     let result = if entry.is_directory {
         sync_dir(src, &dest, remote.as_deref(), &mut refresh)
     } else {
@@ -528,6 +532,16 @@ pub fn sync_all() -> (usize, usize) {
             Ok(true) => updated += 1,
             Ok(false) => {}
             Err(_) => errors += 1,
+        }
+    }
+    // The test builds' list of kept items has done its job once every copy
+    // is recorded.
+    if let Ok(record) = load_record() {
+        if manifest
+            .keys()
+            .all(|p| record.pins.contains(&cache_path_for(p)))
+        {
+            let _ = std::fs::remove_file(manifest_path().with_file_name("offline-kept"));
         }
     }
     (updated, errors)
@@ -696,14 +710,10 @@ fn format_record(record: &Record) -> Vec<u8> {
 }
 
 fn save_record(record: &Record) -> Result<(), String> {
-    let path = record_path();
-    let part = path.with_extension("wayfinder-part");
-    std::fs::write(&part, format_record(record))
-        .and_then(|()| std::fs::rename(&part, &path))
-        .map_err(|e| {
-            log::warn!("Couldn't save the offline copies' record: {e}");
-            e.to_string()
-        })
+    crate::state::write_atomically(&record_path(), &format_record(record)).map_err(|e| {
+        log::warn!("Couldn't save the offline copies' record: {e}");
+        e.to_string()
+    })
 }
 
 /// Record what a refresh of the copy at `root` fetched. If it ran to the
@@ -716,7 +726,11 @@ fn update_record(root: &Path, fetched: Base, complete: bool) -> Result<(), Strin
         record.stamps.retain(|path, _| !path.starts_with(root));
     }
     record.stamps.extend(fetched);
-    record.pins.insert(root.to_path_buf());
+    // Recorded only once all of it has been: until then, what wasn't
+    // reached has no stamp, and would count as the user's for good.
+    if complete {
+        record.pins.insert(root.to_path_buf());
+    }
     save_record(&record)
 }
 
@@ -731,8 +745,12 @@ fn record_fetched(root: &Path) -> Result<(), String> {
 /// copies at `still` (pinned yet).
 fn forget_record(root: &Path, still: &[PathBuf]) {
     let _lock = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(mut record) = load_record() else {
-        return;
+    let mut record = match load_record() {
+        Ok(record) => record,
+        Err(e) => {
+            log::warn!("Couldn't forget {}: {e}", root.display());
+            return;
+        }
     };
     let gone = |path: &Path| path.starts_with(root) && !still.iter().any(|o| path.starts_with(o));
     record.stamps.retain(|path, _| !gone(path));
@@ -776,7 +794,9 @@ struct Refresh {
 }
 
 impl Refresh {
-    fn new(record: Record, root: &Path) -> Self {
+    /// `legacy_kept`: see `legacy_kept()`; used only if `root` isn't
+    /// recorded.
+    fn new(record: Record, root: &Path, legacy_kept: impl FnOnce() -> HashSet<PathBuf>) -> Self {
         let unrecorded = !record.pins.contains(root);
         Self {
             stamps: record.stamps,
@@ -807,8 +827,7 @@ impl Refresh {
                 .unwrap_or(true)
     }
 
-    /// Whether `path`, not on the remote (or not of its kind there), is to
-    /// be left as it is.
+    /// Whether `path`, not on the remote, is to be left as it is.
     fn keeps_extra(&self, path: &Path) -> bool {
         self.unrecorded || self.users(path)
     }
@@ -842,7 +861,7 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, r: &mut Refresh) -> Re
     // A file here that's a folder on the remote now: make way for it —
     // unless it's the user's.
     if dst.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
-        if r.keeps_extra(dst) {
+        if r.users(dst) {
             r.keep(dst);
             return Ok(false);
         }
@@ -890,7 +909,8 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, r: &mut Refresh) -> Re
         }
         let path = entry.path();
         // A download cut short (the app killed, say): ours, not the user's.
-        let part = entry.file_name().to_string_lossy().contains(PART_SUFFIX);
+        let part = entry.file_type().is_ok_and(|t| t.is_file())
+            && entry.file_name().to_string_lossy().ends_with(PART_SUFFIX);
         if !part && r.keeps_extra(&path) {
             r.keep(&path);
             continue;
@@ -918,7 +938,7 @@ fn sync_file(
         if dst_meta.is_dir() {
             // A folder here that's a file on the remote now: make way —
             // unless something in it is the user's.
-            if r.keeps_extra(dst) {
+            if r.users(dst) {
                 r.keep(dst);
                 return Ok(false);
             }
@@ -1024,12 +1044,13 @@ mod tests {
         check_downloaded, format_record, parse_record, paths_overlap, sync_dir, sync_file,
         walk_stamps, Base, Record, Refresh, Stamp,
     };
+    use std::collections::HashSet;
     use std::path::Path;
 
     /// Refresh the copy `dst` of the folder `src`, with `base` recorded
     /// before; returns the record after.
     fn refresh(src: &Path, dst: &Path, base: Base) -> Base {
-        let mut r = Refresh::new(recorded(dst, base), dst);
+        let mut r = Refresh::new(recorded(dst, base), dst, HashSet::new);
         sync_dir(src, dst, None, &mut r).unwrap();
         r.new_base
     }
@@ -1150,7 +1171,7 @@ mod tests {
         for version in ["v2", "v3"] {
             std::fs::write(&src, version).unwrap();
             let meta = std::fs::metadata(&src).unwrap();
-            let mut r = Refresh::new(recorded(&dst, base), &dst);
+            let mut r = Refresh::new(recorded(&dst, base), &dst, HashSet::new);
             sync_file(&src, &meta, &dst, None, &mut r).unwrap();
             base = r.new_base;
             assert_eq!(std::fs::read_to_string(&dst).unwrap(), "mine");
@@ -1166,10 +1187,12 @@ mod tests {
         std::fs::create_dir_all(&dst).unwrap();
         std::fs::write(dst.join("made-here.txt"), "mine").unwrap();
         std::fs::write(dst.join("x.wayfinder-part"), "half").unwrap();
-        let mut r = Refresh::new(Record::default(), &dst);
+        std::fs::create_dir_all(dst.join("backup.wayfinder-part-old")).unwrap();
+        let mut r = Refresh::new(Record::default(), &dst, HashSet::new);
         sync_dir(&src, &dst, None, &mut r).unwrap();
         assert!(dst.join("made-here.txt").exists());
         assert!(!dst.join("x.wayfinder-part").exists());
+        assert!(dst.join("backup.wayfinder-part-old").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 
