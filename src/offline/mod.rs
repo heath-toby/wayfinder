@@ -106,6 +106,20 @@ pub fn is_offline_copy(path: &Path) -> bool {
     path.starts_with(&root) || std::fs::canonicalize(&root).is_ok_and(|real| path.starts_with(real))
 }
 
+/// The folder that `copy`, in the offline copies, is the copy of (as
+/// `cache_path_for` names them); `None` for any other path.
+pub fn original_of_copy(copy: &Path) -> Option<String> {
+    let root = cache_root();
+    let rel = match copy.strip_prefix(&root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => copy
+            .strip_prefix(std::fs::canonicalize(&root).ok()?)
+            .ok()?
+            .to_path_buf(),
+    };
+    Some(format!("/{}", rel.to_string_lossy()))
+}
+
 /// Record the rclone mounts that `path` is in (the offline copies of
 /// their folders are shown while they're down; nothing is synced into
 /// their bare mountpoints).
@@ -1121,6 +1135,16 @@ fn remote_child(remote: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_offline_copy_names_its_original() {
+        let copy = super::cache_root().join("home/u/proton/Work");
+        assert_eq!(
+            super::original_of_copy(&copy).as_deref(),
+            Some("/home/u/proton/Work")
+        );
+        assert_eq!(super::original_of_copy(Path::new("/home/u/Work")), None);
+    }
+
     use super::{
         check_downloaded, format_record, is_leftover_part, merge_record, parse_record,
         paths_overlap, same_as_remote, sync_dir, sync_file, walk_stamps, Base, Record, Refresh,

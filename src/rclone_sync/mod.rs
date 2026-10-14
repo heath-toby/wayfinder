@@ -122,7 +122,7 @@ fn remote_refusal(
     old_remote: Option<&str>,
     cache_root: &std::path::Path,
 ) -> Option<String> {
-    if !sync_local.starts_with(cache_root) {
+    if !sync_local.starts_with(cache_root) && !crate::offline::is_offline_copy(sync_local) {
         return None;
     }
     if let Some(m) = mount_remote.filter(|m| *m != remote) {

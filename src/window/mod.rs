@@ -1797,7 +1797,7 @@ impl WayfinderWindow {
         // next offline refresh. A two-way sync folder's local side lives
         // there too, and that one is meant to be changed.
         let current = std::path::PathBuf::from(self.imp().model.current_path());
-        let in_cache = current.starts_with(wayfinder::offline::cache_root())
+        let in_cache = wayfinder::offline::is_offline_copy(&current)
             && !wayfinder::offline::inside_sync_folder(&current);
         let msg = if self.imp().offline_view.get() {
             "This is the offline copy, shown while the drive can't be reached. It can't be changed here."
