@@ -87,7 +87,7 @@ impl WayfinderWindow {
         }
         // The Bin or Recent Files themselves (asked for over D-Bus, say):
         // not folders to list as paths.
-        if path.contains("://") {
+        if path.starts_with("trash:") || path.starts_with("recent:") {
             self.load_special_uri(path);
             return;
         }

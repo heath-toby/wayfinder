@@ -123,9 +123,10 @@ pub fn set_pair(local_path: &str, sync_local_path: &str, remote: &str) -> Result
         if old.remote != remote
             && std::path::Path::new(&old.sync_local_path).starts_with(crate::offline::cache_root())
         {
-            return Err(
-                "this folder is synced with another remote; remove the pairing first".to_string(),
-            );
+            return Err(format!(
+                "this folder is synced with {}, and its offline copy holds that remote's files: it can't be synced with another",
+                old.remote
+            ));
         }
     }
     // A pair whose ends changed is a new pair: its first sync must

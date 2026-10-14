@@ -228,30 +228,6 @@ pub fn record_pin(original_path: &str) -> Result<(), String> {
     })
 }
 
-/// Remove what a download for pinning `original_path` left, if it was
-/// cancelled or failed: not a pin, so not an offline copy to be shown (an
-/// incomplete one, at that). Left alone if it's pinned after all, or two-
-/// way sync's. May take a while: not on the main thread.
-pub fn discard_download(original_path: &str) {
-    let cached = cache_path_for(original_path);
-    if is_pinned(original_path) || in_sync_folder(&cached) {
-        return;
-    }
-    let removed = if cached.is_dir() {
-        std::fs::remove_dir_all(&cached)
-    } else {
-        std::fs::remove_file(&cached)
-    };
-    if let Err(e) = removed {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            log::warn!(
-                "Couldn't remove the partial download {}: {e}",
-                cached.display()
-            );
-        }
-    }
-}
-
 /// Whether the offline copy at `cached` is complete for a source with
 /// metadata `src_meta`: there, of the same kind, and for a file the same
 /// size.
