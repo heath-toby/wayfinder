@@ -99,7 +99,12 @@ fn save_pairs(pairs: &HashMap<String, SyncPair>) -> Result<(), String> {
             entry.sync_local_path,
         ));
     }
-    std::fs::write(&path, contents).map_err(|e| e.to_string())
+    // Whole or not at all: a torn file would read as no pairs, and the
+    // offline refresh would then treat sync's folders as its own.
+    let part = path.with_extension("wayfinder-part");
+    std::fs::write(&part, contents)
+        .and_then(|()| std::fs::rename(&part, &path))
+        .map_err(|e| e.to_string())
 }
 
 /// Look up the configured sync pair for a given local path, if any.
