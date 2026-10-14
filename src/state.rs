@@ -7,20 +7,34 @@ use std::path::PathBuf;
 /// creating the folder if need be. A reader never sees it half written.
 pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     // Through a link (to a dotfiles folder, say) to the file it leads to,
-    // even one not there yet: the link stays. Only if that's on a
-    // read-only filesystem (a Nix store) is the link replaced, as any file
-    // would be; any other failure is reported, the link left as it is.
+    // even one not there yet: the link stays — unless what it leads to
+    // can't be written (see `replaces_link`).
     let target = link_target(path)?;
-    if target == path {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    if target != path {
+        let written = target
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| write_whole(&target, contents));
+        match written {
+            Err(e) if replaces_link(&e) => {}
+            other => return other,
         }
-        return write_whole(path, contents);
     }
-    match write_whole(&target, contents) {
-        Err(e) if e.raw_os_error() == Some(30) => write_whole(path, contents), // EROFS
-        other => other,
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    write_whole(path, contents)
+}
+
+/// Whether a link to a file that couldn't be written for `error` is
+/// replaced by the file: when it leads somewhere read-only (a Nix store,
+/// read-only or just not the user's). Other failures (a drive not there,
+/// a full disk) are passing: reported, the link left as it is.
+fn replaces_link(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 /// Where `path` leads, following links (to a file that may not exist). An
@@ -394,6 +408,19 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_link_is_replaced_only_when_it_leads_somewhere_read_only() {
+        use std::io::{Error, ErrorKind};
+        assert!(super::replaces_link(&Error::from(
+            ErrorKind::ReadOnlyFilesystem
+        )));
+        assert!(super::replaces_link(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!super::replaces_link(&Error::from(ErrorKind::NotFound)));
+        assert!(!super::replaces_link(&Error::from(ErrorKind::StorageFull)));
+    }
+
     #[test]
     fn a_loop_of_links_is_an_error_not_a_replaced_link() {
         let d = std::env::temp_dir().join(format!("wayfinder-loop-{}", std::process::id()));

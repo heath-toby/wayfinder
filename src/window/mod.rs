@@ -794,6 +794,14 @@ impl WayfinderWindow {
     /// directly.
     fn execute_file(&self, path: &str, name: &str) -> Result<(), String> {
         let is_text = is_text_executable(path);
+        // It runs in its own folder (a script's `./configure` works). (A
+        // local one: files on mounts are opened, not run.) Gone meanwhile:
+        // said as that, not as a missing terminal.
+        let dir = parent_dir(path).unwrap_or_else(|| "/".to_string());
+        let dir = std::path::Path::new(&dir);
+        if !dir.is_dir() {
+            return Err(format!("{} is no longer there", dir.display()));
+        }
 
         if is_text {
             // Text script — run in a terminal so output is visible
@@ -806,36 +814,22 @@ impl WayfinderWindow {
             ];
             // Wrap the script in a shell that keeps the terminal open after
             // the script exits so output stays visible.
-            // It runs in its own folder (a `./configure` in it works): the
-            // shell goes there, not this process, which mustn't wait on a
-            // slow mount.
-            let dir = std::path::Path::new(path)
-                .parent()
-                .map(|d| d.to_string_lossy().to_string())
-                .unwrap_or_else(|| "/".to_string());
             let wrapped = format!(
-                "cd {} ; {} ; echo ; echo \"[Press Enter to close]\" ; read",
-                shell_quote(&dir),
+                "{} ; echo ; echo \"[Press Enter to close]\" ; read",
                 shell_quote(path)
             );
             let tail = ["sh", "-c", wrapped.as_str()];
-            spawn_first(terminals, &tail)?;
+            spawn_first(terminals, &tail, Some(dir))?;
             self.announce(
                 &format!("Running {name} in terminal"),
                 AccessibleAnnouncementPriority::Medium,
             );
             Ok(())
         } else {
-            // Binary executable — run in its own folder, gone to by a
-            // shell (see above) and then replaced by the program.
-            let dir = std::path::Path::new(path)
-                .parent()
-                .map(|d| d.to_string_lossy().to_string())
-                .unwrap_or_else(|| "/".to_string());
-            match std::process::Command::new("sh")
-                .args(["-c", "cd -- \"$1\" && exec \"$2\"", "sh", &dir, path])
-                .spawn()
-            {
+            // Binary executable — spawn directly. (Not through a shell: a
+            // file that isn't a program fails here, and is opened in its
+            // app instead of being run as shell commands.)
+            match std::process::Command::new(path).current_dir(dir).spawn() {
                 Ok(child) => {
                     reap(child);
                     self.announce(
@@ -2863,7 +2857,9 @@ impl WayfinderWindow {
             ("konsole", &["--workdir"]),
         ];
 
-        match spawn_first(terminals, &[path.as_str()]) {
+        // (The folder given to the terminal, which goes there itself: it
+        // may be on a slow mount.)
+        match spawn_first(terminals, &[path.as_str()], None) {
             Ok(()) => self.announce(
                 &format!("Opened terminal in {path}"),
                 AccessibleAnnouncementPriority::Medium,
@@ -3627,14 +3623,20 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 /// Start the first of `programs` (name, its arguments) that's installed,
 /// with `tail` after its arguments. Each is tried in turn: one that isn't
 /// there, or can't be run, fails to start (no `which` waited for first).
-fn spawn_first(programs: &[(&str, &[&str])], tail: &[&str]) -> Result<(), String> {
+/// `dir`: the folder it runs in (a local one: this waits for it).
+fn spawn_first(
+    programs: &[(&str, &[&str])],
+    tail: &[&str],
+    dir: Option<&std::path::Path>,
+) -> Result<(), String> {
     let mut refused = None;
     for (cmd, args) in programs {
-        match std::process::Command::new(cmd)
-            .args(*args)
-            .args(tail)
-            .spawn()
-        {
+        let mut command = std::process::Command::new(cmd);
+        command.args(*args).args(tail);
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        match command.spawn() {
             Ok(child) => {
                 reap(child);
                 return Ok(());
