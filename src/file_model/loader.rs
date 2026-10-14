@@ -108,11 +108,12 @@ pub(super) fn list_dir(path: &str, resolve: bool) -> ListResult {
     })
 }
 
-/// List a GIO location such as `trash:///`.
+/// List a GIO location such as `trash:///`. (Types by name: the Bin holds
+/// what was binned on mounts too, and sniffing would download it.)
 pub(super) fn list_uri(uri: &str) -> ListResult {
     let enumerator = gio::File::for_uri(uri)
         .enumerate_children(
-            LOCAL_ATTRS,
+            FUSE_ATTRS,
             gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
             gio::Cancellable::NONE,
         )
@@ -150,7 +151,9 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
     let busy = busy_mounts();
 
     let mut slots: Vec<Option<(String, FileInfoData)>> = Vec::new();
-    let (tx, rx) = mpsc::channel::<(usize, Option<FileInfoData>)>();
+    // (Per file asked: Some(found or gone), or None — can't tell, kept by
+    // name. Every one answers, so the wait ends when all have.)
+    let (tx, rx) = mpsc::channel::<(usize, Option<Option<FileInfoData>>)>();
     let mut asked = 0;
     // Looked at past the limit: some may turn out to be gone.
     for path in paths.into_iter().take(limit * 2) {
@@ -181,9 +184,7 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
                         Err(_) => None,
                     };
                     drop(question);
-                    if let Some(found) = found {
-                        let _ = tx.send((index, found));
-                    }
+                    let _ = tx.send((index, found));
                 });
             }
             continue;
@@ -208,12 +209,13 @@ pub(super) fn list_recent(paths: Vec<String>, limit: usize) -> ListResult {
         };
         asked -= 1;
         match found {
-            Some(data) => {
+            Some(Some(data)) => {
                 if let Some(slot) = slots[index].as_mut() {
                     slot.1 = data;
                 }
             }
-            None => slots[index] = None,
+            Some(None) => slots[index] = None,
+            None => {}
         }
     }
 

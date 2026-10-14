@@ -57,6 +57,12 @@ impl NavigationState {
             self.current_index -= 1;
             return;
         }
+        // Or the one after (Back to a missing folder opened the one we
+        // left): one entry, or Forward goes nowhere.
+        if self.history.get(self.current_index + 1) == Some(&path) {
+            self.history.remove(self.current_index);
+            return;
+        }
         self.history[self.current_index] = path;
     }
 
@@ -123,6 +129,18 @@ mod tests {
         nav.replace_current(PathBuf::from("/Docs"));
         assert!(!nav.can_go_back());
         assert_eq!(nav.current(), &PathBuf::from("/Docs"));
+    }
+
+    /// /Docs/gone → /Docs, then Back to /Docs/gone, which opens /Docs:
+    /// one entry, so Forward isn't left going to the same place.
+    #[test]
+    fn going_back_to_a_missing_folder_isnt_a_step_either() {
+        let mut nav = NavigationState::new(PathBuf::from("/Docs/gone"));
+        nav.navigate_to(PathBuf::from("/Docs"));
+        nav.go_back();
+        nav.replace_current(PathBuf::from("/Docs"));
+        assert_eq!(nav.current(), &PathBuf::from("/Docs"));
+        assert!(!nav.can_go_forward());
     }
 
     /// Home → Documents → Bin, then Back: Documents.

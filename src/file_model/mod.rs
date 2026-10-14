@@ -574,7 +574,11 @@ impl DirectoryModel {
             // the mount on this thread (the window refreshes them when it
             // regains focus instead), and sizes would mean walking the
             // remote, so they keep showing a dash.
-            self.setup_monitor(&gio::File::for_path(&listing.path));
+            // (A refresh keeps the monitor it has: made anew, the old one's
+            // waiting events — a file written meanwhile — would be lost.)
+            if apply == Apply::Replace || self.monitor.borrow().is_none() {
+                self.setup_monitor(&gio::File::for_path(&listing.path));
+            }
             self.calculate_folder_sizes();
         }
         on_done(Some(Ok(self.store.n_items())));

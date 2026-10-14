@@ -158,6 +158,11 @@
 - **Bookmarks saved by other apps without a name** — no longer get one written into the bookmarks file when Wayfinder changes the bookmarks.
 - **Two-way sync window** — why a sync can't start is spoken from the window itself (Orca could miss it).
 - **File chooser** — the Open/Save button has an Alt key, and its spoken name has no stray underscore.
+- **The Bin with items from a cloud drive** — opening it no longer reads (downloads) those files to tell their type; it's taken from the name, as in the drive's own folders.
+- **Pasting files copied in another app** — when that app leaves out the copy/cut line, the first file is pasted too (it was dropped).
+- **Back to a folder that's gone** — when its parent opens instead, Forward no longer stays on, going to the same folder.
+- **Recent Files** — with a cloud drive that has dropped, the list no longer waits needlessly before showing.
+- **Changes made by other programs** — a file written while the folder was being refreshed no longer goes unseen until the next refresh.
 
 ### Development
 

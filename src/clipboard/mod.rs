@@ -87,6 +87,23 @@ pub fn publish(display: &gdk::Display, state: &ClipboardState) {
     }
 }
 
+/// The operation and URIs in `x-special/gnome-copied-files` text: a
+/// `copy` or `cut` line, then one URI a line. A list without that first
+/// line is copied — its first file isn't taken for the word.
+fn parse_copied_files(text: &str) -> (ClipboardOperation, Vec<&str>) {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .peekable();
+    let operation = match lines.peek() {
+        Some(&"cut") => ClipboardOperation::Cut,
+        _ => ClipboardOperation::Copy,
+    };
+    lines.next_if(|l| *l == "cut" || *l == "copy");
+    (operation, lines.collect())
+}
+
 /// Read files another application put on the system clipboard. Returns `None`
 /// if Wayfinder itself owns the clipboard, because then the internal state is
 /// the authoritative copy. Also returns `None` if the clipboard holds no files.
@@ -99,12 +116,8 @@ pub async fn read_system(display: &gdk::Display) -> Option<ClipboardState> {
 
     if formats.contain_mime_type(GNOME_COPIED_FILES) {
         if let Some(text) = read_mime_text(&clipboard, GNOME_COPIED_FILES).await {
-            let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-            let operation = match lines.next() {
-                Some("cut") => ClipboardOperation::Cut,
-                _ => ClipboardOperation::Copy,
-            };
-            let files: Vec<gio::File> = lines.map(gio::File::for_uri).collect();
+            let (operation, uris) = parse_copied_files(&text);
+            let files: Vec<gio::File> = uris.into_iter().map(gio::File::for_uri).collect();
             if !files.is_empty() {
                 return Some(ClipboardState::new(operation, files));
             }
@@ -169,4 +182,19 @@ fn watch_ownership(display: &gdk::Display) {
             global_clear();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_copied_files, ClipboardOperation};
+
+    #[test]
+    fn copied_files_without_the_word_keep_their_first_file() {
+        let (op, uris) = parse_copied_files("cut\nfile:///a\nfile:///b\n");
+        assert!(matches!(op, ClipboardOperation::Cut));
+        assert_eq!(uris, ["file:///a", "file:///b"]);
+        let (op, uris) = parse_copied_files("file:///a\nfile:///b");
+        assert!(matches!(op, ClipboardOperation::Copy));
+        assert_eq!(uris, ["file:///a", "file:///b"]);
+    }
 }
