@@ -862,7 +862,7 @@ fn copy_directory_recursive(
                 return Err(glib::Error::new(
                     gio::IOErrorEnum::NotSupported,
                     &format!(
-                        "{} is a socket or pipe, which can't be moved to another drive",
+                        "{} is a special file (a socket, pipe or device), which can't be moved this way",
                         child_source.parse_name()
                     ),
                 ));
@@ -1361,6 +1361,41 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_folder_move_stops_at_a_pipe_and_a_copy_leaves_it_out() {
+        let d = std::env::temp_dir().join(format!("wayfinder-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/a"), "a").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(d.join("src/pipe"))
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        let progress = std::sync::Arc::new(std::sync::Mutex::new((0, 0)));
+        let run = |dst: &str, moving: bool| {
+            copy_directory_recursive(
+                &gio::File::for_path(d.join("src")),
+                &gio::File::for_path(d.join(dst)),
+                &gio::Cancellable::new(),
+                &progress,
+                false,
+                moving,
+            )
+        };
+        let copied = run("copy", false);
+        let moved = run("moved", true);
+        let copy_has_a = d.join("copy/a").exists();
+        let pipe_kept = d.join("src/pipe").symlink_metadata().is_ok();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(copied.is_ok() && copy_has_a);
+        assert!(moved.is_err_and(|e| e.message().contains("pipe")));
+        assert!(pipe_kept);
+    }
+
     #[test]
     fn a_case_only_rename_never_goes_over_another_file() {
         let d = std::env::temp_dir().join(format!("wayfinder-clash-{}", std::process::id()));

@@ -174,24 +174,43 @@ fn free_name(
         return first;
     }
     // (Not forever: if every number is "taken" — the folder can't be looked
-    // in, or holds them all — one from the time, which no file will have:
-    // never the name already found taken.)
+    // in, or holds them all — numbers from the time, checked as any; the
+    // name found taken only if even those are.)
     (2..1000)
         .map(|n| dir.join(wayfinder::file_ops::numbered_name(name, n)))
-        .find(|p| !taken(p))
-        .unwrap_or_else(|| {
+        .chain((0..3).map(|k| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u32)
-                .unwrap_or(1000)
-                .max(1000);
-            dir.join(wayfinder::file_ops::numbered_name(name, now))
-        })
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let n = u32::try_from(now % 1_000_000_000).unwrap_or(0) + 1000 + k;
+            dir.join(wayfinder::file_ops::numbered_name(name, n))
+        }))
+        .find(|p| !taken(p))
+        .unwrap_or(first)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{free_name, plain_name};
+
+    #[test]
+    fn a_folder_with_every_number_taken_still_gets_a_new_name() {
+        let dir = std::path::Path::new("/d");
+        let numbered = |p: &std::path::Path| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            name == "scan.pdf"
+                || name.strip_prefix("scan (").is_some_and(|r| {
+                    r.trim_end_matches(").pdf")
+                        .parse::<u32>()
+                        .is_ok_and(|n| n < 1000)
+                })
+        };
+        let got = free_name(dir, "scan.pdf", numbered);
+        assert!(!numbered(&got), "{got:?}");
+        // Every name taken (a folder that can't be looked in): the first.
+        assert_eq!(free_name(dir, "scan.pdf", |_| true), dir.join("scan.pdf"));
+    }
 
     /// An app can't save outside the folder chosen.
     #[test]
