@@ -332,15 +332,7 @@ pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
         let cached = cache_path_for(original_path);
         let still: Vec<PathBuf> = manifest.keys().map(|p| cache_path_for(p)).collect();
         if !still.iter().any(|other| cached.starts_with(other)) {
-            let _lock = BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let mut base = load_base();
-            let before = base.len();
-            base.retain(|path, _| {
-                !path.starts_with(&cached) || still.iter().any(|o| path.starts_with(o))
-            });
-            if base.len() != before {
-                let _ = save_base(&base);
-            }
+            forget_record(&cached, &still);
         }
     }
     if !was_pinned {
@@ -495,28 +487,31 @@ pub fn refresh_pin(entry: &PinnedEntry) -> Result<bool, String> {
     let remote = crate::rclone_ops::rclone_for_path(&entry.original_path)
         .filter(|_| crate::rclone_ops::rclone_available())
         .map(|t| t.full_remote_spec);
-    let mut refresh = Refresh::new(load_base(), &dest);
-    let changed = if entry.is_directory {
-        sync_dir(src, &dest, remote.as_deref(), &mut refresh)?
+    let mut refresh = Refresh::new(load_record()?, &dest);
+    let result = if entry.is_directory {
+        sync_dir(src, &dest, remote.as_deref(), &mut refresh)
     } else {
-        sync_file(src, &meta, &dest, remote.as_deref(), &mut refresh)?
+        sync_file(src, &meta, &dest, remote.as_deref(), &mut refresh)
     };
 
     // Update manifest (if it's still pinned: it may have been unpinned
-    // while this ran), and the record of what was fetched.
+    // while this ran), and the record of what was fetched — of what was,
+    // if it stopped partway. If the record can't be saved, files fetched
+    // now don't match it and are kept as they are next time (not lost,
+    // just not updated), and the remote is checked again.
+    let complete = result.is_ok();
     update_manifest(|manifest| {
         let Some(e) = manifest.get_mut(&entry.original_path) else {
             return Ok::<(), String>(());
         };
-        // Not saved: the files fetched now don't match the record, so
-        // they're kept as they are next time (not lost, just not updated)
-        // and the remote's state is checked again.
-        update_base(&dest, refresh.new_base)?;
-        e.last_synced_mtime = mtime;
-        e.last_synced_size = size;
+        update_record(&dest, std::mem::take(&mut refresh.new_base), complete)?;
+        if complete {
+            e.last_synced_mtime = mtime;
+            e.last_synced_size = size;
+        }
         Ok(())
     })??;
-    Ok(changed)
+    result
 }
 
 /// Sync all pinned entries — call on startup or when a mount returns.
@@ -571,71 +566,139 @@ fn stamp(meta: &std::fs::Metadata) -> Stamp {
     Stamp::File(mtime, meta.len())
 }
 
-/// What refreshes fetched into the offline copies, as it was fetched.
-/// Anything in a copy that doesn't match it — edited, made, moved in or
-/// renamed here — is the user's: a refresh leaves it be, rather than
-/// overwrite it with the remote's version or remove it because the remote
-/// doesn't have it. (Anything unreadable in it counts as the user's too:
-/// the safe way to be wrong.)
+/// Items of offline copies, as refreshes fetched them.
 type Base = HashMap<PathBuf, Stamp>;
 
-/// Held while the record is read, changed and written back.
-static BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// What refreshes fetched into the offline copies, as it was fetched.
+/// Anything in a recorded copy that doesn't match it — edited, made,
+/// moved in or renamed here — is the user's: a refresh leaves it be,
+/// rather than overwrite it with the remote's version or remove it because
+/// the remote doesn't have it. (Anything missing from it counts as the
+/// user's too: the safe way to be wrong.)
+#[derive(Debug, Default, PartialEq)]
+struct Record {
+    stamps: Base,
+    /// The copies (pins' cache paths) recorded so far. A copy pinned
+    /// before there was a record has nothing to tell by: see `Refresh`.
+    pins: HashSet<PathBuf>,
+}
 
-fn base_path() -> PathBuf {
+/// Held while the record is read, changed and written back.
+static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn record_path() -> PathBuf {
     manifest_path().with_file_name("offline-base")
 }
 
-fn load_base() -> Base {
-    std::fs::read_to_string(base_path())
-        .map(|c| parse_base(&c))
-        .unwrap_or_default()
+/// The record; empty if there's none yet. An error if it can't be read:
+/// then nothing can be told apart, and a refresh must not run.
+fn load_record() -> Result<Record, String> {
+    match std::fs::read(record_path()) {
+        Ok(contents) => Ok(parse_record(&contents)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Record::default()),
+        Err(e) => Err(format!("couldn't read the offline copies' record: {e}")),
+    }
 }
 
-/// Lines of `F<TAB>mtime-ns<TAB>size<TAB>path` or `D<TAB>path`.
-fn parse_base(contents: &str) -> Base {
-    contents
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(4, '\t');
-            match parts.next()? {
-                "D" => Some((PathBuf::from(parts.next()?), Stamp::Dir)),
-                "F" => {
-                    let mtime = parts.next()?.parse().ok()?;
-                    let size = parts.next()?.parse().ok()?;
-                    Some((PathBuf::from(parts.next()?), Stamp::File(mtime, size)))
-                }
-                _ => None,
+/// A path as raw bytes, with `\` and newline escaped (a name may hold
+/// either, or not be UTF-8).
+fn escape_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = Vec::new();
+    for &b in path.as_os_str().as_bytes() {
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
+fn unescape_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut it = bytes.iter();
+    while let Some(&b) = it.next() {
+        if b == b'\\' {
+            match it.next() {
+                Some(b'n') => out.push(b'\n'),
+                Some(&other) => out.push(other),
+                None => out.push(b'\\'),
             }
-        })
-        .collect()
+        } else {
+            out.push(b);
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
 }
 
-fn format_base(base: &Base) -> String {
-    let mut lines: Vec<String> = base
+/// Lines of `P<TAB>path` (a copy recorded), `D<TAB>path` or
+/// `F<TAB>mtime-ns<TAB>size<TAB>path`.
+fn parse_record(contents: &[u8]) -> Record {
+    let mut record = Record::default();
+    for line in contents.split(|&b| b == b'\n') {
+        let mut parts = line.splitn(2, |&b| b == b'\t');
+        let (Some(kind), Some(rest)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        match kind {
+            b"P" => {
+                record.pins.insert(unescape_path(rest));
+            }
+            b"D" => {
+                record.stamps.insert(unescape_path(rest), Stamp::Dir);
+            }
+            b"F" => {
+                let mut parts = rest.splitn(3, |&b| b == b'\t');
+                let number = |p: Option<&[u8]>| std::str::from_utf8(p?).ok()?.parse::<u128>().ok();
+                let (Some(mtime), Some(size), Some(path)) =
+                    (number(parts.next()), number(parts.next()), parts.next())
+                else {
+                    continue;
+                };
+                let Ok(size) = u64::try_from(size) else {
+                    continue;
+                };
+                record
+                    .stamps
+                    .insert(unescape_path(path), Stamp::File(mtime, size));
+            }
+            _ => {}
+        }
+    }
+    record
+}
+
+fn format_record(record: &Record) -> Vec<u8> {
+    let mut lines: Vec<Vec<u8>> = record
+        .pins
         .iter()
-        .map(|(path, stamp)| match stamp {
-            Stamp::Dir => format!("D\t{}\n", path.display()),
-            Stamp::File(mtime, size) => format!("F\t{mtime}\t{size}\t{}\n", path.display()),
-        })
+        .map(|path| [b"P\t".as_slice(), &escape_path(path)].concat())
+        .chain(record.stamps.iter().map(|(path, stamp)| {
+            match stamp {
+                Stamp::Dir => [b"D\t".as_slice(), &escape_path(path)].concat(),
+                Stamp::File(mtime, size) => [
+                    format!("F\t{mtime}\t{size}\t").as_bytes(),
+                    &escape_path(path),
+                ]
+                .concat(),
+            }
+        }))
         .collect();
     lines.sort();
-    lines.concat()
+    let mut out = Vec::new();
+    for line in lines {
+        out.extend_from_slice(&line);
+        out.push(b'\n');
+    }
+    out
 }
 
-/// Replace what's recorded under `root` with `entries` (all under it).
-fn update_base(root: &Path, entries: Base) -> Result<(), String> {
-    let _lock = BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut base = load_base();
-    base.retain(|path, _| !path.starts_with(root));
-    base.extend(entries);
-    save_base(&base)
-}
-
-fn save_base(base: &Base) -> Result<(), String> {
-    let path = base_path();
+fn save_record(record: &Record) -> Result<(), String> {
+    let path = record_path();
     let part = path.with_extension("wayfinder-part");
-    std::fs::write(&part, format_base(base))
+    std::fs::write(&part, format_record(record))
         .and_then(|()| std::fs::rename(&part, &path))
         .map_err(|e| {
             log::warn!("Couldn't save the offline copies' record: {e}");
@@ -643,11 +706,38 @@ fn save_base(base: &Base) -> Result<(), String> {
         })
 }
 
+/// Record what a refresh of the copy at `root` fetched. If it ran to the
+/// end, `fetched` is all of it that's the remote's; if not, it's added to
+/// what was recorded before (the rest wasn't looked at).
+fn update_record(root: &Path, fetched: Base, complete: bool) -> Result<(), String> {
+    let _lock = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut record = load_record()?;
+    if complete {
+        record.stamps.retain(|path, _| !path.starts_with(root));
+    }
+    record.stamps.extend(fetched);
+    record.pins.insert(root.to_path_buf());
+    save_record(&record)
+}
+
 /// Record `root` (a fresh download: all of it the remote's) as fetched.
 fn record_fetched(root: &Path) -> Result<(), String> {
     let mut entries = Base::new();
     walk_stamps(root, &mut entries);
-    update_base(root, entries)
+    update_record(root, entries, true)
+}
+
+/// Forget what's recorded of the copy at `root`, except what's inside the
+/// copies at `still` (pinned yet).
+fn forget_record(root: &Path, still: &[PathBuf]) {
+    let _lock = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(mut record) = load_record() else {
+        return;
+    };
+    let gone = |path: &Path| path.starts_with(root) && !still.iter().any(|o| path.starts_with(o));
+    record.stamps.retain(|path, _| !gone(path));
+    record.pins.retain(|path| !gone(path));
+    let _ = save_record(&record);
 }
 
 fn walk_stamps(path: &Path, into: &mut Base) {
@@ -662,34 +752,53 @@ fn walk_stamps(path: &Path, into: &mut Base) {
     }
 }
 
-/// One pin's refresh: what was fetched before, and what's fetched now.
+/// Paths an earlier test build kept as the user's (`offline-kept`, lines
+/// of `mtime<TAB>path`): honoured for copies not yet recorded.
+fn legacy_kept() -> HashSet<PathBuf> {
+    std::fs::read_to_string(manifest_path().with_file_name("offline-kept"))
+        .map(|c| {
+            c.lines()
+                .filter_map(|l| l.split_once('\t').map(|(_, p)| PathBuf::from(p)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One copy's refresh: what was fetched before, and what's fetched now.
 struct Refresh {
-    base: Base,
-    /// Pinned before the record existed: nothing to tell by (see
-    /// `sync_file`).
+    stamps: Base,
+    /// Pinned before the record existed: nothing is removed for being
+    /// gone from the remote, and a file is kept if it's newer than the
+    /// remote's (see `sync_file`) — as before there was a record.
     unrecorded: bool,
+    legacy_kept: HashSet<PathBuf>,
     new_base: Base,
 }
 
 impl Refresh {
-    fn new(base: Base, root: &Path) -> Self {
-        let unrecorded = !base.contains_key(root);
+    fn new(record: Record, root: &Path) -> Self {
+        let unrecorded = !record.pins.contains(root);
         Self {
-            base,
+            stamps: record.stamps,
             unrecorded,
+            legacy_kept: if unrecorded {
+                legacy_kept()
+            } else {
+                HashSet::new()
+            },
             new_base: Base::new(),
         }
     }
 
-    /// Whether `path`, or anything in it, is the user's.
+    /// Whether `path`, or anything in it, is (or may be) the user's.
     fn users(&self, path: &Path) -> bool {
         if self.unrecorded {
-            return false;
+            return self.legacy_kept.iter().any(|k| k.starts_with(path));
         }
         let Ok(meta) = path.symlink_metadata() else {
             return false;
         };
-        if self.base.get(path) != Some(&stamp(&meta)) {
+        if self.stamps.get(path) != Some(&stamp(&meta)) {
             return true;
         }
         meta.is_dir()
@@ -698,11 +807,15 @@ impl Refresh {
                 .unwrap_or(true)
     }
 
-    /// `path` is the remote's as it is now.
-    fn fetched(&mut self, path: &Path) {
-        if let Ok(meta) = path.symlink_metadata() {
-            self.new_base.insert(path.to_path_buf(), stamp(&meta));
-        }
+    /// Whether `path`, not on the remote (or not of its kind there), is to
+    /// be left as it is.
+    fn keeps_extra(&self, path: &Path) -> bool {
+        self.unrecorded || self.users(path)
+    }
+
+    /// `path`, as `meta` says it is, is the remote's.
+    fn fetched(&mut self, path: &Path, meta: &std::fs::Metadata) {
+        self.new_base.insert(path.to_path_buf(), stamp(meta));
     }
 
     /// `path` holds the user's changes and is left as it is. What in it is
@@ -713,7 +826,7 @@ impl Refresh {
         let mut now = Base::new();
         walk_stamps(path, &mut now);
         for (p, s) in now {
-            if self.base.get(&p) == Some(&s) {
+            if self.stamps.get(&p) == Some(&s) {
                 self.new_base.insert(p, s);
             }
         }
@@ -729,14 +842,16 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, r: &mut Refresh) -> Re
     // A file here that's a folder on the remote now: make way for it —
     // unless it's the user's.
     if dst.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
-        if r.users(dst) {
+        if r.keeps_extra(dst) {
             r.keep(dst);
             return Ok(false);
         }
         std::fs::remove_file(dst).map_err(|e| e.to_string())?;
     }
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    r.fetched(dst);
+    if let Ok(meta) = dst.symlink_metadata() {
+        r.fetched(dst, &meta);
+    }
     let entries: Vec<std::fs::DirEntry> = {
         let _io = sleep::io_step();
         std::fs::read_dir(src)
@@ -774,7 +889,9 @@ fn sync_dir(src: &Path, dst: &Path, remote: Option<&str>, r: &mut Refresh) -> Re
             continue;
         }
         let path = entry.path();
-        if r.users(&path) {
+        // A download cut short (the app killed, say): ours, not the user's.
+        let part = entry.file_name().to_string_lossy().contains(PART_SUFFIX);
+        if !part && r.keeps_extra(&path) {
             r.keep(&path);
             continue;
         }
@@ -801,14 +918,14 @@ fn sync_file(
         if dst_meta.is_dir() {
             // A folder here that's a file on the remote now: make way —
             // unless something in it is the user's.
-            if r.users(dst) {
+            if r.keeps_extra(dst) {
                 r.keep(dst);
                 return Ok(false);
             }
             std::fs::remove_dir_all(dst).map_err(|e| e.to_string())?;
         } else {
             if dst_meta.len() == src_meta.len() && mtime_secs(&dst_meta) == mtime_secs(src_meta) {
-                r.fetched(dst);
+                r.fetched(dst, &dst_meta);
                 return Ok(false);
             }
             // Changed here (opened from the offline copy and saved, say):
@@ -835,12 +952,18 @@ fn sync_file(
     // `cp --preserve` both set it). If the mount shows something newer —
     // say an upload still pending in rclone's write cache — the next
     // refresh sees the difference and fetches again.
-    let result = fetch(src, &part, remote).and_then(|()| std::fs::rename(&part, dst));
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&part);
-        return Err(e.to_string());
+    // Its state is taken before it's put in place: from then on, a change
+    // is the user's.
+    let result = fetch(src, &part, remote)
+        .and_then(|()| std::fs::symlink_metadata(&part))
+        .and_then(|meta| std::fs::rename(&part, dst).map(|()| meta));
+    match result {
+        Ok(meta) => r.fetched(dst, &meta),
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e.to_string());
+        }
     }
-    r.fetched(dst);
     Ok(true)
 }
 
@@ -898,17 +1021,25 @@ fn remote_child(remote: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_downloaded, format_base, parse_base, paths_overlap, sync_dir, walk_stamps, Base,
-        Refresh, Stamp,
+        check_downloaded, format_record, parse_record, paths_overlap, sync_dir, sync_file,
+        walk_stamps, Base, Record, Refresh, Stamp,
     };
     use std::path::Path;
 
     /// Refresh the copy `dst` of the folder `src`, with `base` recorded
     /// before; returns the record after.
     fn refresh(src: &Path, dst: &Path, base: Base) -> Base {
-        let mut r = Refresh::new(base, dst);
+        let mut r = Refresh::new(recorded(dst, base), dst);
         sync_dir(src, dst, None, &mut r).unwrap();
         r.new_base
+    }
+
+    /// The record after a refresh of the copy at `root` that fetched `base`.
+    fn recorded(root: &Path, base: Base) -> Record {
+        Record {
+            stamps: base,
+            pins: [root.to_path_buf()].into_iter().collect(),
+        }
     }
 
     fn set_mtime(path: &Path, secs_ago: u64) {
@@ -931,7 +1062,15 @@ mod tests {
             set_mtime(&src.join(name), 3600);
         }
         // Pinned: all fetched.
-        let base = refresh(&src, &dst, Base::new());
+        std::process::Command::new("cp")
+            .args(["-a", "--"])
+            .arg(&src)
+            .arg(&dst)
+            .status()
+            .unwrap();
+        let mut base = Base::new();
+        walk_stamps(&dst, &mut base);
+        let base = refresh(&src, &dst, base);
         let mut first = Base::new();
         walk_stamps(&dst, &mut first);
         assert_eq!(base, first);
@@ -979,13 +1118,59 @@ mod tests {
 
     #[test]
     fn the_record_reads_back_as_written() {
-        let mut base = Base::new();
-        base.insert("/c/Docs".into(), Stamp::Dir);
-        base.insert(
-            "/c/Docs/a b.txt".into(),
+        use std::os::unix::ffi::OsStringExt;
+        let mut record = recorded(Path::new("/c/Docs"), Base::new());
+        record.stamps.insert("/c/Docs".into(), Stamp::Dir);
+        record.stamps.insert("/c/Docs/a\tb".into(), Stamp::Dir);
+        record.stamps.insert(
+            "/c/Docs/a b\\.txt".into(),
             Stamp::File(1_700_000_000_123_456_789, 42),
         );
-        assert_eq!(parse_base(&format_base(&base)), base);
+        record
+            .stamps
+            .insert("/c/Docs/two\nlines".into(), Stamp::File(1, 2));
+        let latin1 = std::ffi::OsString::from_vec(b"/c/Docs/caf\xe9".to_vec());
+        record.stamps.insert(latin1.into(), Stamp::File(3, 4));
+        assert_eq!(parse_record(&format_record(&record)), record);
+    }
+
+    #[test]
+    fn a_kept_edit_to_a_pinned_file_stays_kept() {
+        let d = dir("file");
+        let (src, dst) = (d.join("remote.txt"), d.join("copy.txt"));
+        std::fs::write(&src, "v1").unwrap();
+        set_mtime(&src, 3600);
+        std::fs::copy(&src, &dst).unwrap();
+        set_mtime(&dst, 3600);
+        let mut base = Base::new();
+        walk_stamps(&dst, &mut base);
+        // Edited here, then the remote changes, twice.
+        std::fs::write(&dst, "mine").unwrap();
+        set_mtime(&dst, 1800);
+        for version in ["v2", "v3"] {
+            std::fs::write(&src, version).unwrap();
+            let meta = std::fs::metadata(&src).unwrap();
+            let mut r = Refresh::new(recorded(&dst, base), &dst);
+            sync_file(&src, &meta, &dst, None, &mut r).unwrap();
+            base = r.new_base;
+            assert_eq!(std::fs::read_to_string(&dst).unwrap(), "mine");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_copy_without_a_record_loses_nothing() {
+        let d = dir("unrecorded");
+        let (src, dst) = (d.join("remote"), d.join("copy"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("made-here.txt"), "mine").unwrap();
+        std::fs::write(dst.join("x.wayfinder-part"), "half").unwrap();
+        let mut r = Refresh::new(Record::default(), &dst);
+        sync_dir(&src, &dst, None, &mut r).unwrap();
+        assert!(dst.join("made-here.txt").exists());
+        assert!(!dst.join("x.wayfinder-part").exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

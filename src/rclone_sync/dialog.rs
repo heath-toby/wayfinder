@@ -380,12 +380,15 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
     }
     // Creating it touches the filesystem: not on a FUSE mount from here
     // (a slow one would freeze the window); bisync reports what's missing.
-    let on_mount = crate::rclone_ops::is_fuse_path(
-        &crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(
-            &pair.sync_local_path,
-        ))
-        .to_string_lossy(),
-    );
+    // (Where it really is: /proc/mounts names mountpoints with links
+    // resolved.)
+    let sync_local = crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(
+        &pair.sync_local_path,
+    ))
+    .to_string_lossy()
+    .trim_end_matches('/')
+    .to_string();
+    let on_mount = crate::rclone_ops::is_fuse_path(&sync_local);
     if on_mount {
         // (nothing: see above)
     } else if let Err(e) = std::fs::create_dir_all(&pair.sync_local_path) {
@@ -398,14 +401,6 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
 
     // A drive mounted inside since the pair was set up: bisync would sync
     // what's on it, and delete it on the remote once it's unmounted.
-    // (Where it really is: /proc/mounts names mountpoints with links
-    // resolved.)
-    let sync_local = crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(
-        &pair.sync_local_path,
-    ))
-    .to_string_lossy()
-    .trim_end_matches('/')
-    .to_string();
     if let Some(mount) = crate::rclone_ops::mountpoints_inside(&sync_local)
         .iter()
         .find(|m| m.trim_end_matches('/') != sync_local)
