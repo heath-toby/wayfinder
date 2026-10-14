@@ -192,6 +192,7 @@
 - **The Bin** — an Original Location column shows where each item was deleted from (and Orca reads it with the row: "report.pdf, 2 MB, PDF document, from /home/u/Documents"; Left and Right reach it too); Properties is in its context menu.
 - **Two-way sync** leaves out Wayfinder's own part-downloaded offline copies (`*.wayfinder-part`) and LibreOffice's lock files (`.~lock.…#`): one of each kind had been uploaded to the remote, and a synced lock file makes a document look open elsewhere.
 - **When a name is taken** in a copy or move, the question says which is newer, as the Finder does ("A newer item named example.txt already exists here. Do you want to replace it with the older one you're copying?"), and offers Stop, Skip, Keep Both and Replace. Stop (or Escape) stops the whole copy before anything is copied; Enter skips.
+- **Two-way sync conflicts are asked about** — a file changed both here and on the remote is kept in both versions by the sync; when it's done, Wayfinder asks about each: "report.odt was changed both here and on Proton. The copy from this computer, saved 13 October at 11:37, is newer. The copy from Proton, saved 13 October at 10:39, is older." Keep Newer, Keep Both or Keep Older (Escape and Enter keep both). The version not kept goes to the Bin; keeping both names the second copy after where it came from ("report (from Proton).odt"). Then it syncs again, so the remote has the same.
 
 ### Development
 

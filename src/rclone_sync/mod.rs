@@ -7,6 +7,7 @@
 //! Sync pairs are stored in `~/.config/wayfinder/sync_pairs` as a simple
 //! tab-separated text file for resilience.
 
+pub mod conflicts;
 pub mod dialog;
 
 use std::collections::HashMap;

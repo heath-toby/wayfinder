@@ -484,6 +484,8 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
 
     let args = super::bisync_args(&pair);
     let synced = pair.clone();
+    let for_conflicts = pair.clone();
+    let parent_for_conflicts = parent_window.clone();
 
     let labels = crate::rclone_ops::progress::ProgressLabels {
         title: "Syncing",
@@ -496,7 +498,7 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
             let conflicts = super::count_conflicts(&r.stdout, &r.stderr);
             if conflicts > 0 {
                 format!(
-                    "Sync complete with {conflicts} conflict(s). Files with .conflict-local or .conflict-remote suffixes preserve both versions."
+                    "Sync complete. {conflicts} file(s) had been changed in both places: you'll be asked which to keep."
                 )
             } else {
                 "Sync complete.".to_string()
@@ -511,13 +513,91 @@ pub fn trigger_sync(parent_window: &gtk::Window, local_path: &str) {
         parent_window,
         labels,
         summarise_line,
-        None,
+        // Then any file changed in both places is asked about.
+        Some(Box::new(move |succeeded| {
+            if succeeded {
+                ask_about_conflicts(&parent_for_conflicts, for_conflicts);
+            }
+        })),
         move |tx, _cancel| {
             if let Err(e) = crate::rclone_ops::run_streaming(&args, tx.clone()) {
                 let _ = tx.send(crate::rclone_ops::RcloneEvent::Finished(Err(e)));
             }
         },
     );
+}
+
+/// Ask about each file `pair`'s sync left in two versions (changed in both
+/// places): keep the newer, both, or the older. If anything was changed,
+/// sync again, so the remote has the same.
+fn ask_about_conflicts(parent: &gtk::Window, pair: super::SyncPair) {
+    let root = std::path::PathBuf::from(&pair.sync_local_path);
+    let parent = parent.clone();
+    crate::background::run(
+        move || super::conflicts::find_conflicts(&root),
+        move |found| {
+            if !found.is_empty() {
+                ask_next(parent, pair, found.into(), false);
+            }
+        },
+        || {},
+    );
+}
+
+fn ask_next(
+    parent: gtk::Window,
+    pair: super::SyncPair,
+    mut left: std::collections::VecDeque<super::conflicts::Conflict>,
+    changed: bool,
+) {
+    use super::conflicts::Keep;
+    let Some(conflict) = left.pop_front() else {
+        if changed {
+            parent.announce(
+                "Syncing what you chose",
+                AccessibleAnnouncementPriority::Medium,
+            );
+            trigger_sync(&parent, &pair.local_path);
+        }
+        return;
+    };
+    let remote = pair
+        .remote
+        .split(':')
+        .next()
+        .filter(|r| !r.is_empty())
+        .unwrap_or("the remote")
+        .to_string();
+    let (message, detail) = super::conflicts::question(&conflict, &remote);
+    // (Escape and Enter keep both: nothing is lost by a stray key.)
+    let dialog = gtk::AlertDialog::builder()
+        .message(message)
+        .detail(detail)
+        .buttons(["Keep Newer", "Keep Both", "Keep Older"])
+        .cancel_button(1)
+        .default_button(1)
+        .build();
+    let p = parent.clone();
+    dialog.choose(Some(&p), gtk::gio::Cancellable::NONE, move |answer| {
+        let keep = match answer {
+            Ok(0) => Keep::Newer,
+            Ok(2) => Keep::Older,
+            _ => Keep::Both,
+        };
+        crate::background::run(
+            move || super::conflicts::resolve(&conflict, keep, &remote),
+            move |result| {
+                if let Err(e) = &result {
+                    parent.announce(
+                        &format!("Couldn't do that: {e}"),
+                        AccessibleAnnouncementPriority::High,
+                    );
+                }
+                ask_next(parent, pair, left, changed || result.is_ok());
+            },
+            || {},
+        );
+    });
 }
 
 /// Pull a short, screen-reader-friendly status line out of a raw rclone
