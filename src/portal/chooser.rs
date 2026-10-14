@@ -770,74 +770,48 @@ pub fn show_chooser(
             let d_slow = d_accept.clone();
             let waiting = wayfinder::background::waiting_message(&check);
             // (Only the latest press's check acts: see checking_accept.)
-            let checking_done = checking_accept.clone();
-            // Whether this press's check may still act: the latest press,
-            // the dialog open, and the folder (no other typed in the
-            // location) and name it checked still the ones shown.
-            let still_current = std::rc::Rc::new({
+            // Why this press's check may no longer act, if so: "" for a
+            // newer press or the dialog gone (quietly: the newer press
+            // speaks), or what changed since (the folder and name shown,
+            // as written, or another location typed).
+            let stale = std::rc::Rc::new({
                 let model = model_accept.clone();
                 let name_entry = fn_accept.clone();
                 let location = le_accept.clone();
                 let d = d_accept.clone();
-                let target = full_path.clone();
+                let (checked_folder, checked_name) = (current_dir.clone(), name.clone());
                 let checking = checking_accept.clone();
-                move || {
+                move || -> Option<&'static str> {
+                    if checking.get() != press || !d.is_visible() {
+                        return Some("");
+                    }
+                    let folder = model.current_path();
+                    if location_not_open(&location.text(), &folder) {
+                        return Some("Not saved: another location was typed. Press Enter in it to go there, then Save.");
+                    }
                     let name = name_entry
                         .as_ref()
                         .map(|e| e.text().to_string())
                         .unwrap_or_default();
-                    let folder = model.current_path();
-                    checking.get() == press
-                        && d.is_visible()
-                        && !location_not_open(&location.text(), &folder)
-                        && std::path::Path::new(&folder).join(name) == std::path::Path::new(&target)
+                    if folder != checked_folder || name != checked_name {
+                        return Some("Not saved: the folder or name changed. Press Save again.");
+                    }
+                    None
                 }
             });
-            let still_current_choice = still_current.clone();
-            let still_current_slow = still_current.clone();
+            let stale_choice = stale.clone();
+            let checking_slow = checking_accept.clone();
+            let d_choice = d_accept.clone();
             wayfinder::background::run(
-                // What's there by that name: a folder, a link leading
-                // nowhere, or a file (a link to one counts, as in GTK's).
-                // (Err: it couldn't be told — not taken for free, or an
-                // existing file would be written over unasked.)
-                // (Only a file is replaced: not a folder, nor a pipe or a
-                // device, which the app would hang writing to.)
-                move || {
-                    let kind = |m: &std::fs::Metadata| {
-                        if m.is_dir() {
-                            Some("a folder".to_string())
-                        } else if m.is_file() {
-                            None
-                        } else {
-                            Some("not a regular file".to_string())
-                        }
-                    };
-                    match std::fs::symlink_metadata(&check) {
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                        Err(e) => Err(e.to_string()),
-                        Ok(m) if !m.file_type().is_symlink() => Ok(Some(kind(&m))),
-                        Ok(_) => match std::fs::metadata(&check) {
-                            Ok(m) => Ok(Some(kind(&m))),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Ok(Some(Some("a link that leads nowhere".to_string())))
-                            }
-                            Err(e) => Ok(Some(Some(format!("a link that can't be followed ({e})")))),
-                        },
-                    }
-                },
+                move || save_target(std::path::Path::new(&check)),
                 move |found| {
-                    // (A newer press, or the dialog gone: that's that.)
-                    if checking_done.get() != press || !d.is_visible() {
-                        return;
-                    }
-                    // The folder or name changed meanwhile: not saved where
-                    // it no longer says.
-                    if !still_current() {
-                        d.announce(
-                            "Not saved: the folder or name changed. Press Save again.",
-                            AccessibleAnnouncementPriority::Medium,
-                        );
-                        return;
+                    match stale() {
+                        Some("") => return,
+                        Some(why) => {
+                            d.announce(why, AccessibleAnnouncementPriority::Medium);
+                            return;
+                        }
+                        None => {}
                     }
                     let found = match found {
                         Ok(found) => found,
@@ -871,14 +845,22 @@ pub fn show_chooser(
                         .default_button(0)
                         .build();
                     confirm.choose(Some(&d), gio::Cancellable::NONE, move |choice| {
-                        // (Another press meanwhile: that one decides.)
-                        if choice == Ok(1) && still_current_choice() {
-                            send(&full_path);
+                        if choice != Ok(1) {
+                            return;
+                        }
+                        // Changed while the question was open: said, not
+                        // saved somewhere else.
+                        match stale_choice() {
+                            None => send(&full_path),
+                            Some("") => {}
+                            Some(why) => d_choice.announce(why, AccessibleAnnouncementPriority::Medium),
                         }
                     });
                 },
                 move || {
-                    if !still_current_slow() {
+                    // (Said even if the name is being edited meanwhile:
+                    // the check is under way all the same.)
+                    if checking_slow.get() != press || !d_slow.is_visible() {
                         return;
                     }
                     if let Some(msg) = waiting {
@@ -993,6 +975,37 @@ fn load_dir(
     });
 }
 
+/// What's at `path`, where a file is to be saved: `Ok(None)` nothing (free);
+/// `Ok(Some(None))` a file to replace (a link to one counts, as in GTK's
+/// chooser); `Ok(Some(Some(what)))` something not to save over — a folder,
+/// a pipe or device (the app would hang writing to it), a link leading
+/// nowhere (the app would write wherever it pointed); `Err` if it can't be
+/// told (not taken for free: an existing file would be written over
+/// unasked).
+fn save_target(path: &std::path::Path) -> Result<Option<Option<String>>, String> {
+    let kind = |m: &std::fs::Metadata| {
+        if m.is_dir() {
+            Some("a folder".to_string())
+        } else if m.is_file() {
+            None
+        } else {
+            Some("not a regular file".to_string())
+        }
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+        Ok(m) if !m.file_type().is_symlink() => Ok(Some(kind(&m))),
+        Ok(_) => match std::fs::metadata(path) {
+            Ok(m) => Ok(Some(kind(&m))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Some(Some("a link that leads nowhere".to_string())))
+            }
+            Err(e) => Ok(Some(Some(format!("a link that can't be followed ({e})")))),
+        },
+    }
+}
+
 /// Whether the location typed (`typed`) is somewhere other than the folder
 /// shown (`current`): typed but not gone to. As written or trimmed (a
 /// folder's name may end in a space; a stray one typed is no matter).
@@ -1007,7 +1020,31 @@ fn location_not_open(typed: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::location_not_open;
+    use super::{location_not_open, save_target};
+
+    #[test]
+    fn what_a_save_would_go_over() {
+        let d = std::env::temp_dir().join(format!("wayfinder-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("dir")).unwrap();
+        std::fs::write(d.join("file"), "").unwrap();
+        std::os::unix::fs::symlink(d.join("file"), d.join("to-file")).unwrap();
+        std::os::unix::fs::symlink(d.join("missing"), d.join("nowhere")).unwrap();
+        let free = save_target(&d.join("new"));
+        let file = save_target(&d.join("file"));
+        let to_file = save_target(&d.join("to-file"));
+        let dir = save_target(&d.join("dir"));
+        let nowhere = save_target(&d.join("nowhere"));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(free, Ok(None));
+        assert_eq!(file, Ok(Some(None)));
+        assert_eq!(to_file, Ok(Some(None)));
+        assert_eq!(dir, Ok(Some(Some("a folder".to_string()))));
+        assert_eq!(
+            nowhere,
+            Ok(Some(Some("a link that leads nowhere".to_string())))
+        );
+    }
 
     #[test]
     fn a_typed_location_counts_only_if_its_somewhere_else() {
