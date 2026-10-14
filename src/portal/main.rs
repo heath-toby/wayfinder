@@ -110,7 +110,7 @@ fn main() {
                             gtk::gio::spawn_blocking(move || save_files_uris(&folder, &names))
                                 .await
                                 .unwrap_or_else(|_| {
-                                    Err("the names couldn't be checked".to_string())
+                                    Err("The names couldn't be checked. Try again.".to_string())
                                 });
                         match uris {
                             Ok(uris) => result.uris = uris,
@@ -157,8 +157,6 @@ fn main() {
 /// The URIs to save `names` under in the folder `folder_uri`: a name taken
 /// by an existing file gets a number ("report (2).pdf"), so nothing is
 /// overwritten without being asked.
-/// `None` if a name that's surely free can't be found for every file (the
-/// folder can't be looked in): the save fails rather than risk one.
 /// An error, saying why, if a name that's surely free can't be found for
 /// every file: the save fails rather than risk one.
 fn save_files_uris(folder_uri: &str, names: &[String]) -> Result<Vec<String>, String> {
@@ -166,6 +164,9 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Result<Vec<String>, St
     // (No names asked for — a request not understood — is no save either.)
     if names.is_empty() {
         return Err("No files were asked to be saved".to_string());
+    }
+    if folder_uri.is_empty() {
+        return Err("No folder was chosen".to_string());
     }
     let folder = gtk::gio::File::for_uri(folder_uri);
     let dir = folder
@@ -189,16 +190,22 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Result<Vec<String>, St
                 let free = match wayfinder::file_ops::name_free(p) {
                     Ok(free) => free,
                     Err(e) => {
-                        *error.borrow_mut() = Some(e.to_string());
+                        // (In plain words: the kind, not the OS's code.)
+                        *error.borrow_mut() = Some(e.kind().to_string());
                         return None;
                     }
                 };
                 let lower = p.to_string_lossy().to_lowercase();
                 Some(!free || taken.contains(&lower))
             })
+            // (Not naming the file: the name is the app's, and its words
+            // mustn't speak in this window.)
             .ok_or_else(|| match error.take() {
-                Some(e) => format!("{name} couldn't be checked in the folder chosen ({e})"),
-                None => format!("Every name for {name} is taken in the folder chosen"),
+                Some(e) => format!(
+                    "A name couldn't be checked in the folder chosen: {e}. Try another folder"
+                ),
+                None => "Every name for one of the files is taken in the folder chosen. Try another folder"
+                    .to_string(),
             })?;
             taken.push(path.to_string_lossy().to_lowercase());
             Ok(gtk::gio::File::for_path(&path).uri().to_string())
