@@ -85,6 +85,12 @@ impl WayfinderWindow {
             );
             return;
         }
+        // The Bin or Recent Files themselves (asked for over D-Bus, say):
+        // not folders to list as paths.
+        if path.contains("://") {
+            self.load_special_uri(path);
+            return;
+        }
         self.imp().nav.borrow_mut().navigate_to(PathBuf::from(path));
         self.open_directory(path, true);
     }
@@ -2092,7 +2098,8 @@ impl WayfinderWindow {
             file.name()
         ))]);
         // Select the name without extension for convenience
-        entry.select_region(0, stem_chars(&file.name(), file.is_directory()));
+        let stem = stem_chars(&file.name(), file.is_directory());
+        entry.select_region(0, stem);
 
         let dlg = gtk::Window::builder()
             .title(format!("Rename {}", file.name()))
@@ -2273,6 +2280,8 @@ impl WayfinderWindow {
 
         dlg.present();
         entry.grab_focus();
+        // (Taking focus selects all of it: just the name again.)
+        entry.select_region(0, stem);
     }
 
     pub fn batch_rename(&self) {
@@ -2903,7 +2912,7 @@ impl WayfinderWindow {
                     ("Ctrl+Shift+L", "Downloads"),
                     ("Ctrl+Shift+R", "File System"),
                     ("Enter", "Open file or folder"),
-                    ("Backspace", "Go back"),
+                    ("Backspace", "Go to parent folder"),
                 ],
             ),
             (
@@ -3349,13 +3358,31 @@ fn init_zoom(window: &WayfinderWindow) {
     });
 }
 
+/// The theme's font size in points (`Cantarell 11` is 11); 10 if unknown.
+fn theme_font_size() -> f64 {
+    gtk::Settings::default()
+        .and_then(|s| s.gtk_font_name())
+        .and_then(|name| font_size(&name))
+        .unwrap_or(10.0)
+}
+
+/// The size at the end of a font name (`Noto Sans Bold 11.5` is 11.5).
+fn font_size(name: &str) -> Option<f64> {
+    name.rsplit(' ')
+        .next()?
+        .parse()
+        .ok()
+        .filter(|s: &f64| *s > 0.0)
+}
+
 fn apply_zoom_css(level: i32) {
     ZOOM.with(|(provider, current)| {
         current.set(level);
         if level == 100 {
             provider.load_from_string("");
         } else {
-            let pt = level as f64 / 100.0 * 10.0;
+            // Of the theme's own size (100%), whatever that is.
+            let pt = level as f64 / 100.0 * theme_font_size();
             provider.load_from_string(&format!("* {{ font-size: {pt}pt; }}"));
         }
     });
@@ -3674,6 +3701,13 @@ fn stem_chars(name: &str, is_dir: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zoom_is_of_the_themes_font_size() {
+        assert_eq!(super::font_size("Cantarell 11"), Some(11.0));
+        assert_eq!(super::font_size("Noto Sans Bold 11.5"), Some(11.5));
+        assert_eq!(super::font_size("Sans"), None);
+    }
+
     #[test]
     fn scripts_run_in_their_folder_and_wait_for_enter_in_any_sh() {
         let cmd = super::script_command(

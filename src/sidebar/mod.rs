@@ -921,26 +921,23 @@ impl WayfinderSidebar {
     /// Connect to GIO VolumeMonitor signals for dynamic updates.
     pub fn connect_volume_signals(&self) {
         let vm = &self.imp().volume_monitor;
-
-        let sidebar = self.clone();
-        vm.connect_mount_added(move |_, _| {
-            sidebar.refresh_volumes();
-        });
-
-        let sidebar = self.clone();
-        vm.connect_mount_removed(move |_, _| {
-            sidebar.refresh_volumes();
-        });
-
-        let sidebar = self.clone();
-        vm.connect_volume_added(move |_, _| {
-            sidebar.refresh_volumes();
-        });
-
-        let sidebar = self.clone();
-        vm.connect_volume_removed(move |_, _| {
-            sidebar.refresh_volumes();
-        });
+        // Weakly: the monitor lives as long as the process, and would keep
+        // every closed window's sidebar (and so the window) alive.
+        let refresh = |sidebar: glib::WeakRef<WayfinderSidebar>| {
+            move || {
+                if let Some(sidebar) = sidebar.upgrade() {
+                    sidebar.refresh_volumes();
+                }
+            }
+        };
+        let f = refresh(self.downgrade());
+        vm.connect_mount_added(move |_, _| f());
+        let f = refresh(self.downgrade());
+        vm.connect_mount_removed(move |_, _| f());
+        let f = refresh(self.downgrade());
+        vm.connect_volume_added(move |_, _| f());
+        let f = refresh(self.downgrade());
+        vm.connect_volume_removed(move |_, _| f());
     }
 
     pub fn connect_trash_right_click<F: Fn() + 'static>(&self, callback: F) {

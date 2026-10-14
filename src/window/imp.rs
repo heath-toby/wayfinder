@@ -1060,6 +1060,11 @@ impl WayfinderWindowInner {
         controller.connect_key_pressed(move |_controller, key, _code, mods| {
             use gtk::gdk;
             let imp = window.imp();
+            // Keys in a menu opened on the list (it's the menu's parent,
+            // so they pass by here first) are the menu's.
+            if focus_in_popover(&window) {
+                return glib::Propagation::Proceed;
+            }
 
             if key == gdk::Key::Tab && !mods.contains(gdk::ModifierType::SHIFT_MASK) {
                 if imp.back_button.is_sensitive() {
@@ -1278,6 +1283,11 @@ impl WayfinderWindowInner {
         controller.connect_key_pressed(move |_controller, key, _code, mods| {
             use gtk::gdk;
             let imp = window.imp();
+            // Keys in a menu opened on the list (it's the menu's parent,
+            // so they pass by here first) are the menu's.
+            if focus_in_popover(&window) {
+                return glib::Propagation::Proceed;
+            }
 
             if key == gdk::Key::Tab && !mods.contains(gdk::ModifierType::SHIFT_MASK) {
                 if imp.back_button.is_sensitive() {
@@ -1702,4 +1712,16 @@ impl WayfinderWindowInner {
             }
         });
     }
+}
+
+/// Whether keyboard focus is in a popover (a context menu) of `window`.
+fn focus_in_popover(window: &super::WayfinderWindow) -> bool {
+    let mut widget = gtk::prelude::GtkWindowExt::focus(window);
+    while let Some(w) = widget {
+        if w.is::<gtk::Popover>() {
+            return true;
+        }
+        widget = w.parent();
+    }
+    false
 }
