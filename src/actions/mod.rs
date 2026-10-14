@@ -682,7 +682,8 @@ fn build_compress_command(
         // (-y: links kept as links, as tar keeps them — not the folder one
         // leads to, which may be big, or on a mount.)
         "zip" => format!("zip -r -y {quoted_archive} {quoted_files}"),
-        "7z" => format!("7z a {quoted_archive} {quoted_files}"),
+        // (-spd: a `*` or `?` in a name is the name, not a wildcard.)
+        "7z" => format!("7z a -spd {quoted_archive} {quoted_files}"),
         _ => {
             let options = match ext {
                 "tar.xz" => "cJf",

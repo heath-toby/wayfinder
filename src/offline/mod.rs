@@ -162,7 +162,7 @@ fn parse_manifest(contents: &str) -> HashMap<String, PinnedEntry> {
         if parts.len() < 4 {
             continue;
         }
-        let original_path = parts[0].to_string();
+        let original_path = unescape_field(parts[0]);
         let is_directory = parts[1] == "1" || parts[1].eq_ignore_ascii_case("true");
         let last_synced_mtime: i64 = parts[2].parse().unwrap_or(0);
         let last_synced_size: u64 = parts[3].parse().unwrap_or(0);
@@ -175,6 +175,36 @@ fn parse_manifest(contents: &str) -> HashMap<String, PinnedEntry> {
                 last_synced_size,
             },
         );
+    }
+    out
+}
+
+/// A path as a manifest field: `\`, tab and newline escaped (a name may
+/// hold them; unescaped, the line would split wrongly).
+fn escape_field(path: &str) -> String {
+    path.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+}
+
+fn unescape_field(field: &str) -> String {
+    let mut out = String::new();
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
     }
     out
 }
@@ -193,7 +223,7 @@ fn save_manifest(manifest: &HashMap<String, PinnedEntry>) -> Result<(), String> 
     for entry in entries {
         contents.push_str(&format!(
             "{}\t{}\t{}\t{}\n",
-            entry.original_path,
+            escape_field(&entry.original_path),
             if entry.is_directory { 1 } else { 0 },
             entry.last_synced_mtime,
             entry.last_synced_size,
@@ -1135,6 +1165,13 @@ fn remote_child(remote: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_paths_with_tabs_and_newlines_read_back() {
+        let path = "/m/Docs/a\tb\nc\\d.txt";
+        assert_eq!(super::unescape_field(&super::escape_field(path)), path);
+        assert!(!super::escape_field(path).contains('\t'));
+    }
+
     #[test]
     fn an_offline_copy_names_its_original() {
         let copy = super::cache_root().join("home/u/proton/Work");

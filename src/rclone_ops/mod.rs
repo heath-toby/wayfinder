@@ -29,6 +29,12 @@ pub struct RcloneTarget {
 /// Resolve a local path to its rclone remote, if it lives inside an rclone
 /// FUSE mount. Returns None for paths not on an rclone mount.
 pub fn rclone_for_path(local_path: &str) -> Option<RcloneTarget> {
+    // On the rclone mount itself, not on another drive mounted inside it
+    // (that's not the remote: acting on the remote would hit the files
+    // hidden under it).
+    if !is_rclone_fuse_path(local_path) {
+        return None;
+    }
     let mounts = list_rclone_fuse_mounts();
     let mut best: Option<&(String, String)> = None;
     let mut best_len = 0;
@@ -79,7 +85,18 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
         }
     }
 
-    let found = match Command::new("ps").arg("-eo").arg("args=").output() {
+    // (This user's mounts only: another's — a system service's — names
+    // remotes in another config, which this user's rclone would read as
+    // its own.)
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self")
+        .map(|m| m.uid())
+        .unwrap_or(0);
+    let found = match Command::new("ps")
+        .args(["-o", "args=", "-u"])
+        .arg(uid.to_string())
+        .output()
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
             .lines()
             .filter_map(|line| parse_rclone_mount(line, &fuse_mounts, configured_remotes()))
@@ -618,7 +635,9 @@ fn fstype_for_path(path: &str) -> Option<String> {
         let mountpoint = decode_mount_path(parts[1]);
         let fstype = parts[2];
         let is_prefix = path == mountpoint || path.starts_with(&format!("{mountpoint}/"));
-        if is_prefix && mountpoint.len() > best_len {
+        // (`>=`: of two at one place, the one listed later is on top — an
+        // automount's real mount over its autofs stand-in.)
+        if is_prefix && mountpoint.len() >= best_len {
             best_len = mountpoint.len();
             best_fstype = Some(fstype.to_string());
         }
@@ -636,11 +655,20 @@ pub fn spec_for_path(local_path: &str) -> String {
 }
 
 /// `steps` fitted, each, to its source in `sources` (see `fit_to_kind`).
+/// A folder copied is made first: rclone copies what's in it, and makes no
+/// destination at all for an empty one.
 fn fit_steps(steps: Vec<(String, Vec<String>)>, sources: &[String]) -> Vec<(String, Vec<String>)> {
     steps
         .into_iter()
         .zip(sources)
-        .map(|((label, args), src)| (label, fit_to_kind(args, src)))
+        .flat_map(|((label, args), src)| {
+            let args = fit_to_kind(args, src);
+            let make = (args.first().map(String::as_str) == Some("copy"))
+                .then(|| args.get(2).cloned())
+                .flatten()
+                .map(|dst| (format!("Making {dst}"), vec!["mkdir".to_string(), dst]));
+            make.into_iter().chain(std::iter::once((label, args)))
+        })
         .collect()
 }
 
@@ -797,6 +825,12 @@ pub fn pin_with_progress(
         on_complete,
         move |tx, _cancel| {
             let args = fit_to_kind(args, &source);
+            // (A folder: made first — an empty one gets none from rclone.)
+            if args.first().map(String::as_str) == Some("copy") {
+                if let Some(dst) = args.get(2) {
+                    let _ = std::fs::create_dir_all(dst);
+                }
+            }
             if let Err(e) = run_streaming(&args, tx.clone()) {
                 let _ = tx.send(RcloneEvent::Finished(Err(e)));
             }
