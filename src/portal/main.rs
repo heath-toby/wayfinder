@@ -106,8 +106,16 @@ fn main() {
                                 .flatten();
                         match uris {
                             Some(uris) => result.uris = uris,
-                            // No safe names: the app is told it failed.
-                            None => failed = true,
+                            // No safe names: the app is told it failed, and
+                            // the user (the chooser has closed) by an alert.
+                            None => {
+                                failed = true;
+                                gtk::AlertDialog::builder()
+                                    .message("The files weren't saved")
+                                    .detail("The folder chosen couldn't be checked for files of the same names, so they could have been written over. Try another folder.")
+                                    .build()
+                                    .show(None::<&gtk::Window>);
+                            }
                         }
                     }
                     let response = if failed {
@@ -144,6 +152,10 @@ fn main() {
 /// folder can't be looked in): the save fails rather than risk one.
 fn save_files_uris(folder_uri: &str, names: &[String]) -> Option<Vec<String>> {
     use gtk::gio::prelude::FileExt;
+    // (No names asked for — a request not understood — is no save either.)
+    if names.is_empty() {
+        return None;
+    }
     let folder = gtk::gio::File::for_uri(folder_uri);
     let dir = folder.path()?;
     let mut taken: Vec<std::path::PathBuf> = Vec::new();
@@ -158,8 +170,8 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Option<Vec<String>> {
             // (Taken: anything there, a link leading nowhere included, or
             // that can't be looked at — only "not found" is free.)
             let path = free_name(&dir, &name, |p| {
-                !wayfinder::file_ops::name_free(p).unwrap_or(false)
-                    || taken.contains(&p.to_path_buf())
+                let free = wayfinder::file_ops::name_free(p).ok()?;
+                Some(!free || taken.contains(&p.to_path_buf()))
             })?;
             taken.push(path.clone());
             Some(gtk::gio::File::for_path(&path).uri().to_string())
@@ -177,13 +189,16 @@ fn plain_name(name: &str) -> Option<String> {
 }
 
 /// `dir/name`, or if `taken` says that's in use, `dir/stem (N).ext`.
+/// `taken`: whether a path is taken; `None` if that can't be told — then
+/// there's no name (stopping at once: a mount timing out would make each
+/// try wait).
 fn free_name(
     dir: &std::path::Path,
     name: &str,
-    taken: impl Fn(&std::path::Path) -> bool,
+    taken: impl Fn(&std::path::Path) -> Option<bool>,
 ) -> Option<std::path::PathBuf> {
     let first = dir.join(name);
-    if !taken(&first) {
+    if !taken(&first)? {
         return Some(first);
     }
     // (Not forever: if every number is "taken" — the folder can't be looked
@@ -194,10 +209,13 @@ fn free_name(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let base = u32::try_from(now % 1_000_000_000).unwrap_or(0) + 1000;
-    (2..1000)
-        .chain(base..base + 3)
-        .map(|n| dir.join(wayfinder::file_ops::numbered_name(name, n)))
-        .find(|p| !taken(p))
+    for n in (2..1000).chain(base..base + 3) {
+        let path = dir.join(wayfinder::file_ops::numbered_name(name, n));
+        if !taken(&path)? {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -216,10 +234,16 @@ mod tests {
                         .is_ok_and(|n| n < 1000)
                 })
         };
-        let got = free_name(dir, "scan.pdf", numbered).unwrap();
+        let got = free_name(dir, "scan.pdf", |p| Some(numbered(p))).unwrap();
         assert!(!numbered(&got), "{got:?}");
-        // Every name taken (a folder that can't be looked in): none.
-        assert_eq!(free_name(dir, "scan.pdf", |_| true), None);
+        // Every name taken: none. Nor if it can't be told (at once).
+        assert_eq!(free_name(dir, "scan.pdf", |_| Some(true)), None);
+        let tries = std::cell::Cell::new(0);
+        let none = free_name(dir, "scan.pdf", |_| {
+            tries.set(tries.get() + 1);
+            None
+        });
+        assert_eq!((none, tries.get()), (None, 1));
     }
 
     /// An app can't save outside the folder chosen.
@@ -239,17 +263,17 @@ mod tests {
     fn taken_names_get_a_number() {
         let dir = Path::new("/d");
         let taken =
-            |p: &Path| p == Path::new("/d/report.pdf") || p == Path::new("/d/report (2).pdf");
+            |p: &Path| Some(p == Path::new("/d/report.pdf") || p == Path::new("/d/report (2).pdf"));
         assert_eq!(
             free_name(dir, "report.pdf", taken),
             Some(Path::new("/d/report (3).pdf").to_path_buf())
         );
         assert_eq!(
-            free_name(dir, "notes", |p: &Path| p == Path::new("/d/notes")),
+            free_name(dir, "notes", |p: &Path| Some(p == Path::new("/d/notes"))),
             Some(Path::new("/d/notes (2)").to_path_buf())
         );
         assert_eq!(
-            free_name(dir, "new.txt", |_: &Path| false),
+            free_name(dir, "new.txt", |_: &Path| Some(false)),
             Some(Path::new("/d/new.txt").to_path_buf())
         );
     }
