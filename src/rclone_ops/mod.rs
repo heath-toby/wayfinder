@@ -69,10 +69,9 @@ fn mount_for<'a>(
         .filter(|(m, _)| holds(m))
         .max_by_key(|(m, _)| m.len())?;
     let innermost = fuse.iter().filter(|m| holds(m)).map(|m| m.len()).max();
-    // (Two at one place — one stacked on another: which is on top, and
-    // whose remote, can't be told from `ps`.)
-    let here = fuse.iter().filter(|m| **m == best.0).count();
-    (innermost.unwrap_or(0) <= best.0.len() && here <= 1).then_some(best)
+    // (Two listed at one place aren't refused: one mount can be listed
+    // twice, by mount propagation, and would never be used directly.)
+    (innermost.unwrap_or(0) <= best.0.len()).then_some(best)
 }
 
 /// Return a list of (mountpoint, remote_root) pairs for currently-running
@@ -194,9 +193,6 @@ pub fn is_mountpoint(path: &str) -> bool {
         .any(|m| decode_mount_path(m) == path)
 }
 
-/// Filesystems mounted at or inside `path`: deleting `path` would
-/// reach into them — a whole remote drive, perhaps. By path, from
-/// /proc/mounts; no filesystem access.
 /// Whether another drive is mounted somewhere inside `path` (not at it):
 /// rclone, reading the remote, would copy what's hidden under that drive
 /// instead of what's shown.
@@ -206,6 +202,9 @@ pub fn has_mounts_inside(path: &str) -> bool {
         .any(|m| m.trim_end_matches('/') != path.trim_end_matches('/'))
 }
 
+/// Filesystems mounted at or inside `path`: deleting `path` would
+/// reach into them — a whole remote drive, perhaps. By path, from
+/// /proc/mounts; no filesystem access.
 pub fn mountpoints_inside(path: &str) -> Vec<String> {
     let Ok(proc_mounts) = std::fs::read_to_string("/proc/mounts") else {
         return Vec::new();
@@ -1480,9 +1479,9 @@ mod fit_tests {
         let mounts = vec![("/h/Proton".to_string(), "Proton:".to_string())];
         let fuse = vec!["/h/Proton".to_string(), "/h/Proton/Work".to_string()];
         assert!(super::mount_for("/h/Proton/Work/r", &mounts, &fuse).is_none());
-        // Stacked at one place: not told apart.
-        let stacked = vec!["/h/Proton".to_string(), "/h/Proton".to_string()];
-        assert!(super::mount_for("/h/Proton/Docs", &mounts, &stacked).is_none());
+        // Listed twice at one place (propagation): still the one mount.
+        let twice = vec!["/h/Proton".to_string(), "/h/Proton".to_string()];
+        assert!(super::mount_for("/h/Proton/Docs", &mounts, &twice).is_some());
         assert_eq!(
             super::mount_for("/h/Proton/Docs", &mounts, &fuse).map(|m| m.1.as_str()),
             Some("Proton:")
