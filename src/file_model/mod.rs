@@ -68,8 +68,11 @@ pub struct DirectoryModel {
     /// a newer one has been applied is stale and dropped.
     next_seq: Rc<Cell<u64>>,
     applied_seq: Rc<Cell<u64>>,
-    /// Changes the file monitor has applied to the store.
+    /// Files the file monitor has added to or removed from the store.
     monitor_events: Rc<Cell<u64>>,
+    /// Refreshes listed again in a row, for being older than the monitor's
+    /// changes.
+    relists: Rc<Cell<u8>>,
     /// True while a navigation is waiting with nothing to show yet.
     loading: Rc<Cell<bool>>,
     /// Called when a background refresh changed the store on its own.
@@ -159,6 +162,7 @@ impl DirectoryModel {
             next_seq: Rc::new(Cell::new(0)),
             applied_seq: Rc::new(Cell::new(0)),
             monitor_events: Rc::new(Cell::new(0)),
+            relists: Rc::new(Cell::new(0)),
             loading: Rc::new(Cell::new(false)),
             on_background_update: Rc::new(RefCell::new(None)),
             on_background_error: Rc::new(RefCell::new(None)),
@@ -524,14 +528,28 @@ impl DirectoryModel {
             }
         };
 
-        if apply == Apply::Diff && self.monitor_events.get() != events {
-            // The file monitor changed the store while this was listed:
-            // the store is newer than the listing, which would bring back
-            // what was deleted meanwhile and drop what was made.
-            log::debug!("skipping listing older than the monitor's changes");
-            on_done(Some(Ok(self.store.n_items())));
+        if apply == Apply::Diff
+            && self.monitor_events.get() != events
+            && listing.path.starts_with('/')
+            && self.relists.get() < 3
+        {
+            // The file monitor added or removed files while this was
+            // listed: applied, it would bring back what was deleted
+            // meanwhile and drop what was made. List again. (A few times
+            // at most: in a folder that never stops changing, the last
+            // listing is applied as it is.)
+            log::debug!("listing again: older than the monitor's changes");
+            self.relists.set(self.relists.get() + 1);
+            let location = listing.path.clone();
+            self.run(
+                gen,
+                move || loader::list_dir(&location, false),
+                Apply::Diff,
+                on_done,
+            );
             return;
         }
+        self.relists.set(0);
 
         log::debug!("listed {}: {} entries", listing.path, listing.entries.len());
         *self.current_path.borrow_mut() = listing.path.clone();
@@ -672,7 +690,6 @@ impl DirectoryModel {
                     {
                         return;
                     }
-                    monitor_events.set(monitor_events.get() + 1);
 
                     // Get the basename of the changed file for matching
                     let changed_name = file
@@ -707,6 +724,7 @@ impl DirectoryModel {
                                 // re-sorting everything would make Orca
                                 // lose its place.)
                                 store.append(&file_obj);
+                                monitor_events.set(monitor_events.get() + 1);
                                 // It says "Calculating...": do so.
                                 if file_obj.is_directory() {
                                     // Part of the current listing's job:
@@ -726,6 +744,7 @@ impl DirectoryModel {
                         gio::FileMonitorEvent::Deleted => {
                             if let Some(idx) = find_index(&store, &changed_name) {
                                 store.remove(idx);
+                                monitor_events.set(monitor_events.get() + 1);
                             }
                         }
                         gio::FileMonitorEvent::AttributeChanged

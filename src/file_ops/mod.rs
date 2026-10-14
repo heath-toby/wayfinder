@@ -752,11 +752,11 @@ fn copy_directory_recursive(
 
     // Create the destination directory (ignore "already exists" for non-replace
     // cases, e.g. copying into an existing tree on FUSE mounts)
-    match dest.make_directory_with_parents(Some(cancellable)) {
-        Ok(()) => {}
-        Err(e) if e.matches(gio::IOErrorEnum::Exists) => {}
+    let created = match dest.make_directory_with_parents(Some(cancellable)) {
+        Ok(()) => true,
+        Err(e) if e.matches(gio::IOErrorEnum::Exists) => false,
         Err(e) => return Err(e),
-    }
+    };
 
     let metadata = if moving {
         gio::FileCopyFlags::ALL_METADATA
@@ -802,10 +802,13 @@ fn copy_directory_recursive(
 
     // The folder's own permissions (a private one stays private), and for
     // a move its dates: set last, as writing into it changes them (and a
-    // read-only one couldn't be written into). Not getting them is no
-    // reason to fail, as for files.
-    if let Err(e) = source.copy_attributes(dest, metadata, Some(cancellable)) {
-        log::warn!("Couldn't copy the attributes of {}: {e}", source.uri());
+    // read-only one couldn't be written into). Only on a folder made here,
+    // not one merged into. Not getting them is no reason to fail, as for
+    // files.
+    if created {
+        if let Err(e) = source.copy_attributes(dest, metadata, Some(cancellable)) {
+            log::warn!("Couldn't copy the attributes of {}: {e}", source.uri());
+        }
     }
     Ok(())
 }
@@ -1032,9 +1035,8 @@ fn run_with_progress(
         };
         let clear = if refusal.is_none() && replace {
             let (src_kind, dst_kind) = (kind(&src), kind(&dst));
-            let is_dir = |k| k == gio::FileType::Directory;
-            if dst_kind != gio::FileType::Unknown && is_dir(src_kind) != is_dir(dst_kind) {
-                if is_dir(dst_kind) {
+            if clear_before_replace(src_kind, dst_kind, is_move) {
+                if dst_kind == gio::FileType::Directory {
                     delete_recursive_gio(&dst, &cancellable_clone)
                 } else {
                     dst.delete(Some(&cancellable_clone))
@@ -1212,7 +1214,16 @@ fn format_time_remaining(seconds: f64) -> String {
     }
 }
 
-/// If dest already exists, append " (2)", " (3)", etc.
+/// Whether what's at the destination (`dst`) goes before a Replace with
+/// `src` starts: when it's of the other kind (GIO won't put a folder over a
+/// file or the other way round), and for a move of a folder over a folder
+/// (then the move is a rename, not a copy of everything). Otherwise the
+/// copy replaces it itself.
+fn clear_before_replace(src: gio::FileType, dst: gio::FileType, is_move: bool) -> bool {
+    let is_dir = |k| k == gio::FileType::Directory;
+    dst != gio::FileType::Unknown && (is_dir(src) != is_dir(dst) || (is_move && is_dir(src)))
+}
+
 /// Whether something is at `file` — a link too, even one leading nowhere
 /// (`query_exists` follows links, so a broken one looks free).
 fn exists_here(file: &gio::File) -> bool {
@@ -1224,13 +1235,14 @@ fn exists_here(file: &gio::File) -> bool {
 
 /// `name` numbered: `a (2).txt`. A leading dot isn't an extension's
 /// (`.bashrc (2)`, still hidden).
-fn numbered_name(name: &str, i: u32) -> String {
+pub fn numbered_name(name: &str, i: u32) -> String {
     match name.rfind('.').filter(|&dot| dot > 0) {
         Some(dot) => format!("{} ({i}){}", &name[..dot], &name[dot..]),
         None => format!("{name} ({i})"),
     }
 }
 
+/// If dest already exists, append " (2)", " (3)", etc.
 fn get_unique_dest(dest: &gio::File) -> gio::File {
     if !exists_here(dest) {
         return dest.clone();
@@ -1257,12 +1269,23 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_directory_recursive, copy_keeping_links, in_drive_bin, numbered_name, placement,
-        Placement,
+        clear_before_replace, copy_directory_recursive, copy_keeping_links, in_drive_bin,
+        numbered_name, placement, Placement,
     };
     use gtk::gio;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn replace_clears_the_other_kind_and_a_moved_folders_target() {
+        use gio::FileType::{Directory as D, Regular as F, Unknown as None_};
+        assert!(clear_before_replace(D, F, false));
+        assert!(clear_before_replace(F, D, false));
+        assert!(clear_before_replace(D, D, true));
+        assert!(!clear_before_replace(D, D, false));
+        assert!(!clear_before_replace(F, F, true));
+        assert!(!clear_before_replace(D, None_, true));
+    }
 
     #[test]
     fn copied_and_moved_folders_keep_their_permissions() {
@@ -1300,7 +1323,14 @@ mod tests {
                 "secret"
             );
             if moving {
-                assert_eq!(mtime(&dst.join("keys/id")), mtime(&src.join("keys/id")));
+                // (To the microsecond: older GLib copies no finer.)
+                let micros = |p: &std::path::Path| {
+                    mtime(p)
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros()
+                };
+                assert_eq!(micros(&dst.join("keys/id")), micros(&src.join("keys/id")));
             }
         }
         let _ = std::fs::remove_dir_all(&d);

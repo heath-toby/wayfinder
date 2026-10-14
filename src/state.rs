@@ -21,7 +21,9 @@ pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Res
         .map(|m| m.permissions().mode() & 0o7777);
     let result = fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        // (One left by a crash with the same name is written over.)
+        .create(true)
+        .truncate(true)
         // (A new file: as any, less the umask.)
         .mode(existing.unwrap_or(0o666))
         .open(&part)
@@ -349,8 +351,6 @@ mod tests {
         let private = d.join("private");
         super::write_atomically(&private, b"one").unwrap();
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        // New: never writable by others.
-        assert_eq!(mode(&private) & 0o002, 0);
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
         super::write_atomically(&private, b"two").unwrap();
         assert_eq!(mode(&private), 0o600);

@@ -1405,7 +1405,10 @@ impl WayfinderWindow {
             self.run_blocking(
                 &plan.dest_dir.clone(),
                 move || {
-                    landing.iter().any(|p| std::path::Path::new(p).exists())
+                    // (A link counts even if it leads nowhere.)
+                    landing
+                        .iter()
+                        .any(|p| std::path::Path::new(p).symlink_metadata().is_ok())
                         || has_duplicate(&landing)
                         || sources.iter().any(|p| {
                             !wayfinder::rclone_ops::is_fuse_path(p)

@@ -170,12 +170,8 @@ fn free_name(
     if !taken(&first) {
         return first;
     }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
-        _ => (name, String::new()),
-    };
     (2..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .map(|n| dir.join(wayfinder::file_ops::numbered_name(name, n)))
         .find(|p| !taken(p))
         .unwrap_or(first)
 }
