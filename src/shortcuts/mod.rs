@@ -60,6 +60,8 @@ pub fn register_shortcuts(window: &super::window::WayfinderWindow) {
 
     // Undo (restore last trashed)
     add_shortcut(&controller, "<Ctrl>z", "win.undo");
+    add_shortcut(&controller, "<Ctrl><Shift>z", "win.redo");
+    add_shortcut(&controller, "<Ctrl>y", "win.redo");
 
     // Open terminal here
     add_shortcut(&controller, "<Ctrl>grave", "win.terminal-here");

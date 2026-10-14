@@ -694,6 +694,31 @@ impl WayfinderWindow {
         column_view.sort_by_column(Some(&col), order);
     }
 
+    /// How Tab completion orders its matches: as the list is sorted.
+    pub(crate) fn completion_order(&self) -> (wayfinder::path_complete::Order, bool) {
+        use wayfinder::path_complete::Order;
+        let column_view = self.imp().list_view.column_view();
+        let Some(sorter) = column_view.sorter().and_downcast::<gtk::ColumnViewSorter>() else {
+            return (Order::Name, false);
+        };
+        let columns = column_view.columns();
+        let index = sorter.primary_sort_column().and_then(|col| {
+            (0..columns.n_items()).find(|i| {
+                columns.item(*i).and_downcast::<gtk::ColumnViewColumn>() == Some(col.clone())
+            })
+        });
+        let order = match index {
+            Some(1) => Order::Size,
+            Some(2) => Order::Modified,
+            Some(3) => Order::Kind,
+            _ => Order::Name,
+        };
+        (
+            order,
+            sorter.primary_sort_order() == gtk::SortType::Descending,
+        )
+    }
+
     /// Copy the selected files' full paths, one a line, as text (Edit >
     /// Copy Path): for a terminal, a chat, a document.
     pub fn copy_paths(&self) {
@@ -1132,6 +1157,13 @@ impl WayfinderWindow {
                 if restored.is_empty() {
                     return;
                 }
+                // Undo puts them back in the Bin.
+                w.did(BinStep::Trash(
+                    restored
+                        .iter()
+                        .map(|(_, _, dest)| (*dest).clone())
+                        .collect(),
+                ));
                 let msg = match restored.as_slice() {
                     [(name, _, dest)] => format!("Restored {name} to {dest}"),
                     _ => format!("Restored {} items", restored.len()),
@@ -1623,9 +1655,10 @@ impl WayfinderWindow {
         if self.refuse_in_offline_view() {
             return;
         }
-        // In the Bin, Delete means delete for good (after asking).
+        // In the Bin, Delete puts back (as Cmd+Backspace in the Finder;
+        // Ctrl+Z moves it to the Bin again). Shift+Delete deletes for good.
         if self.is_in_trash() {
-            self.delete_selected();
+            self.restore_selected();
             return;
         }
         // Pressing Delete again while a slow mount is still answering would
@@ -1701,7 +1734,6 @@ impl WayfinderWindow {
         results: Vec<Result<wayfinder::file_ops::TrashResult, String>>,
         since: String,
     ) {
-        let imp = self.imp();
         let mut success = 0;
         let mut failed = 0;
         let mut last_error = String::new();
@@ -1801,7 +1833,7 @@ impl WayfinderWindow {
 
         // Store trashed paths for undo (only successfully trashed ones)
         if !trashed_paths.is_empty() {
-            *imp.last_trashed.borrow_mut() = (trashed_paths.clone(), since);
+            self.did(BinStep::Restore(trashed_paths.clone(), since));
         }
 
         // Announce failures FIRST (before focus changes trigger Orca)
@@ -2953,54 +2985,116 @@ impl WayfinderWindow {
         self.update_status();
     }
 
-    pub fn undo_trash(&self) {
-        let (paths, since) = self.imp().last_trashed.borrow().clone();
-        if paths.is_empty() {
+    /// Something was moved to or from the Bin: `undo` is the step that
+    /// takes it back. (What could be redone goes: it's another way now.)
+    pub(crate) fn did(&self, undo: BinStep) {
+        self.imp().undo_steps.borrow_mut().push(undo);
+        self.imp().redo_steps.borrow_mut().clear();
+    }
+
+    /// Undo the last move to or from the Bin (Ctrl+Z).
+    pub fn undo(&self) {
+        let step = self.imp().undo_steps.borrow_mut().pop();
+        let Some(step) = step else {
             self.announce("Nothing to undo", AccessibleAnnouncementPriority::Medium);
             return;
-        }
-        self.imp().last_trashed.borrow_mut().0.clear();
+        };
+        self.take_step(step, |w, redo| w.imp().redo_steps.borrow_mut().push(redo));
+    }
 
-        // Going through the Bin, and moving files back (maybe onto a slow
-        // drive), isn't for the main thread.
-        let work_paths = paths.clone();
-        self.run_blocking(
-            "trash:///",
-            move || restore_newest(&work_paths, &since),
-            move |w, restored| {
-                if restored.is_empty() {
-                    w.announce(
-                        "Could not restore files",
-                        AccessibleAnnouncementPriority::High,
-                    );
-                    return;
-                }
-                // Reload, and drop the cached listings of the folders the
-                // files went back to.
-                let mut folders: Vec<String> = Vec::new();
-                for parent in restored.iter().filter_map(|p| parent_dir(p)) {
-                    if !folders.contains(&parent) {
-                        folders.push(parent);
-                    }
-                }
-                w.reload_after_change(&folders);
-                let name = |p: &String| {
-                    std::path::Path::new(p)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                };
-                let mut msg = match restored.as_slice() {
-                    [one] => format!("Restored {}", name(one)),
-                    _ => format!("Restored {} files", restored.len()),
-                };
-                let missed = paths.len() - restored.len();
-                if missed > 0 {
-                    msg.push_str(&format!(", {missed} could not be restored"));
-                }
-                w.announce(&msg, AccessibleAnnouncementPriority::Medium);
-            },
-        );
+    /// Do again what Undo took back (Ctrl+Shift+Z or Ctrl+Y).
+    pub fn redo(&self) {
+        let step = self.imp().redo_steps.borrow_mut().pop();
+        let Some(step) = step else {
+            self.announce("Nothing to redo", AccessibleAnnouncementPriority::Medium);
+            return;
+        };
+        self.take_step(step, |w, undo| w.imp().undo_steps.borrow_mut().push(undo));
+    }
+
+    /// Do `step` (off the main thread: the Bin, and the drives files go
+    /// back to, may be slow), say how it went, and hand `then` the step
+    /// that takes it back, if anything was done.
+    fn take_step(&self, step: BinStep, then: impl FnOnce(&WayfinderWindow, BinStep) + 'static) {
+        let name = |p: &String| {
+            std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        match step {
+            BinStep::Restore(paths, since) => {
+                let work_paths = paths.clone();
+                self.run_blocking(
+                    "trash:///",
+                    move || restore_newest(&work_paths, &since),
+                    move |w, restored| {
+                        if restored.is_empty() {
+                            w.announce(
+                                "Could not restore files",
+                                AccessibleAnnouncementPriority::High,
+                            );
+                            return;
+                        }
+                        // Reload, and drop the cached listings of the
+                        // folders the files went back to.
+                        w.reload_after_change(&parent_folders(&restored));
+                        let mut msg = match restored.as_slice() {
+                            [one] => format!("Restored {}", name(one)),
+                            _ => format!("Restored {} files", restored.len()),
+                        };
+                        let missed = paths.len() - restored.len();
+                        if missed > 0 {
+                            msg.push_str(&format!(", {missed} could not be restored"));
+                        }
+                        w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                        then(w, BinStep::Trash(restored));
+                    },
+                );
+            }
+            BinStep::Trash(paths) => {
+                let since = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                let work_paths = paths.clone();
+                self.run_blocking(
+                    &paths.first().cloned().unwrap_or_default(),
+                    move || {
+                        // (Only into the Bin: where there's none, it stays —
+                        // never deleted for good by an undo or redo.)
+                        work_paths
+                            .iter()
+                            .filter(|p| {
+                                matches!(
+                                    wayfinder::file_ops::trash_or_delete(&gio::File::for_path(p)),
+                                    Ok(wayfinder::file_ops::TrashResult::Trashed)
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<String>>()
+                    },
+                    move |w, trashed| {
+                        if trashed.is_empty() {
+                            w.announce(
+                                "Could not move the files to the Bin",
+                                AccessibleAnnouncementPriority::High,
+                            );
+                            return;
+                        }
+                        w.forget_moved(&trashed);
+                        w.reload_after_change(&parent_folders(&trashed));
+                        let mut msg = match trashed.as_slice() {
+                            [one] => format!("Moved {} to the Bin", name(one)),
+                            _ => format!("Moved {} files to the Bin", trashed.len()),
+                        };
+                        let missed = paths.len() - trashed.len();
+                        if missed > 0 {
+                            msg.push_str(&format!(", {missed} could not be"));
+                        }
+                        w.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                        then(w, BinStep::Restore(trashed, since));
+                    },
+                );
+            }
+        }
     }
 
     pub fn open_terminal_here(&self) {
@@ -3098,7 +3192,9 @@ impl WayfinderWindow {
                     ("Shift+Delete", "Delete permanently"),
                     ("Ctrl+Shift+N", "New folder"),
                     ("Ctrl+D", "Bookmark current folder"),
-                    ("Ctrl+Z", "Undo trash"),
+                    ("Ctrl+Z", "Undo moving to or from the Bin"),
+                    ("Ctrl+Shift+Z or Ctrl+Y", "Redo"),
+                    ("Delete (in the Bin)", "Restore"),
                 ],
             ),
             (
@@ -3590,6 +3686,27 @@ fn apply_zoom_css(level: i32) {
             provider.load_from_string(&format!("* {{ font-size: {size}{unit}; }}"));
         }
     });
+}
+
+/// A step Undo or Redo takes, as what it does.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BinStep {
+    /// Move these to the Bin.
+    Trash(Vec<String>),
+    /// Restore the newest items from these places that went to the Bin at
+    /// or after the time given (as `restore_newest`).
+    Restore(Vec<String>, String),
+}
+
+/// The folders `paths` are in, each once.
+fn parent_folders(paths: &[String]) -> Vec<String> {
+    let mut folders: Vec<String> = Vec::new();
+    for parent in paths.iter().filter_map(|p| parent_dir(p)) {
+        if !folders.contains(&parent) {
+            folders.push(parent);
+        }
+    }
+    folders
 }
 
 /// Restore, for each of `paths`, the most recently trashed item that came

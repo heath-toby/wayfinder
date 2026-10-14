@@ -91,7 +91,9 @@ pub struct WayfinderWindowInner {
     pub type_ahead_buffer: Rc<RefCell<String>>,
     pub type_ahead_generation: Rc<Cell<u32>>,
     /// The paths last moved to the Bin, and when (as the Bin dates them).
-    pub last_trashed: RefCell<(Vec<String>, String)>,
+    /// What Undo, and Redo, would do next (the last first).
+    pub undo_steps: RefCell<Vec<super::BinStep>>,
+    pub redo_steps: RefCell<Vec<super::BinStep>>,
     /// Paths whose move to Bin is still waiting on the filesystem.
     pub trashing: RefCell<std::collections::HashSet<String>>,
     /// Remembers the last-selected filename per directory so that
@@ -231,7 +233,8 @@ impl Default for WayfinderWindowInner {
             file_selection: RefCell::new(SelectionState::new()),
             type_ahead_buffer: Rc::new(RefCell::new(String::new())),
             type_ahead_generation: Rc::new(Cell::new(0)),
-            last_trashed: RefCell::new((Vec::new(), String::new())),
+            undo_steps: RefCell::new(Vec::new()),
+            redo_steps: RefCell::new(Vec::new()),
             trashing: RefCell::new(std::collections::HashSet::new()),
             last_position: RefCell::new(std::collections::HashMap::new()),
             pending_properties: RefCell::new(None),
@@ -366,7 +369,15 @@ impl ObjectImpl for WayfinderWindowInner {
             .position(180)
             .build();
 
-        window.set_child(Some(&paned));
+        // The menu bar, at the top (F10, or Alt and a menu's letter). Put
+        // here, not left to GtkApplicationWindow, which didn't show it.
+        let menu_bar = gtk::PopoverMenuBar::from_model(Some(&crate::menubar::menu_bar()));
+        menu_bar.update_property(&[gtk::accessible::Property::Label("Menu bar")]);
+        let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        main.append(&menu_bar);
+        main.append(&paned);
+        window.set_show_menubar(false);
+        window.set_child(Some(&main));
 
         // Restore saved view mode
         let saved_view = wayfinder::state::load_view_mode();
@@ -1016,7 +1027,14 @@ impl WayfinderWindowInner {
         let w = window.clone();
         let action = gio::SimpleAction::new("undo", None);
         action.connect_activate(move |_, _| {
-            w.undo_trash();
+            w.undo();
+        });
+        window.add_action(&action);
+
+        let w = window.clone();
+        let action = gio::SimpleAction::new("redo", None);
+        action.connect_activate(move |_, _| {
+            w.redo();
         });
         window.add_action(&action);
 
@@ -1160,65 +1178,127 @@ impl WayfinderWindowInner {
             // A relative path is taken from the folder being shown.
             let here = window.imp().model.current_path();
             let here_for_go = here.clone();
+            // Tab as the user's shell has it: the first fills in what the
+            // matches share (and says how many), each one after puts in the
+            // next match, Shift+Tab the one before; in the list's order.
+            // (matches, which is in now, the text last put in)
+            type Cycle = (Vec<String>, Option<usize>, String);
+            let cycle: Rc<RefCell<Option<Cycle>>> = Rc::new(RefCell::new(None));
+            let (order, descending) = window.completion_order();
             tab_ctrl.connect_key_pressed(move |_ctrl, key, _code, mods| {
                 use gtk::gdk;
                 if key == gdk::Key::Escape {
                     dlg_for_esc.close();
                     return glib::Propagation::Stop;
                 }
-                if key == gdk::Key::Tab && !mods.contains(gdk::ModifierType::SHIFT_MASK) {
-                    let text = entry_for_tab.text().to_string();
-                    if text.is_empty() {
-                        return glib::Propagation::Proceed;
-                    }
+                let back = key == gdk::Key::ISO_Left_Tab
+                    || (key == gdk::Key::Tab && mods.contains(gdk::ModifierType::SHIFT_MASK));
+                if key != gdk::Key::Tab && !back {
+                    return glib::Propagation::Proceed;
+                }
+                let text = entry_for_tab.text().to_string();
 
-                    // Completing lists a directory, which may be on a slow
-                    // mount; apply the result only if the text is unchanged.
-                    let entry = entry_for_tab.clone();
-                    let dlg = dlg_for_tab.clone();
-                    let dlg_slow = dlg_for_tab.clone();
-                    let typed = wayfinder::path_complete::absolute(&text, &here);
-                    let waiting = wayfinder::background::waiting_message(
-                        &wayfinder::path_complete::expand_tilde(&typed),
+                // Going through the matches (the text as last put in).
+                let going = cycle
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(all, _, shown)| *shown == text && all.len() > 1);
+                if going {
+                    let mut c = cycle.borrow_mut();
+                    let (all, at, shown) = c.as_mut().unwrap();
+                    let n = all.len();
+                    let next = match (*at, back) {
+                        (None, false) => 0,
+                        (None, true) => n - 1,
+                        (Some(i), false) => (i + 1) % n,
+                        (Some(i), true) => (i + n - 1) % n,
+                    };
+                    *at = Some(next);
+                    *shown = all[next].clone();
+                    entry_for_tab.set_text(&all[next]);
+                    entry_for_tab.set_position(-1);
+                    let name = all[next].trim_end_matches('/');
+                    let name = name.rsplit('/').next().unwrap_or(name);
+                    let folder = if all[next].ends_with('/') {
+                        ", folder"
+                    } else {
+                        ""
+                    };
+                    dlg_for_tab.announce(
+                        &format!("{name}{folder}, {} of {n}", next + 1),
+                        AccessibleAnnouncementPriority::Medium,
                     );
-                    wayfinder::background::run(
-                        move || wayfinder::path_complete::complete(&typed),
-                        move |completed| {
-                            if entry.text() != text.as_str() {
-                                return;
-                            }
-                            use wayfinder::path_complete::Completion;
-                            match completed {
-                                Completion::Text(completed) => {
-                                    let added =
-                                        wayfinder::path_complete::added_text(&text, &completed);
-                                    entry.set_text(&completed);
-                                    entry.set_position(-1);
-                                    if !added.is_empty() {
-                                        dlg.announce(added, AccessibleAnnouncementPriority::Medium);
-                                    }
-                                }
-                                Completion::Several(n) => dlg.announce(
-                                    &format!("{n} matches"),
-                                    AccessibleAnnouncementPriority::Medium,
-                                ),
-                                Completion::NoMatch if text.contains('/') => dlg.announce(
+                    return glib::Propagation::Stop;
+                }
+                // Shift+Tab otherwise moves focus back, as anywhere.
+                if back || text.is_empty() {
+                    return glib::Propagation::Proceed;
+                }
+                cycle.borrow_mut().take();
+
+                // Completing lists a directory, which may be on a slow
+                // mount; apply the result only if the text is unchanged.
+                let entry = entry_for_tab.clone();
+                let dlg = dlg_for_tab.clone();
+                let dlg_slow = dlg_for_tab.clone();
+                let cycle = cycle.clone();
+                let typed = wayfinder::path_complete::absolute(&text, &here);
+                let relative = typed != text;
+                let base = wayfinder::path_complete::absolute("", &here);
+                let waiting = wayfinder::background::waiting_message(
+                    &wayfinder::path_complete::expand_tilde(&typed),
+                );
+                wayfinder::background::run(
+                    move || {
+                        let rules = wayfinder::path_complete::shell_rules();
+                        wayfinder::path_complete::matches(&typed, rules, order, descending)
+                    },
+                    move |found| {
+                        if entry.text() != text.as_str() {
+                            return;
+                        }
+                        let Some(mut found) = found.filter(|f| !f.all.is_empty()) else {
+                            if text.contains('/') {
+                                dlg.announce(
                                     "No completions",
                                     AccessibleAnnouncementPriority::Medium,
-                                ),
-                                Completion::NoMatch => {}
+                                );
                             }
-                        },
-                        move || {
-                            if let Some(msg) = waiting {
-                                dlg_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
-                            }
-                        },
-                    );
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
+                            return;
+                        };
+                        // (Typed relative to the folder shown: kept so.)
+                        if relative {
+                            let strip = |p: &mut String| {
+                                if let Some(rest) = p.strip_prefix(&base) {
+                                    *p = rest.to_string();
+                                }
+                            };
+                            strip(&mut found.common);
+                            found.all.iter_mut().for_each(strip);
+                        }
+                        let added =
+                            wayfinder::path_complete::added_text(&text, &found.common).to_string();
+                        entry.set_text(&found.common);
+                        entry.set_position(-1);
+                        let n = found.all.len();
+                        let msg = match (n, added.is_empty()) {
+                            (1, true) => String::new(),
+                            (1, false) => added,
+                            (n, true) => format!("{n} matches. Tab goes through them"),
+                            (n, false) => format!("{added}, {n} matches. Tab goes through them"),
+                        };
+                        if !msg.is_empty() {
+                            dlg.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                        }
+                        *cycle.borrow_mut() = Some((found.all, None, found.common));
+                    },
+                    move || {
+                        if let Some(msg) = waiting {
+                            dlg_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                        }
+                    },
+                );
+                glib::Propagation::Stop
             });
             entry.add_controller(tab_ctrl);
 

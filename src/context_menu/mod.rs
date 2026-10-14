@@ -40,16 +40,30 @@ fn focused_index(buttons: &[gtk::Button]) -> Option<usize> {
 /// Focus the first of `items` once `popover` is on screen. (When it's
 /// "shown" it isn't yet: the focus could stay in the list behind, where the
 /// arrow keys then went.)
+/// Also when the keyboard reaches it (on Wayland that comes a moment after
+/// it's on screen, and focus is then put on the popover itself), and once
+/// more shortly after — each only if no item has focus yet.
 fn focus_first_when_shown(popover: &gtk::Popover, items: &gtk::Box) {
-    let items = items.clone();
-    popover.connect_map(move |pop| {
+    let focus_first = {
         let items = items.clone();
-        let pop = pop.downgrade();
-        glib::idle_add_local_once(move || {
-            if pop.upgrade().is_some_and(|p| p.is_visible()) {
-                focus_button(&get_buttons(&items), 0);
+        let pop = popover.downgrade();
+        move || {
+            let buttons = get_buttons(&items);
+            if pop.upgrade().is_some_and(|p| p.is_visible()) && focused_index(&buttons).is_none() {
+                focus_button(&buttons, 0);
             }
-        });
+        }
+    };
+    let keyboard = gtk::EventControllerFocus::new();
+    let f = focus_first.clone();
+    keyboard.connect_enter(move |_| {
+        let f = f.clone();
+        glib::idle_add_local_once(f);
+    });
+    popover.add_controller(keyboard);
+    popover.connect_map(move |_| {
+        glib::idle_add_local_once(focus_first.clone());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(200), focus_first.clone());
     });
 }
 

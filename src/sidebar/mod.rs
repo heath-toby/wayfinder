@@ -368,19 +368,37 @@ pub fn settings_check() -> gtk::CheckButton {
 
 /// Focus the first item of `popover`'s menu once it's on screen (not when
 /// it's "shown": it isn't yet, and focus would stay behind it).
+/// (Also when the keyboard reaches it, which on Wayland comes a moment
+/// later, and once more shortly after — each only if nothing in it has
+/// focus yet.)
 fn focus_first_when_shown(popover: &gtk::Popover) {
-    popover.connect_map(|pop| {
-        let pop = pop.downgrade();
-        glib::idle_add_local_once(move || {
-            if let Some(first) = pop
-                .upgrade()
-                .filter(|p| p.is_visible())
-                .and_then(|p| p.child())
-                .and_then(|menu| menu.first_child())
-            {
-                first.grab_focus();
+    let focus_first = {
+        let pop = popover.downgrade();
+        move || {
+            let Some(pop) = pop.upgrade().filter(|p| p.is_visible()) else {
+                return;
+            };
+            let inside = pop
+                .root()
+                .and_then(|r| r.focus())
+                .is_some_and(|f| f != pop.clone().upcast::<gtk::Widget>() && f.is_ancestor(&pop));
+            if !inside {
+                if let Some(first) = pop.child().and_then(|menu| menu.first_child()) {
+                    first.grab_focus();
+                }
             }
-        });
+        }
+    };
+    let keyboard = gtk::EventControllerFocus::new();
+    let f = focus_first.clone();
+    keyboard.connect_enter(move |_| {
+        let f = f.clone();
+        glib::idle_add_local_once(f);
+    });
+    popover.add_controller(keyboard);
+    popover.connect_map(move |_| {
+        glib::idle_add_local_once(focus_first.clone());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(200), focus_first.clone());
     });
 }
 

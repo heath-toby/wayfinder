@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use gtk::gio;
 use gtk::glib;
@@ -20,6 +20,11 @@ struct Details {
     came_from: Option<String>,
     /// For a link, where it leads (and whether anything is there).
     link_to: Option<String>,
+    /// For a link, the kind of what it leads to ("Folder", "Plain text
+    /// document"); `None` if nothing's there.
+    link_kind: Option<String>,
+    /// For a file with more than one name (hard links), how many it has.
+    names: Option<u64>,
 }
 
 /// Where the link at `link` leads, as shown: `target` as written, with the
@@ -38,6 +43,40 @@ fn link_target_text(link: &std::path::Path, target: &std::path::Path, exists: bo
         text.push_str(" (missing)");
     }
     text
+}
+
+/// The kind of what the link `file` leads to (following it): "Folder", or
+/// the file's type by its name ("Plain text document"). `None` if nothing
+/// is there.
+fn kind_of_target(file: &gio::File) -> Option<String> {
+    let info = file
+        .query_info(
+            "standard::type,standard::fast-content-type",
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
+        .ok()?;
+    if info.file_type() == gio::FileType::Directory {
+        return Some("Folder".to_string());
+    }
+    let content_type = info.attribute_string(gio::FILE_ATTRIBUTE_STANDARD_FAST_CONTENT_TYPE)?;
+    Some(gio::content_type_get_description(&content_type).to_string())
+}
+
+/// The Kind shown: a symbolic link says so, and the kind of what it leads
+/// to ("Symbolic link (Folder)"); a file with other names — hard links,
+/// each the same file — says how many it has.
+fn kind_text(kind: &str, is_link: bool, link_kind: Option<&str>, names: Option<u64>) -> String {
+    if is_link {
+        return match link_kind {
+            Some(target) => format!("Symbolic link ({target})"),
+            None => "Symbolic link (to nothing)".to_string(),
+        };
+    }
+    match names {
+        Some(n) => format!("{kind}, hard linked ({n} names for the same file)"),
+        None => kind.to_string(),
+    }
 }
 
 /// setuid, setgid and sticky.
@@ -95,10 +134,16 @@ fn gather_details(path: &str) -> Result<Details, String> {
         // A link has no permissions of its own (changing them would change
         // its target's): no permissions section for one.
         mode: metadata
+            .as_ref()
             .filter(|m| !m.file_type().is_symlink())
             .map(|m| m.permissions().mode()),
         came_from,
+        link_kind: link_to.as_ref().and_then(|_| kind_of_target(&file)),
         link_to,
+        names: metadata
+            .as_ref()
+            .filter(|m| m.file_type().is_file() && m.nlink() > 1)
+            .map(|m| m.nlink()),
     })
 }
 
@@ -174,12 +219,13 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
     add_info_row(&grid, row, "Name", &file.name());
     row += 1;
 
-    // (A link is a link, not "inode/symlink".)
-    let kind = if details.link_to.is_some() {
-        "Link".to_string()
-    } else {
-        file.file_type_name()
-    };
+    // (A link is a link, not "inode/symlink": and of what.)
+    let kind = kind_text(
+        &file.file_type_name(),
+        details.link_to.is_some(),
+        details.link_kind.as_deref(),
+        details.names,
+    );
     add_info_row(&grid, row, "Kind", &kind);
     row += 1;
     if let Some(link_to) = &details.link_to {
@@ -615,6 +661,24 @@ fn add_info_row(grid: &gtk::Grid, row: i32, label_text: &str, value: &str) {
 mod tests {
     use super::link_target_text;
     use std::path::Path;
+
+    #[test]
+    fn kind_tells_symbolic_links_from_hard_links() {
+        use super::kind_text;
+        assert_eq!(
+            kind_text("Link", true, Some("Folder"), None),
+            "Symbolic link (Folder)"
+        );
+        assert_eq!(
+            kind_text("Link", true, None, None),
+            "Symbolic link (to nothing)"
+        );
+        assert_eq!(
+            kind_text("Plain text document", false, None, Some(3)),
+            "Plain text document, hard linked (3 names for the same file)"
+        );
+        assert_eq!(kind_text("Folder", false, None, None), "Folder");
+    }
 
     #[test]
     fn a_link_says_where_it_leads() {

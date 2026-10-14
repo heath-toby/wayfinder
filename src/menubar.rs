@@ -1,4 +1,5 @@
-//! The menu bar (F10 opens it): Wayfinder, File, Edit, View, Go and Window.
+//! The menu bar (F10, or Alt and the menu's letter, opens it): Wayfinder
+//! (Alt+I), File, Edit, View, Go and Window.
 //! Its items are the window's actions (`win.`, those the keyboard
 //! shortcuts run) and the application's own (`app.`: About, Preferences,
 //! Quit). Each item shows its shortcut; the shortcuts themselves are in
@@ -7,7 +8,7 @@
 use gtk::gio;
 use gtk::prelude::*;
 
-/// Give `app` its menu bar and the actions only it has.
+/// Give `app` the actions only the menu bar has.
 pub fn install(app: &gtk::Application) {
     let about = gio::SimpleAction::new("about", None);
     let a = app.clone();
@@ -27,11 +28,10 @@ pub fn install(app: &gtk::Application) {
     let a = app.clone();
     quit.connect_activate(move |_, _| quit_app(&a));
     app.add_action(&quit);
-
-    app.set_menubar(Some(&menu_bar()));
 }
 
-fn menu_bar() -> gio::Menu {
+/// The menu bar's menus (each window puts them at its top).
+pub fn menu_bar() -> gio::Menu {
     let bar = gio::Menu::new();
 
     let app_menu = gio::Menu::new();
@@ -50,7 +50,7 @@ fn menu_bar() -> gio::Menu {
         None,
         &section(&[("_Quit Wayfinder", "app.quit", Some("<Ctrl>q"))]),
     );
-    bar.append_submenu(Some("_Wayfinder"), &app_menu);
+    bar.append_submenu(Some("Wayf_inder"), &app_menu);
 
     let file = gio::Menu::new();
     file.append_section(
@@ -102,7 +102,10 @@ fn menu_bar() -> gio::Menu {
     let edit = gio::Menu::new();
     edit.append_section(
         None,
-        &section(&[("_Undo Move to Bin", "win.undo", Some("<Ctrl>z"))]),
+        &section(&[
+            ("_Undo", "win.undo", Some("<Ctrl>z")),
+            ("_Redo", "win.redo", Some("<Ctrl><Shift>z")),
+        ]),
     );
     edit.append_section(
         None,
@@ -218,7 +221,7 @@ fn menu_bar() -> gio::Menu {
         None,
         &section(&[("_Operations in Progress", "win.show-operations", None)]),
     );
-    bar.append_submenu(Some("Wi_ndow"), &window);
+    bar.append_submenu(Some("_Window"), &window);
 
     bar
 }

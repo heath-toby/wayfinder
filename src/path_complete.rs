@@ -179,8 +179,332 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     &a[..end]
 }
 
+/// How names are matched in completing: as the user's shell is set up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rules {
+    /// `docu` matches `Documents`.
+    pub ignore_case: bool,
+    /// And `-` and `_` match each other.
+    pub map_case: bool,
+}
+
+/// The completion rules of the user's shell: for bash (readline),
+/// `completion-ignore-case` and `completion-map-case` in `~/.inputrc`,
+/// `/etc/inputrc`, or `bind 'set …'` in `~/.bashrc`; for zsh, a
+/// `matcher-list` in `~/.zshrc` matching case. Not set anywhere: case is
+/// ignored, as Wayfinder always has.
+pub fn shell_rules() -> Rules {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let home = dirs::home_dir().unwrap_or_default();
+    let files: Vec<std::path::PathBuf> = if shell.ends_with("zsh") {
+        vec![home.join(".zshrc")]
+    } else {
+        // (The user's own last: they override the system's.)
+        vec![
+            std::path::PathBuf::from("/etc/inputrc"),
+            std::env::var("INPUTRC")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| home.join(".inputrc")),
+            home.join(".bashrc"),
+        ]
+    };
+    let texts: Vec<String> = files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .collect();
+    rules_from(shell.ends_with("zsh"), &texts)
+}
+
+/// The rules the shell's settings `texts` (read in order: later ones win)
+/// give; `zsh` for zsh's, otherwise readline's.
+pub fn rules_from(zsh: bool, texts: &[String]) -> Rules {
+    let mut rules = Rules {
+        ignore_case: true,
+        map_case: false,
+    };
+    if zsh {
+        // zsh matches case exactly, unless a matcher-list says otherwise.
+        let mut said = None;
+        for line in texts.iter().flat_map(|t| t.lines()) {
+            let line = line.trim();
+            if line.starts_with('#') || !line.contains("matcher-list") {
+                continue;
+            }
+            said = Some(line.contains("{a-z}={A-Z}") || line.contains("{a-zA-Z}={A-Za-z}"));
+            if line.contains("-_") || line.contains("_-") {
+                rules.map_case = true;
+            }
+        }
+        if let Some(ignore) = said {
+            rules.ignore_case = ignore;
+        }
+        return rules;
+    }
+    for line in texts.iter().flat_map(|t| t.lines()) {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        // `set name value`, alone (inputrc) or in `bind '…'` (bashrc).
+        let words: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+            .filter(|w| !w.is_empty())
+            .collect();
+        for window in words.windows(3) {
+            if window[0] != "set" {
+                continue;
+            }
+            let on = window[2].eq_ignore_ascii_case("on");
+            match window[1] {
+                "completion-ignore-case" => rules.ignore_case = on,
+                "completion-map-case" => rules.map_case = on,
+                _ => {}
+            }
+        }
+    }
+    rules
+}
+
+/// How completions are ordered: as the file list is sorted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Order {
+    Name,
+    Size,
+    Modified,
+    Kind,
+}
+
+/// The matches for a typed path.
+#[derive(Debug, PartialEq)]
+pub struct Matches {
+    /// The typed text, filled in as far as all the matches agree.
+    pub common: String,
+    /// Every match, in the form typed (`~/…` stays so; a folder ends in
+    /// `/`), folders first, then in `order`.
+    pub all: Vec<String>,
+}
+
+/// Every match for `partial`, by `rules`, in `order` (`descending` or
+/// not). Lists a directory, so may block on a slow mount: call it off the
+/// main thread. `None` if it's not a full path, or the folder can't be
+/// read.
+pub fn matches(partial: &str, rules: Rules, order: Order, descending: bool) -> Option<Matches> {
+    matches_with(
+        partial,
+        dirs::home_dir().as_deref(),
+        rules,
+        order,
+        descending,
+    )
+}
+
+fn matches_with(
+    partial: &str,
+    home: Option<&Path>,
+    rules: Rules,
+    order: Order,
+    descending: bool,
+) -> Option<Matches> {
+    // `~` alone is the home folder, not a name to find in its parent.
+    if partial == "~" && home.is_some() {
+        return Some(Matches {
+            common: "~/".to_string(),
+            all: vec!["~/".to_string()],
+        });
+    }
+    let expanded = expand_with(partial, home);
+    if !expanded.starts_with('/') {
+        return None;
+    }
+    let as_typed = |path: &str| match home {
+        Some(home) if partial.starts_with('~') => contract_with(path, home),
+        _ => path.to_string(),
+    };
+    let i = expanded.rfind('/').unwrap_or(0);
+    let (dir_str, prefix) = (&expanded[..=i], &expanded[i + 1..]);
+    let entries = std::fs::read_dir(dir_str).ok()?;
+
+    let normal = |s: &str| {
+        let s = if rules.ignore_case {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        };
+        if rules.map_case {
+            s.replace('_', "-")
+        } else {
+            s
+        }
+    };
+    let wanted = normal(prefix);
+    struct Found {
+        name: String,
+        is_dir: bool,
+        size: u64,
+        modified: std::time::SystemTime,
+    }
+    let mut found: Vec<Found> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            // Hidden ones only if a `.` is typed.
+            if name.starts_with('.') && !prefix.starts_with('.') {
+                return None;
+            }
+            if !normal(&name).starts_with(&wanted) {
+                return None;
+            }
+            // (Following a link: one to a folder completes as a folder.)
+            let meta = std::fs::metadata(e.path()).or_else(|_| e.metadata()).ok();
+            Some(Found {
+                name,
+                is_dir: meta.as_ref().is_some_and(|m| m.is_dir()),
+                size: meta.as_ref().map_or(0, |m| m.len()),
+                modified: meta
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+            })
+        })
+        .collect();
+    if found.is_empty() {
+        return Some(Matches {
+            common: partial.to_string(),
+            all: Vec::new(),
+        });
+    }
+
+    let kind = |name: &str| {
+        name.rsplit_once('.')
+            .map(|(_, ext)| ext.to_lowercase())
+            .unwrap_or_default()
+    };
+    found.sort_by(|a, b| {
+        // Folders first, either way round (as the list has them).
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            let by = match order {
+                Order::Name => std::cmp::Ordering::Equal,
+                Order::Size => a.size.cmp(&b.size),
+                Order::Modified => a.modified.cmp(&b.modified),
+                Order::Kind => kind(&a.name).cmp(&kind(&b.name)),
+            }
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            if descending {
+                by.reverse()
+            } else {
+                by
+            }
+        })
+    });
+
+    let full = |f: &Found| {
+        let path = format!("{dir_str}{}", f.name);
+        as_typed(&if f.is_dir { format!("{path}/") } else { path })
+    };
+    let all: Vec<String> = found.iter().map(full).collect();
+    // As far as they all agree (by the rules: then in the first's case).
+    let names: Vec<String> = found
+        .iter()
+        .map(|f| {
+            if f.is_dir {
+                format!("{}/", f.name)
+            } else {
+                f.name.clone()
+            }
+        })
+        .collect();
+    let shared = names[1..]
+        .iter()
+        .fold(names[0].chars().count(), |n, other| {
+            names[0]
+                .chars()
+                .zip(other.chars())
+                .take(n)
+                .take_while(|(a, b)| normal(&a.to_string()) == normal(&b.to_string()))
+                .count()
+        });
+    let common_name: String = names[0].chars().take(shared).collect();
+    let common = if shared > prefix.chars().count() || names.len() == 1 {
+        as_typed(&format!("{dir_str}{common_name}"))
+    } else {
+        partial.to_string()
+    };
+    Some(Matches { common, all })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{matches_with, rules_from, Order, Rules};
+
+    #[test]
+    fn the_shells_case_rules_are_followed() {
+        let bashrc =
+            "bind 'set completion-ignore-case on'\nbind 'set completion-map-case on'\n".to_string();
+        assert_eq!(
+            rules_from(false, &[bashrc]),
+            Rules {
+                ignore_case: true,
+                map_case: true
+            }
+        );
+        let inputrc = "# hi\nset completion-ignore-case off\n".to_string();
+        assert!(!rules_from(false, &[inputrc]).ignore_case);
+        let zshrc = "zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}'\n".to_string();
+        assert!(rules_from(true, &[zshrc]).ignore_case);
+        assert!(
+            !rules_from(
+                true,
+                &["zstyle ':completion:*' matcher-list ''".to_string()]
+            )
+            .ignore_case
+        );
+    }
+
+    /// Several matches: the shared part (in the first's case), then each in
+    /// the list's order, folders first.
+    #[test]
+    fn several_matches_are_all_given_in_order() {
+        let d = std::env::temp_dir().join(format!("wayfinder-matches-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("Docs")).unwrap();
+        std::fs::write(d.join("doc_b.txt"), "bb").unwrap();
+        std::fs::write(d.join("doc-a.txt"), "a").unwrap();
+        let rules = Rules {
+            ignore_case: true,
+            map_case: true,
+        };
+        let typed = format!("{}/do", d.display());
+        let by_name = matches_with(&typed, None, rules, Order::Name, false).unwrap();
+        let by_size = matches_with(&typed, None, rules, Order::Size, true).unwrap();
+        let exact = matches_with(
+            &typed,
+            None,
+            Rules {
+                ignore_case: false,
+                map_case: false,
+            },
+            Order::Name,
+            false,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        let names = |m: &super::Matches| {
+            m.all
+                .iter()
+                .map(|p| {
+                    p.rsplit_once(&format!("{}/", d.display()))
+                        .unwrap()
+                        .1
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&by_name), ["Docs/", "doc-a.txt", "doc_b.txt"]);
+        assert_eq!(by_name.common, format!("{}/Doc", d.display()));
+        assert_eq!(names(&by_size), ["Docs/", "doc_b.txt", "doc-a.txt"]);
+        assert_eq!(names(&exact), ["doc-a.txt", "doc_b.txt"]);
+        assert_eq!(exact.common, format!("{}/doc", d.display()));
+    }
+
     #[test]
     fn a_lone_tilde_completes_to_the_home_folder() {
         assert!(matches!(
