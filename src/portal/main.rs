@@ -142,8 +142,13 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Vec<String> {
         // step with the app's.)
         .map(|name| plain_name(name).unwrap_or_else(|| "file".to_string()))
         .map(|name| {
+            // (Taken: anything there, a link leading nowhere included, or
+            // that can't be looked at — only "not found" is free.)
             let path = free_name(&dir, &name, |p| {
-                p.exists() || taken.contains(&p.to_path_buf())
+                !matches!(
+                    std::fs::symlink_metadata(p),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                ) || taken.contains(&p.to_path_buf())
             });
             taken.push(path.clone());
             gtk::gio::File::for_path(&path).uri().to_string()

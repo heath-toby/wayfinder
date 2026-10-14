@@ -141,6 +141,7 @@ fn show_item(app: &gtk::Application, path: &str, fresh: bool, properties: bool) 
         .find_map(|w| w.downcast::<crate::window::WayfinderWindow>().ok());
     let window = window.unwrap_or_else(|| crate::window::WayfinderWindow::new(app));
     window.remember_selection(&parent, &name);
+    window.note_show_requested(&parent, &name);
     if properties {
         window.show_properties_when_opened(&parent, &name);
     }

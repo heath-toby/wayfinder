@@ -493,6 +493,11 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                     add_menu_item(&main_box, &action_name, &popover, {
                         let w = window.clone();
                         move || {
+                            // (Its output would go into the offline copy, not
+                            // the drive the location names.)
+                            if w.refuse_in_offline_view() {
+                                return;
+                            }
                             let files = w.get_selected_files();
                             if files.is_empty() {
                                 w.say_marked_hidden();
@@ -508,6 +513,11 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                         let w = window.clone();
                         let a = action.clone();
                         move || {
+                            // (Its output would go into the offline copy, not
+                            // the drive the location names.)
+                            if w.refuse_in_offline_view() {
+                                return;
+                            }
                             let files = w.get_selected_files();
                             if files.is_empty() {
                                 w.say_marked_hidden();

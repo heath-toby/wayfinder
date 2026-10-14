@@ -95,6 +95,9 @@ pub struct WayfinderWindowInner {
     /// (folder, name): show this file's properties once the folder has
     /// been opened (asked for over D-Bus).
     pub pending_properties: RefCell<Option<(String, String)>>,
+    /// (folder, name): a file another app asked to be shown; if it isn't
+    /// in the list (hidden), that's said.
+    pub show_requested: RefCell<Option<(String, String)>>,
     pub breadcrumb_box: gtk::Box,
     pub breadcrumb_scroll: gtk::ScrolledWindow,
     pub breadcrumb_toggle: gtk::ToggleButton,
@@ -227,6 +230,7 @@ impl Default for WayfinderWindowInner {
             trashing: RefCell::new(std::collections::HashSet::new()),
             last_position: RefCell::new(std::collections::HashMap::new()),
             pending_properties: RefCell::new(None),
+            show_requested: RefCell::new(None),
             breadcrumb_box: gtk::Box::new(gtk::Orientation::Horizontal, 0),
             breadcrumb_scroll: gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -417,7 +421,13 @@ impl ObjectImpl for WayfinderWindowInner {
                 }
                 let win2 = w.clone();
                 glib::idle_add_local_once(move || {
-                    win2.restore_focus_to_selected();
+                    // Not out of a text field the user was typing in (the
+                    // search or location): only back to the files.
+                    let typing = gtk::prelude::GtkWindowExt::focus(&win2)
+                        .is_some_and(|f| f.is::<gtk::Text>() || f.is::<gtk::Entry>());
+                    if !typing {
+                        win2.restore_focus_to_selected();
+                    }
                 });
             }
         });
@@ -1603,8 +1613,13 @@ impl WayfinderWindowInner {
         let list_key = gtk::EventControllerKey::new();
         list_key.set_propagation_phase(gtk::PropagationPhase::Capture);
         let w1 = w.clone();
+        let w_menu = w.clone();
         list_key.connect_key_pressed(move |_ctrl, key, _code, mods| {
             use gtk::gdk;
+            // (In a menu already open on the view, the key is the menu's.)
+            if focus_in_popover(&w_menu) {
+                return glib::Propagation::Proceed;
+            }
             if key == gdk::Key::F10 && mods.contains(gdk::ModifierType::SHIFT_MASK)
                 || key == gdk::Key::Menu
             {
@@ -1618,8 +1633,13 @@ impl WayfinderWindowInner {
 
         let grid_key = gtk::EventControllerKey::new();
         grid_key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let w_menu = w.clone();
         grid_key.connect_key_pressed(move |_ctrl, key, _code, mods| {
             use gtk::gdk;
+            // (In a menu already open on the view, the key is the menu's.)
+            if focus_in_popover(&w_menu) {
+                return glib::Propagation::Proceed;
+            }
             if key == gdk::Key::F10 && mods.contains(gdk::ModifierType::SHIFT_MASK)
                 || key == gdk::Key::Menu
             {

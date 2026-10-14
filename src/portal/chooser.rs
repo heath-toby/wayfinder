@@ -498,7 +498,13 @@ pub fn show_chooser(
         let sel = selection.clone();
         let d = dlg.clone();
         let lv = list_view.clone();
+        // Enters, counted: only the latest one's check goes anywhere (one
+        // for a corrected path mustn't lose to the one before it).
+        let enters = std::rc::Rc::new(std::cell::Cell::new(0u64));
         location_entry.connect_activate(move |entry| {
+            let enter = enters.get() + 1;
+            enters.set(enter);
+            let enters = enters.clone();
             let path = wayfinder::path_complete::expand_tilde(entry.text().trim());
             if !path.starts_with('/') {
                 d.announce(
@@ -530,8 +536,9 @@ pub fn show_chooser(
             wayfinder::background::run(
                 move || std::path::Path::new(&check).is_dir(),
                 move |is_dir| {
-                    // Gone somewhere else while it was checked: leave it.
-                    if model.generation() != generation {
+                    // Gone somewhere else while it was checked, or another
+                    // Enter since: leave it.
+                    if model.generation() != generation || enters.get() != enter {
                         return;
                     }
                     if !is_dir {
@@ -815,7 +822,17 @@ pub fn show_chooser(
             let say_stale_choice = say_stale.clone();
             let (model_slow, folder_slow) = (model_accept.clone(), current_dir.clone());
             wayfinder::background::run(
-                move || save_target(std::path::Path::new(&check)),
+                // (The folder itself first: one that failed to open — gone,
+                // say — isn't a place to save in.)
+                move || {
+                    let path = std::path::Path::new(&check);
+                    match path.parent() {
+                        Some(folder) if !folder.is_dir() => {
+                            Err(format!("the folder {} can't be opened", folder.display()))
+                        }
+                        _ => save_target(path),
+                    }
+                },
                 move |found| {
                     match stale() {
                         Some("") => return,

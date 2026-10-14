@@ -305,6 +305,26 @@ impl WayfinderWindow {
                 // visited it before this session, otherwise start at 0.
                 let remembered = imp.last_position.borrow().get(path).cloned();
                 let mut selected_pos: u32 = 0;
+                let requested = imp
+                    .show_requested
+                    .take()
+                    .filter(|(folder, _)| folder == path)
+                    .map(|(_, name)| name);
+                if let Some(name) = &requested {
+                    let listed = (0..imp.model.filter_model.n_items()).any(|i| {
+                        imp.model
+                            .filter_model
+                            .item(i)
+                            .and_downcast::<FileObject>()
+                            .is_some_and(|f| f.name() == *name)
+                    });
+                    // Asked for, but not shown: say why (a hidden file).
+                    if !listed && name.starts_with('.') {
+                        self.announce_after_navigation(format!(
+                            "{name} is hidden. Press Ctrl+H to show hidden files."
+                        ));
+                    }
+                }
                 if let Some(name) = remembered {
                     let model = &imp.model.filter_model;
                     for i in 0..model.n_items() {
@@ -941,6 +961,14 @@ impl WayfinderWindow {
             .replace(Some((folder.to_string(), name.to_string())));
     }
 
+    /// `name` in `folder` was asked to be shown (by another app): if it's
+    /// hidden when the folder opens, that's said.
+    pub fn note_show_requested(&self, folder: &str, name: &str) {
+        self.imp()
+            .show_requested
+            .replace(Some((folder.to_string(), name.to_string())));
+    }
+
     /// Select `name` the next time `folder` is opened.
     pub fn remember_selection(&self, folder: &str, name: &str) {
         self.imp()
@@ -1418,11 +1446,15 @@ impl WayfinderWindow {
             self.run_blocking(
                 &plan.dest_dir.clone(),
                 move || {
-                    // (A link counts even if it leads nowhere.)
-                    landing
-                        .iter()
-                        .any(|p| std::path::Path::new(p).symlink_metadata().is_ok())
-                        || has_duplicate(&landing)
+                    // (A link counts even if it leads nowhere; one that
+                    // can't be looked at counts too: only "not found" is
+                    // free, or rclone would go over it unasked.)
+                    landing.iter().any(|p| {
+                        !matches!(
+                            std::path::Path::new(p).symlink_metadata(),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                        )
+                    }) || has_duplicate(&landing)
                         || sources.iter().any(|p| {
                             !wayfinder::rclone_ops::is_fuse_path(p)
                                 && holds_link(std::path::Path::new(p))
@@ -1815,7 +1847,7 @@ impl WayfinderWindow {
     /// In the offline copy (mount unreachable), say that files can't be
     /// changed and return true: the change would land on the copy, not the
     /// drive the location bar names.
-    fn refuse_in_offline_view(&self) -> bool {
+    pub(crate) fn refuse_in_offline_view(&self) -> bool {
         // Also inside it (a subfolder opened from the offline copy is
         // listed by its cache path): changes there would be undone by the
         // next offline refresh. A two-way sync folder's local side lives
@@ -2180,8 +2212,10 @@ impl WayfinderWindow {
                 return;
             }
             // A name, not a path: `/` or `..` would move it elsewhere.
+            // (Said from the dialog, which stays open with focus: Orca may
+            // not speak for the window behind it.)
             if !is_plain_name(&new_name) {
-                w.announce(
+                d.announce(
                     "A name can't contain / or be . or ..",
                     AccessibleAnnouncementPriority::High,
                 );
@@ -2489,7 +2523,7 @@ impl WayfinderWindow {
         rename_btn.connect_clicked(move |_| {
             let find_text = find_e.text().to_string();
             if find_text.is_empty() {
-                w.announce("Enter text to find", AccessibleAnnouncementPriority::Medium);
+                d.announce("Enter text to find", AccessibleAnnouncementPriority::Medium);
                 return;
             }
             let replace_text = replace_e.text().to_string();
@@ -2503,7 +2537,7 @@ impl WayfinderWindow {
                     continue;
                 }
                 if !is_plain_name(&new_name) {
-                    w.announce(
+                    d.announce(
                         &format!("Not renamed: {new_name} isn't a plain name (no / or ..)"),
                         AccessibleAnnouncementPriority::High,
                     );
@@ -2529,7 +2563,7 @@ impl WayfinderWindow {
             // Two files given the same new name: the second would replace
             // the first.
             if let Some(name) = duplicate_target(&pairs) {
-                w.announce(
+                d.announce(
                     &format!("Not renamed: more than one file would be called {name}"),
                     AccessibleAnnouncementPriority::High,
                 );
@@ -2762,7 +2796,7 @@ impl WayfinderWindow {
             }
             // A name, not a path: `/` or `..` would make it elsewhere.
             if !is_plain_name(&name) {
-                w.announce(
+                d.announce(
                     "A name can't contain / or be . or ..",
                     AccessibleAnnouncementPriority::High,
                 );
@@ -3651,8 +3685,12 @@ fn rename_clash(old: &str, new: &str) -> bool {
             }
         }
     }
-    let Ok(new_meta) = std::fs::symlink_metadata(new) else {
-        return false;
+    // (Only "not found" is free: a check that failed isn't taken for it,
+    // or rclone would write over what's there.)
+    let new_meta = match std::fs::symlink_metadata(new) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
     match std::fs::symlink_metadata(old) {
         Ok(old_meta) => (old_meta.dev(), old_meta.ino()) != (new_meta.dev(), new_meta.ino()),
