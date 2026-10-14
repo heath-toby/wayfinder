@@ -6,7 +6,7 @@ use gtk::AccessibleAnnouncementPriority;
 
 use crate::rclone_ops::{list_remotes, rclone_available};
 
-use super::{pair_for, remove_pair, set_pair};
+use super::{pair_for, remove_pair, set_pair, SyncPair};
 
 /// Show a dialog to configure two-way sync for the given local path.
 ///
@@ -87,14 +87,17 @@ pub fn show_dialog(
     if is_on_rclone_mount {
         crate::offline::record_mountpoints_containing(&real_path);
     }
-    // With its drive down, an existing pairing keeps the side it syncs
-    // (the bare folder isn't it); mounted, a drive's folder syncs its
-    // offline copy (which a pairing from an older version may not have),
-    // named by where the folder really is.
-    let sync_local_path = if let Some(pair) = existing.as_ref().filter(|_| !is_on_rclone_mount) {
+    // An existing pairing keeps the side it syncs — unless, its drive
+    // mounted, that's the mounted folder (a pairing from an older version):
+    // then its offline copy.
+    let keeps_side = |pair: &&SyncPair| {
+        !is_on_rclone_mount
+            || std::path::Path::new(&pair.sync_local_path).starts_with(crate::offline::cache_root())
+    };
+    let sync_local_path = if let Some(pair) = existing.as_ref().filter(keeps_side) {
         pair.sync_local_path.clone()
     } else if is_on_rclone_mount {
-        crate::offline::cache_path_for(&real_path)
+        crate::offline::cache_path_for(local_path)
             .to_string_lossy()
             .to_string()
     } else {
