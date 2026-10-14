@@ -184,15 +184,25 @@ pub fn show<W>(
     // (Results are said from this window, which has focus: Orca may not
     // speak for the one behind it.)
     dlg.present();
+    // (Focus on the status reads it out.)
     status.grab_focus();
-    status.announce(
-        labels.initial_status,
-        AccessibleAnnouncementPriority::Medium,
-    );
 
     let progress_pulse = progress.clone();
     let pulsing = std::rc::Rc::new(std::cell::Cell::new(true));
     let pulsing_ref = pulsing.clone();
+    // Said from whichever window has focus: Orca may not speak for one
+    // behind it (the progress window may have been left, or closed).
+    let say = {
+        let dlg = dlg.clone();
+        let parent = parent.clone();
+        move |msg: &str, priority: AccessibleAnnouncementPriority| {
+            if dlg.is_active() {
+                dlg.announce(msg, priority);
+            } else {
+                parent.announce(msg, priority);
+            }
+        }
+    };
     glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
         if !pulsing_ref.get() {
             return glib::ControlFlow::Break;
@@ -284,12 +294,12 @@ pub fn show<W>(
                                 .map(|f| f(&r))
                                 .unwrap_or_else(|| "Done.".to_string());
                             status_clone.set_text(&msg);
-                            status_clone.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                            say(&msg, AccessibleAnnouncementPriority::Medium);
                         }
                         Ok(_) if was_cancelled => {
                             let msg = "Cancelled before completion.";
                             status_clone.set_text(msg);
-                            status_clone.announce(msg, AccessibleAnnouncementPriority::Medium);
+                            say(msg, AccessibleAnnouncementPriority::Medium);
                         }
                         Ok(r) => {
                             let tail: String = r
@@ -304,12 +314,12 @@ pub fn show<W>(
                                 .join(" | ");
                             let msg = format!("{fail_prefix} {tail}");
                             status_clone.set_text(&msg);
-                            status_clone.announce(&msg, AccessibleAnnouncementPriority::High);
+                            say(&msg, AccessibleAnnouncementPriority::High);
                         }
                         Err(e) => {
                             let msg = format!("{error_prefix} {e}");
                             status_clone.set_text(&msg);
-                            status_clone.announce(&msg, AccessibleAnnouncementPriority::High);
+                            say(&msg, AccessibleAnnouncementPriority::High);
                         }
                     }
                     if let Some(cb) = on_complete_holder.take() {
@@ -325,7 +335,7 @@ pub fn show<W>(
                     close_clone.grab_focus();
                     let msg = "rclone disconnected unexpectedly. Operation may be incomplete.";
                     status_clone.set_text(msg);
-                    status_clone.announce(msg, AccessibleAnnouncementPriority::High);
+                    say(msg, AccessibleAnnouncementPriority::High);
                     if let Some(cb) = on_complete_holder.take() {
                         cb(false);
                     }

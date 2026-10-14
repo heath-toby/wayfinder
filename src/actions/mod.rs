@@ -595,11 +595,7 @@ pub fn show_compress_dialog(files: &[String], parent_window: &gtk::Window) {
             })
             .collect();
 
-        let tar = if has_command("bsdtar") {
-            "bsdtar"
-        } else {
-            "tar"
-        };
+        let tar = if bsdtar { "bsdtar" } else { "tar" };
         let cmd = build_compress_command(&ext, &archive_name, &basenames, tar);
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -652,12 +648,23 @@ fn build_compress_command(
 
     match ext {
         "zip" => format!("zip -r {quoted_archive} {quoted_files}"),
-        "tar.gz" => format!("{tar} czf {quoted_archive} {quoted_files}"),
-        "tar.xz" => format!("{tar} cJf {quoted_archive} {quoted_files}"),
-        "tar.zst" => format!("{tar} --zstd -cf {quoted_archive} {quoted_files}"),
-        "tar" => format!("{tar} cf {quoted_archive} {quoted_files}"),
         "7z" => format!("7z a {quoted_archive} {quoted_files}"),
-        _ => format!("{tar} czf {quoted_archive} {quoted_files}"),
+        _ => {
+            let options = match ext {
+                "tar.xz" => "cJf",
+                "tar.zst" => "--zstd -cf",
+                "tar" => "cf",
+                _ => "czf",
+            };
+            let cmd = format!("{tar} {options} {quoted_archive} {quoted_files}");
+            // GNU tar's 1 is a warning (a file changed as it was read): the
+            // archive is made.
+            if tar == "tar" {
+                format!("{cmd} || [ $? -eq 1 ]")
+            } else {
+                cmd
+            }
+        }
     }
 }
 
@@ -813,6 +820,20 @@ fn execute_nautilus_script(
 #[cfg(test)]
 mod tests {
     use super::{build_compress_command, desktop_commands, matches_mime, CustomAction};
+
+    #[test]
+    fn tar_archives_with_either_tar() {
+        let names = files(&["a"]);
+        assert_eq!(
+            build_compress_command("tar.zst", "x.tar.zst", &names, "bsdtar"),
+            "bsdtar --zstd -cf './x.tar.zst' './a'"
+        );
+        // GNU tar: a warning (1) isn't a failure.
+        assert_eq!(
+            build_compress_command("tar.xz", "x.tar.xz", &names, "tar"),
+            "tar cJf './x.tar.xz' './a' || [ $? -eq 1 ]"
+        );
+    }
 
     #[test]
     fn mime_patterns_as_file_manager_actions_write_them() {

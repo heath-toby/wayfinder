@@ -763,22 +763,29 @@ pub fn show_chooser(
             let d_slow = d_accept.clone();
             let waiting = wayfinder::background::waiting_message(&check);
             wayfinder::background::run(
-                // (Some(true): a folder of that name.)
+                // What's there by that name: a folder, a link, or a file.
                 move || {
-                    std::fs::symlink_metadata(&check)
-                        .ok()
-                        .map(|_| std::path::Path::new(&check).is_dir())
+                    std::fs::symlink_metadata(&check).ok().map(|m| {
+                        if m.is_dir() {
+                            "folder"
+                        } else if m.file_type().is_symlink() {
+                            "link"
+                        } else {
+                            "file"
+                        }
+                    })
                 },
                 move |found| {
-                    let Some(is_folder) = found else {
+                    let Some(kind) = found else {
                         send(&full_path);
                         return;
                     };
                     // A folder isn't a file to save over (the app couldn't
                     // write to it).
-                    if is_folder {
+                    // (Nor a link: the app would write wherever it leads.)
+                    if kind != "file" {
                         d.announce(
-                            &format!("{name} is a folder: give the file another name, or open the folder first"),
+                            &format!("{name} is a {kind}: give the file another name"),
                             AccessibleAnnouncementPriority::High,
                         );
                         return;
