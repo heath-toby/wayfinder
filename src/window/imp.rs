@@ -421,8 +421,10 @@ impl ObjectImpl for WayfinderWindowInner {
                 // touch the mount on this thread, and remote changes never
                 // reach it anyway): check for changes whenever the user
                 // comes back to the window instead.
+                // (The Bin too: another window may have emptied it, or
+                // restored from it, and it has no monitor.)
                 let model = &w.imp().model;
-                if model.is_fuse() && !model.is_loading() {
+                if (model.is_fuse() || w.is_in_trash()) && !model.is_loading() {
                     let w = w.clone();
                     model.refresh_if_idle(move || w.update_status());
                 }

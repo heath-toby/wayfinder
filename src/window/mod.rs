@@ -175,6 +175,9 @@ impl WayfinderWindow {
         properties: Option<(String, String)>,
     ) {
         let imp = self.imp();
+        // Asked for with this load only, whatever comes of it: not shown
+        // on some later visit.
+        let show_requested = imp.show_requested.take();
         // A folder that no longer exists resolves to its nearest parent.
         let resolved = imp.model.current_path();
         // Walked up from a folder on a drive that's been unmounted (to its
@@ -305,9 +308,8 @@ impl WayfinderWindow {
                 // visited it before this session, otherwise start at 0.
                 let remembered = imp.last_position.borrow().get(path).cloned();
                 let mut selected_pos: u32 = 0;
-                let requested = imp
-                    .show_requested
-                    .take()
+                let requested = show_requested
+                    .clone()
                     .filter(|(folder, _)| folder == path)
                     .map(|(_, name)| name);
                 if let Some(name) = &requested {
@@ -504,11 +506,12 @@ impl WayfinderWindow {
         }
     }
 
-    /// Like `reload_after_change`, then select `name` (a renamed file) once
+    /// Like `reload_after_change`, then select the renamed file once
     /// listed: otherwise its old row goes and the selection jumps to a
     /// neighbour, which a Delete pressed next would act on.
     /// `select`: the navigation (`generation()`) the rename was made in,
-    /// and the new name; nothing is selected if the user has moved on.
+    /// and the file's new path (not just its name: Recent Files may list
+    /// another of that name); nothing is selected if the user has moved on.
     pub fn reload_and_select(&self, folders: &[String], select: Option<(u64, String)>) {
         let model = &self.imp().model;
         for folder in folders {
@@ -517,7 +520,7 @@ impl WayfinderWindow {
         let w = self.clone();
         model.refresh(move |listed| {
             w.update_status();
-            let Some((generation, name)) = select else {
+            let Some((generation, new_path)) = select else {
                 return;
             };
             if !listed || w.imp().model.generation() != generation {
@@ -528,7 +531,7 @@ impl WayfinderWindow {
                 selection
                     .item(i)
                     .and_downcast::<FileObject>()
-                    .is_some_and(|f| f.name() == name)
+                    .is_some_and(|f| f.path() == new_path)
             });
             if let Some(pos) = found {
                 selection.set_selected(pos);
@@ -1557,15 +1560,17 @@ impl WayfinderWindow {
         // Pressing Delete again while a slow mount is still answering would
         // trash (or offer to permanently delete) the same files twice, so
         // skip files already on their way.
+        let selected = self.get_selected_files();
         let files: Vec<FileObject> = {
             let trashing = self.imp().trashing.borrow();
-            self.get_selected_files()
-                .into_iter()
+            selected
+                .iter()
                 .filter(|f| !trashing.contains(&f.path()))
+                .cloned()
                 .collect()
         };
         if files.is_empty() {
-            self.say_marked_hidden();
+            self.say_none_left(&selected);
             return;
         }
         // A drive mounted inside goes along into the Bin, and emptying the
@@ -1948,13 +1953,35 @@ impl WayfinderWindow {
         });
     }
 
+    /// Nothing to remove: the files selected are all already on their way
+    /// to the Bin (said, or the key seems to do nothing), or none are.
+    fn say_none_left(&self, selected: &[FileObject]) {
+        if selected.is_empty() {
+            self.say_marked_hidden();
+        } else {
+            self.announce(
+                "Already being moved to the Bin",
+                AccessibleAnnouncementPriority::Medium,
+            );
+        }
+    }
+
     pub fn delete_selected(&self) {
         if self.refuse_in_offline_view() {
             return;
         }
-        let files = self.get_selected_files();
+        // (Not files already on their way to the Bin: two removals at once.)
+        let selected = self.get_selected_files();
+        let files: Vec<FileObject> = {
+            let trashing = self.imp().trashing.borrow();
+            selected
+                .iter()
+                .filter(|f| !trashing.contains(&f.path()))
+                .cloned()
+                .collect()
+        };
         if files.is_empty() {
-            self.say_marked_hidden();
+            self.say_none_left(&selected);
             return;
         }
         let paths: Vec<String> = files.iter().map(|f| f.path()).collect();
@@ -2275,13 +2302,7 @@ impl WayfinderWindow {
                                     note_renames(&renamed);
                                 }
                                 w_done.forget_moved(&moved);
-                                let select = succeeded.then(|| {
-                                    let name = std::path::Path::new(&renamed[0].1)
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    (generation, name)
-                                });
+                                let select = succeeded.then(|| (generation, renamed[0].1.clone()));
                                 w_done.reload_and_select(&changed, select);
                             }));
                         wayfinder::rclone_ops::rename_with_progress(
@@ -2308,19 +2329,20 @@ impl WayfinderWindow {
                 },
                 move |w, result| match result {
                     Ok((new_name, new_path)) => {
-                        if let Some(new_path) = new_path {
-                            note_renames(&[(
-                                moved[0].clone(),
-                                new_path.to_string_lossy().to_string(),
-                            )]);
-                        }
+                        let new_path = new_path
+                            .unwrap_or_else(|| {
+                                std::path::Path::new(&moved[0]).with_file_name(&new_name)
+                            })
+                            .to_string_lossy()
+                            .to_string();
+                        note_renames(&[(moved[0].clone(), new_path.clone())]);
                         w.announce(
                             &format!("Renamed to {new_name}"),
                             AccessibleAnnouncementPriority::Medium,
                         );
                         // Reload directory as fallback in case file monitor doesn't catch the rename
                         w.forget_moved(&moved);
-                        w.reload_and_select(&changed, Some((generation, new_name)));
+                        w.reload_and_select(&changed, Some((generation, new_path)));
                     }
                     Err(e) => {
                         w.announce(
@@ -2596,7 +2618,7 @@ impl WayfinderWindow {
 
             if all_rclone {
                 let parent: gtk::Window = w.clone().upcast();
-                let changed = vec![w.imp().model.current_path()];
+                let changed = renamed_in(&pairs);
                 let moved: Vec<String> = pairs.iter().map(|(old, _)| old.clone()).collect();
                 d.close();
                 // rclone would overwrite a file that already has a new name;
@@ -2653,7 +2675,7 @@ impl WayfinderWindow {
 
             d.close();
             let current = w.imp().model.current_path();
-            let changed = vec![current.clone()];
+            let changed = renamed_in(&pairs);
             let moved: Vec<String> = pairs.iter().map(|(old, _)| old.clone()).collect();
             w.run_blocking(
                 &current,
@@ -2986,6 +3008,11 @@ impl WayfinderWindow {
     }
 
     pub fn open_terminal_here(&self) {
+        // (Not in the offline copies: what's done there is undone at their
+        // next refresh.)
+        if self.refuse_in_offline_view() {
+            return;
+        }
         // Recent Files and the Bin aren't folders a terminal can be in.
         if self.refuse_in_special_location_with(|place| {
             format!("A terminal can't be opened in {place}")
@@ -3684,6 +3711,19 @@ fn is_plain_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
+/// The folders files in `pairs` (old, new) were renamed in: their
+/// cached listings are out of date. (By the files' own folders: in Recent
+/// Files the location shown is none of them.)
+fn renamed_in(pairs: &[(String, String)]) -> Vec<String> {
+    let mut folders: Vec<String> = Vec::new();
+    for folder in pairs.iter().filter_map(|(old, _)| parent_dir(old)) {
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    }
+    folders
+}
+
 /// Whether any path appears twice.
 fn has_duplicate(paths: &[String]) -> bool {
     let mut seen = std::collections::HashSet::new();
@@ -4163,6 +4203,17 @@ mod tests {
             super::range_from_anchor(5, at, "/d/b", gtk::INVALID_LIST_POSITION),
             None
         );
+    }
+
+    /// Renaming in Recent Files: the files' own folders are out of date.
+    #[test]
+    fn renames_mark_the_files_own_folders() {
+        let pairs = [
+            ("/a/x".to_string(), "/a/y".to_string()),
+            ("/b/x".to_string(), "/b/y".to_string()),
+            ("/a/z".to_string(), "/a/w".to_string()),
+        ];
+        assert_eq!(super::renamed_in(&pairs), ["/a", "/b"]);
     }
 
     /// Undo doesn't restore an older item from the same place, binned

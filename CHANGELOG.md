@@ -171,6 +171,11 @@
 - **Hiding the sidebar** (F3) with focus in it — focus goes to the files, instead of nowhere.
 - **Context menus** — Down with no item focused goes to the first item, not the second.
 - **Sidebar** — the Menu key (or Shift+F10) on the Bin opens its own menu with Empty Bin, as right-click does; removing a bookmark names it as it's shown.
+- **Renaming in Recent Files** — the renamed file is the one selected afterwards (another of the same name, from another folder, could be — and a Delete pressed next would go to it); renaming several there no longer leaves their folders' cached listings showing the old names.
+- **Requests from other apps to show a file** — one that couldn't be shown then (the drive was unreachable) is no longer announced on a later, unrelated visit.
+- **The Bin in several windows** — emptying it, or restoring from it, in one window shows in the others when you go to them.
+- **Delete pressed again** while a file is still going to the Bin (on a slow drive) says so, instead of nothing; Shift+Delete leaves such a file alone instead of deleting it at the same time.
+- **Open Terminal Here in the offline copy** is refused, as other changes there are.
 
 ### Development
 
