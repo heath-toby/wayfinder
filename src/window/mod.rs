@@ -3738,10 +3738,11 @@ fn special_uri_root(uri: &str) -> &str {
 
 /// What Ctrl+D bookmarks for the folder shown at `current`: in the
 /// offline copies (the drive down, or a folder opened from one), the folder
-/// it's a copy of; a two-way sync folder's working copy (`in_sync`), and
-/// anything else, as itself.
-pub(crate) fn bookmark_target(current: &str, in_sync: bool) -> String {
-    if in_sync {
+/// it's a copy of — which the location shows in the offline view, even if
+/// that copy is also a two-way sync folder's; a sync folder's working copy
+/// opened as such (`in_sync`), and anything else, as itself.
+pub(crate) fn bookmark_target(current: &str, offline_view: bool, in_sync: bool) -> String {
+    if in_sync && !offline_view {
         return current.to_string();
     }
     wayfinder::offline::original_of_copy(std::path::Path::new(current))
@@ -3773,11 +3774,19 @@ mod tests {
     fn bookmarks_in_the_offline_copies_are_of_the_folders_they_copy() {
         let copy = wayfinder::offline::cache_root().join("home/u/Drive/Docs");
         let copy = copy.to_string_lossy();
-        assert_eq!(super::bookmark_target(&copy, false), "/home/u/Drive/Docs");
-        // A sync folder's working copy is a place of its own.
-        assert_eq!(super::bookmark_target(&copy, true), copy);
         assert_eq!(
-            super::bookmark_target("/home/u/Work", false),
+            super::bookmark_target(&copy, false, false),
+            "/home/u/Drive/Docs"
+        );
+        // The offline view of a synced folder: the folder it shows.
+        assert_eq!(
+            super::bookmark_target(&copy, true, true),
+            "/home/u/Drive/Docs"
+        );
+        // A sync folder's working copy is a place of its own.
+        assert_eq!(super::bookmark_target(&copy, false, true), copy);
+        assert_eq!(
+            super::bookmark_target("/home/u/Work", false, false),
             "/home/u/Work"
         );
     }

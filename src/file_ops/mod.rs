@@ -191,27 +191,32 @@ pub fn rename_file(file: &gio::File, new_name: &str) -> Result<gio::File, glib::
     let case_only = old_name
         .as_deref()
         .is_some_and(|old| is_case_only_change(old, new_name));
-    // (The name "taken" by the file itself, not by another one beside it.)
+    // (The name "taken" by the file itself, not by another one beside it:
+    // the folder holds nothing spelled exactly so. Inode numbers can't
+    // tell — some such drives number a file differently by spelling.)
     let same_file = || {
-        use std::os::unix::fs::MetadataExt;
-        let (Some(from), Some(parent)) = (
-            file.path(),
-            file.path()
-                .and_then(|p| p.parent().map(std::path::Path::to_path_buf)),
-        ) else {
+        let Some(parent) = file
+            .path()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        else {
             return false;
         };
-        match (
-            std::fs::symlink_metadata(&from),
-            std::fs::symlink_metadata(parent.join(new_name)),
-        ) {
-            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-            _ => false,
-        }
+        std::fs::read_dir(parent).is_ok_and(|entries| {
+            !entries
+                .flatten()
+                .any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
+        })
     };
     match direct {
         Err(e) if case_only && e.matches(gio::IOErrorEnum::Exists) && same_file() => {
-            let step = format!(".{new_name}.wayfinder-renaming");
+            // Short (a long name's case can change too) and of its own (one
+            // left by an earlier failure doesn't stand in the way).
+            static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let step = format!(
+                ".wayfinder-renaming-{}-{}",
+                std::process::id(),
+                STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
             let between = file.set_display_name(&step, gio::Cancellable::NONE)?;
             between
                 .set_display_name(new_name, gio::Cancellable::NONE)
@@ -1321,6 +1326,22 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_case_only_rename_never_goes_over_another_file() {
+        let d = std::env::temp_dir().join(format!("wayfinder-clash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("foo"), "mine").unwrap();
+        std::fs::write(d.join("Foo"), "other").unwrap();
+        let result = rename_file(&gio::File::for_path(d.join("foo")), "Foo");
+        let other = std::fs::read_to_string(d.join("Foo")).unwrap();
+        let mine = std::fs::read_to_string(d.join("foo")).ok();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(result.is_err());
+        assert_eq!(other, "other");
+        assert_eq!(mine.as_deref(), Some("mine"));
+    }
+
     #[test]
     fn a_long_name_changes_case_directly() {
         let d = std::env::temp_dir().join(format!("wayfinder-long-{}", std::process::id()));

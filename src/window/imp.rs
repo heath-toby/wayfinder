@@ -798,7 +798,7 @@ impl WayfinderWindowInner {
             // In the offline copy (the drive down): the folder it's a copy
             // of, which the location shows — not Wayfinder's cache.
             let in_sync = wayfinder::offline::inside_sync_folder(std::path::Path::new(&path));
-            let path = super::bookmark_target(&path, in_sync);
+            let path = super::bookmark_target(&path, w.imp().offline_view.get(), in_sync);
             // The Bin and Recent Files aren't folders: a bookmark to them
             // would open nothing.
             if !path.starts_with('/') {
