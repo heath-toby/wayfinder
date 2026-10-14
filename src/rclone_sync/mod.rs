@@ -146,20 +146,7 @@ fn remote_refusal(
 /// for rclone FUSE mounts this should be the offline cache path.
 pub fn set_pair(local_path: &str, sync_local_path: &str, remote: &str) -> Result<(), String> {
     let mut pairs = load_pairs();
-    // A mount's folder edited while its drive is down: its sync side is
-    // still the offline copy, not the bare (empty) mountpoint.
     let cache_root = crate::offline::cache_root();
-    let sync_local_path = match pairs.get(local_path) {
-        Some(old)
-            if std::path::Path::new(&old.sync_local_path).starts_with(&cache_root)
-                && !std::path::Path::new(sync_local_path).starts_with(&cache_root)
-                && crate::offline::path_is_in_known_mountpoint(local_path) =>
-        {
-            old.sync_local_path.clone()
-        }
-        _ => sync_local_path.to_string(),
-    };
-    let sync_local_path = sync_local_path.as_str();
     let mount_remote = crate::rclone_ops::rclone_for_path(
         &crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(local_path))
             .to_string_lossy(),
