@@ -231,30 +231,91 @@ enum ConflictChoice {
     Replace,
     Skip,
     Rename(gio::File),
+    /// Stop the whole copy or move (nothing has been copied yet).
+    Stop,
 }
 
-/// Show a conflict resolution dialog when the destination already exists.
-/// Returns the user's choice via a channel.
+/// How the item already at a destination compares, by date, with the one
+/// being copied or moved there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Age {
+    Newer,
+    Older,
+    Same,
+    Unknown,
+}
+
+/// How `existing` compares by date with `source` (touching both, perhaps
+/// on a slow mount: off the main thread).
+fn age_of_existing(source: &gio::File, existing: &gio::File) -> Age {
+    let time = |f: &gio::File| {
+        f.query_info(
+            "time::modified",
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            gio::Cancellable::NONE,
+        )
+        .ok()
+        .and_then(|i| i.modification_date_time())
+        .map(|d| d.to_unix())
+    };
+    match (time(source), time(existing)) {
+        (Some(s), Some(e)) if e > s => Age::Newer,
+        (Some(s), Some(e)) if e < s => Age::Older,
+        (Some(_), Some(_)) => Age::Same,
+        _ => Age::Unknown,
+    }
+}
+
+/// The question asked when `name` is already where it's going, as the
+/// Finder puts it: which is newer, and whether to replace it.
+fn conflict_text(name: &str, age: Age, is_move: bool) -> (String, String) {
+    let doing = if is_move { "moving" } else { "copying" };
+    match age {
+        Age::Newer => (
+            format!("A newer item named {name} already exists here"),
+            format!("Do you want to replace it with the older one you're {doing}?"),
+        ),
+        Age::Older => (
+            format!("An older item named {name} already exists here"),
+            format!("Do you want to replace it with the newer one you're {doing}?"),
+        ),
+        Age::Same => (
+            format!("An item named {name} already exists here"),
+            format!("It has the same date as the one you're {doing}. Do you want to replace it?"),
+        ),
+        Age::Unknown => (
+            format!("An item named {name} already exists here"),
+            "Do you want to replace it?".to_string(),
+        ),
+    }
+}
+
+/// Ask what to do now that `dest` is taken: Stop, Skip, Keep Both or
+/// Replace. (Escape stops; Enter skips.)
 fn show_conflict_dialog(
     name: &str,
+    age: Age,
+    is_move: bool,
     dest: &gio::File,
     parent_window: &gtk::Window,
     callback: impl FnOnce(ConflictChoice) + 'static,
 ) {
+    let (message, detail) = conflict_text(name, age, is_move);
     let dialog = gtk::AlertDialog::builder()
-        .message(format!("{name} already exists"))
-        .detail("What would you like to do?")
-        .buttons(["Skip", "Rename (keep both)", "Replace"])
+        .message(message)
+        .detail(detail)
+        .buttons(["Stop", "Skip", "Keep Both", "Replace"])
         .cancel_button(0)
-        .default_button(0)
+        .default_button(1)
         .build();
 
     let dest = dest.clone();
     let parent = parent_window.clone();
     dialog.choose(Some(parent_window), gio::Cancellable::NONE, move |result| {
         match result {
-            Ok(2) => callback(ConflictChoice::Replace),
-            Ok(1) => {
+            Ok(3) => callback(ConflictChoice::Replace),
+            Ok(1) => callback(ConflictChoice::Skip),
+            Ok(2) => {
                 // Finding a free name probes the destination, which may be
                 // on a slow mount.
                 crate::background::run(
@@ -272,7 +333,7 @@ fn show_conflict_dialog(
                     || {},
                 );
             }
-            _ => callback(ConflictChoice::Skip),
+            _ => callback(ConflictChoice::Stop),
         }
     });
 }
@@ -676,6 +737,22 @@ fn get_unique_dest(dest: &gio::File) -> Result<gio::File, glib::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_clash_says_which_is_newer() {
+        use super::{conflict_text, Age};
+        assert_eq!(
+            conflict_text("example.txt", Age::Newer, false),
+            (
+                "A newer item named example.txt already exists here".to_string(),
+                "Do you want to replace it with the older one you're copying?".to_string()
+            )
+        );
+        assert_eq!(
+            conflict_text("a", Age::Older, true).1,
+            "Do you want to replace it with the newer one you're moving?"
+        );
+    }
+
     /// Keep both: the next free number, never the taken name; a name
     /// that can't be checked (too long with its number) is an error.
     #[test]

@@ -191,6 +191,7 @@
 - **Context menus** — Down and Up go through a menu as soon as it opens (focus could stay in the list behind it, where Up reached the column buttons); the sidebar's menus start on their first item too.
 - **The Bin** — an Original Location column shows where each item was deleted from (and Orca reads it with the row: "report.pdf, 2 MB, PDF document, from /home/u/Documents"; Left and Right reach it too); Properties is in its context menu.
 - **Two-way sync** leaves out Wayfinder's own part-downloaded offline copies (`*.wayfinder-part`) and LibreOffice's lock files (`.~lock.…#`): one of each kind had been uploaded to the remote, and a synced lock file makes a document look open elsewhere.
+- **When a name is taken** in a copy or move, the question says which is newer, as the Finder does ("A newer item named example.txt already exists here. Do you want to replace it with the older one you're copying?"), and offers Stop, Skip, Keep Both and Replace. Stop (or Escape) stops the whole copy before anything is copied; Enter skips.
 
 ### Development
 

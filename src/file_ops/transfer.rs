@@ -152,10 +152,15 @@ fn plan(
     let waiting = crate::background::waiting_message(&dest_dir_path.to_string_lossy());
     let parent_slow = parent.clone();
     let dest_for_check = dest.clone();
+    let source_for_check = source.clone();
     crate::background::run(
-        move || super::exists_here(&dest_for_check),
-        move |exists| {
-            if !exists {
+        // (And, if it's taken, which is newer: for the question.)
+        move || {
+            super::exists_here(&dest_for_check)
+                .then(|| super::age_of_existing(&source_for_check, &dest_for_check))
+        },
+        move |taken| {
+            let Some(age) = taken else {
                 planned.push(Planned {
                     source: src_path,
                     dest: dest_path,
@@ -163,44 +168,61 @@ fn plan(
                 });
                 next(planned, parent, dest_dir, done);
                 return;
-            }
+            };
             let parent_for_choice = parent.clone();
             let dialog_name = display_name.clone();
-            super::show_conflict_dialog(&dialog_name, &dest, &parent, move |choice| {
-                match choice {
-                    ConflictChoice::Skip => {
-                        parent_for_choice.announce(
-                            &format!("Skipped {display_name}"),
-                            AccessibleAnnouncementPriority::Medium,
-                        );
-                    }
-                    // Replacing would delete the source itself (or the
-                    // folder holding it) before copying it.
-                    ConflictChoice::Replace
-                        if super::placement(&src_path, &dest_path) != Placement::Elsewhere =>
-                    {
-                        parent_for_choice.announce(
-                            &format!("Cannot replace {display_name} with itself"),
-                            AccessibleAnnouncementPriority::High,
-                        );
-                    }
-                    ConflictChoice::Replace => planned.push(Planned {
-                        source: src_path,
-                        dest: dest_path,
-                        replace: true,
-                    }),
-                    ConflictChoice::Rename(renamed) => {
-                        if let Some(renamed) = renamed.path() {
-                            planned.push(Planned {
-                                source: src_path,
-                                dest: renamed,
-                                replace: false,
-                            });
+            super::show_conflict_dialog(
+                &dialog_name,
+                age,
+                is_move,
+                &dest,
+                &parent,
+                move |choice| {
+                    match choice {
+                        // Nothing's been copied yet: none of it is.
+                        ConflictChoice::Stop => {
+                            let verb = if is_move { "moved" } else { "copied" };
+                            parent_for_choice.announce(
+                                &format!("Stopped. Nothing was {verb}"),
+                                AccessibleAnnouncementPriority::Medium,
+                            );
+                            done(Vec::new(), parent_for_choice, dest_dir);
+                            return;
+                        }
+                        ConflictChoice::Skip => {
+                            parent_for_choice.announce(
+                                &format!("Skipped {display_name}"),
+                                AccessibleAnnouncementPriority::Medium,
+                            );
+                        }
+                        // Replacing would delete the source itself (or the
+                        // folder holding it) before copying it.
+                        ConflictChoice::Replace
+                            if super::placement(&src_path, &dest_path) != Placement::Elsewhere =>
+                        {
+                            parent_for_choice.announce(
+                                &format!("Cannot replace {display_name} with itself"),
+                                AccessibleAnnouncementPriority::High,
+                            );
+                        }
+                        ConflictChoice::Replace => planned.push(Planned {
+                            source: src_path,
+                            dest: dest_path,
+                            replace: true,
+                        }),
+                        ConflictChoice::Rename(renamed) => {
+                            if let Some(renamed) = renamed.path() {
+                                planned.push(Planned {
+                                    source: src_path,
+                                    dest: renamed,
+                                    replace: false,
+                                });
+                            }
                         }
                     }
-                }
-                next(planned, parent_for_choice, dest_dir, done);
-            });
+                    next(planned, parent_for_choice, dest_dir, done);
+                },
+            );
         },
         move || {
             if let Some(msg) = waiting {
