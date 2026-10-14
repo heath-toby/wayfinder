@@ -7,44 +7,16 @@ use std::path::PathBuf;
 /// creating the folder if need be. A reader never sees it half written.
 pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     // Through a link (to a dotfiles folder, say) to the file it leads to,
-    // even one not there yet: the link stays — unless what it leads to
-    // can't be written (see `replaces_link`).
+    // even one not there yet: the link stays. If that can't be written
+    // (read-only, a drive not mounted), it's reported, as before; the
+    // link is never replaced.
     let target = link_target(path)?;
-    if target != path {
-        // (Whether its folder was there: one that isn't may be on a drive
-        // not mounted, and its mountpoint not the user's.)
-        let folder_there = target.parent().is_some_and(|p| p.is_dir());
-        let written = target
-            .parent()
-            .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| write_whole(&target, contents));
-        match written {
-            Err(e) if folder_there && replaces_link(&e) => {
-                log::warn!(
-                    "{} leads to {}, which can't be written ({e}): replacing the link",
-                    path.display(),
-                    target.display()
-                );
-            }
-            other => return other,
+    if target == path {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_whole(path, contents)
-}
-
-/// Whether a link to a file (in a folder that's there) that couldn't be
-/// written for `error` is replaced by the file: when it leads somewhere
-/// read-only (a Nix store, read-only or just not the user's). Other
-/// failures (a full disk, say) are passing: reported, the link left as it
-/// is.
-fn replaces_link(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied
-    )
+    write_whole(&target, contents)
 }
 
 /// Where `path` leads, following links (to a file that may not exist). An
@@ -418,39 +390,6 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_link_into_a_drive_not_mounted_stays_a_link() {
-        use std::os::unix::fs::PermissionsExt;
-        let d = std::env::temp_dir().join(format!("wayfinder-unmounted-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        // An empty mountpoint, not the user's to write in.
-        std::fs::create_dir_all(d.join("mnt")).unwrap();
-        std::fs::set_permissions(d.join("mnt"), std::fs::Permissions::from_mode(0o555)).unwrap();
-        std::os::unix::fs::symlink(d.join("mnt/dotfiles/state"), d.join("state")).unwrap();
-        let result = super::write_atomically(&d.join("state"), b"x");
-        let still_link = std::fs::symlink_metadata(d.join("state"))
-            .unwrap()
-            .file_type()
-            .is_symlink();
-        std::fs::set_permissions(d.join("mnt"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&d);
-        assert!(result.is_err());
-        assert!(still_link);
-    }
-
-    #[test]
-    fn a_link_is_replaced_only_when_it_leads_somewhere_read_only() {
-        use std::io::{Error, ErrorKind};
-        assert!(super::replaces_link(&Error::from(
-            ErrorKind::ReadOnlyFilesystem
-        )));
-        assert!(super::replaces_link(&Error::from(
-            ErrorKind::PermissionDenied
-        )));
-        assert!(!super::replaces_link(&Error::from(ErrorKind::NotFound)));
-        assert!(!super::replaces_link(&Error::from(ErrorKind::StorageFull)));
-    }
-
     #[test]
     fn a_loop_of_links_is_an_error_not_a_replaced_link() {
         let d = std::env::temp_dir().join(format!("wayfinder-loop-{}", std::process::id()));

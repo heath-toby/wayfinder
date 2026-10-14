@@ -768,15 +768,6 @@ impl WayfinderWindow {
         // If the file is executable, run it directly instead of opening
         // it with a text editor (which is GIO's default for scripts).
         if is_executable_file(&path) {
-            // Its folder gone meanwhile: say so (it can't be run there, nor
-            // opened).
-            if let Some(dir) = std::path::Path::new(&path).parent().filter(|d| !d.is_dir()) {
-                self.announce(
-                    &format!("{} is no longer there", dir.display()),
-                    AccessibleAnnouncementPriority::High,
-                );
-                return;
-            }
             match self.execute_file(&path, &file.name()) {
                 Ok(()) => return,
                 Err(e) => {
@@ -820,14 +811,7 @@ impl WayfinderWindow {
             ];
             // Wrap the script in a shell that keeps the terminal open after
             // the script exits so output stays visible.
-            // The shell goes to its folder (a terminal set to start in one
-            // of its own would ignore one it was started in), and doesn't
-            // run it anywhere else.
-            let wrapped = format!(
-                "cd -- {} && {} ; echo ; echo \"[Press Enter to close]\" ; read",
-                shell_quote(&dir.to_string_lossy()),
-                shell_quote(path)
-            );
+            let wrapped = script_command(dir, path);
             let tail = ["sh", "-c", wrapped.as_str()];
             spawn_first(terminals, &tail)?;
             self.announce(
@@ -3662,6 +3646,18 @@ fn reap(child: std::process::Child) {
     glib::child_watch_add_local(glib::Pid(child.id() as i32), |_, _| {});
 }
 
+/// The shell command that runs the script at `path` in a terminal: in its
+/// own folder `dir` (gone to by the shell: a terminal set to start in one
+/// of its own ignores the one it's started in), and only there; then
+/// waiting for Enter, so its output can be read.
+fn script_command(dir: &std::path::Path, path: &str) -> String {
+    format!(
+        "cd -- {} && {} ; echo ; echo \"[Press Enter to close]\" ; read _",
+        shell_quote(&dir.to_string_lossy()),
+        shell_quote(path)
+    )
+}
+
 /// How many characters of `name` come before its extension: what Rename
 /// selects. (In characters, as the entry counts: `Résumé.pdf` is 6.) A
 /// leading dot isn't an extension's: all of `.bashrc` is selected, as is
@@ -3678,6 +3674,25 @@ fn stem_chars(name: &str, is_dir: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scripts_run_in_their_folder_and_wait_for_enter_in_any_sh() {
+        let cmd = super::script_command(
+            std::path::Path::new("/home/u/my dir"),
+            "/home/u/my dir/b.sh",
+        );
+        assert_eq!(
+            cmd,
+            "cd -- '/home/u/my dir' && '/home/u/my dir/b.sh' ; echo ; echo \"[Press Enter to close]\" ; read _"
+        );
+        // dash wants a name to read into, as POSIX does.
+        let status = std::process::Command::new("sh")
+            .args(["-c", "read _"])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.code().is_some());
+    }
+
     #[test]
     fn rename_selects_the_name_before_the_extension_in_characters() {
         assert_eq!(super::stem_chars("Résumé.pdf", false), 6);
