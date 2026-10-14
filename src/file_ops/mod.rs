@@ -142,12 +142,7 @@ pub fn restore_from_trash(file: &gio::File) -> Result<String, glib::Error> {
         let _ = parent.make_directory_with_parents(gio::Cancellable::NONE);
     }
 
-    let dest = get_unique_dest(&dest).ok_or_else(|| {
-        glib::Error::new(
-            gio::IOErrorEnum::Exists,
-            "No free name to restore it under in its original folder",
-        )
-    })?;
+    let dest = get_unique_dest(&dest)?;
     file.move_(
         &dest,
         gio::FileCopyFlags::NONE,
@@ -342,11 +337,19 @@ pub fn delete_with_progress(
         // closes with consistent state.
         dlg_for_cancel.set_title(Some("Cancelling..."));
     });
-    // Closing the window (Alt+F4) stops it too: not deleting on unseen.
+    // Closing the window (Alt+F4) stops it too, as Cancel does — and like
+    // Cancel, the window stays until the item being deleted is done, rather
+    // than going while it's deleted unseen. (Closed when done by destroy.)
     let cancelled_for_close = cancelled.clone();
-    dlg.connect_close_request(move |_| {
-        cancelled_for_close.store(true, Ordering::Relaxed);
-        glib::Propagation::Proceed
+    dlg.connect_close_request(move |d| {
+        if !cancelled_for_close.swap(true, Ordering::Relaxed) {
+            d.set_title(Some("Cancelling..."));
+            d.announce(
+                "Cancelling. The item being deleted is finished first.",
+                AccessibleAnnouncementPriority::Medium,
+            );
+        }
+        glib::Propagation::Stop
     });
 
     dlg.present();
@@ -431,7 +434,7 @@ pub fn delete_with_progress(
                     status_clone.set_text(&msg);
                 }
                 Ok(DeleteEvent::Done { success, failed }) => {
-                    dlg_clone.close();
+                    dlg_clone.destroy();
                     if let Some(cb) = on_complete_cell.borrow_mut().take() {
                         cb(success, failed);
                     }
@@ -439,7 +442,7 @@ pub fn delete_with_progress(
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(_) => {
-                    dlg_clone.close();
+                    dlg_clone.destroy();
                     return glib::ControlFlow::Break;
                 }
             }
@@ -503,10 +506,10 @@ fn show_conflict_dialog(
                 crate::background::run(
                     move || get_unique_dest(&dest),
                     move |renamed| match renamed {
-                        Some(renamed) => callback(ConflictChoice::Rename(renamed)),
-                        None => {
+                        Ok(renamed) => callback(ConflictChoice::Rename(renamed)),
+                        Err(e) => {
                             parent.announce(
-                                "No free name was found to keep both",
+                                &format!("Couldn't keep both: {}", e.message()),
                                 AccessibleAnnouncementPriority::High,
                             );
                             callback(ConflictChoice::Skip);
@@ -1349,13 +1352,19 @@ pub fn name_free(path: &std::path::Path) -> std::io::Result<bool> {
 /// can't be checked counts as there, as in `name_free`: what's there
 /// mustn't be merged into or written over unasked.
 fn exists_here(file: &gio::File) -> bool {
+    taken(file).unwrap_or(true)
+}
+
+/// Whether something is at `file`; an error if that can't be told.
+fn taken(file: &gio::File) -> Result<bool, glib::Error> {
     match file.query_info(
         "standard::type",
         gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
         gio::Cancellable::NONE,
     ) {
-        Ok(_) => true,
-        Err(e) => !e.matches(gio::IOErrorEnum::NotFound),
+        Ok(_) => Ok(true),
+        Err(e) if e.matches(gio::IOErrorEnum::NotFound) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -1368,17 +1377,28 @@ pub fn numbered_name(name: &str, i: u32) -> String {
     }
 }
 
-/// If dest already exists, append " (2)", " (3)", etc. `None` if no free
-/// name is found: never the taken one, which would be merged into.
-fn get_unique_dest(dest: &gio::File) -> Option<gio::File> {
-    if !exists_here(dest) {
-        return Some(dest.clone());
+/// If dest already exists, append " (2)", " (3)", etc. An error if no
+/// free name is found — never the taken one, which would be merged into —
+/// or, at the first, if a name can't be checked (saying why: a mount
+/// erroring, or the name too long).
+fn get_unique_dest(dest: &gio::File) -> Result<gio::File, glib::Error> {
+    if !taken(dest)? {
+        return Ok(dest.clone());
     }
-    let parent = dest.parent()?;
-    let name = dest.basename()?.to_string_lossy().to_string();
-    (2..1000)
-        .map(|i| parent.child(numbered_name(&name, i)))
-        .find(|candidate| !exists_here(candidate))
+    let none = || glib::Error::new(gio::IOErrorEnum::Exists, "No free name was found");
+    let parent = dest.parent().ok_or_else(none)?;
+    let name = dest
+        .basename()
+        .ok_or_else(none)?
+        .to_string_lossy()
+        .to_string();
+    for i in 2..1000 {
+        let candidate = parent.child(numbered_name(&name, i));
+        if !taken(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(none())
 }
 
 #[cfg(test)]

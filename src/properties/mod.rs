@@ -318,7 +318,8 @@ fn build_dialog(file: &FileObject, parent: &gtk::Window, details: Details) {
                 if *guard.borrow() {
                     return;
                 }
-                let text = entry.text().to_string();
+                // (Trimmed, as Apply reads it.)
+                let text = entry.text().trim().to_string();
                 if let Ok(new_mode) = u32::from_str_radix(&text, 8) {
                     if new_mode <= 0o7777 {
                         special.set(new_mode & SPECIAL_BITS);

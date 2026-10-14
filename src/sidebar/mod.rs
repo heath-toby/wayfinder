@@ -162,14 +162,21 @@ fn remove_bookmark_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
     let Some(path) = name.strip_prefix("bookmark:") else {
         return;
     };
+    // Said by the name it's shown (and read) by, not its folder's.
+    let display = load_bookmarks()
+        .into_iter()
+        .find(|(uri, _)| bookmark_path(uri).as_deref() == Some(path))
+        .map(|(_, name)| name)
+        .unwrap_or_else(|| {
+            std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string())
+        });
     if let Err(e) = remove_bookmark(path) {
         list.announce(&e, gtk::AccessibleAnnouncementPriority::High);
         return;
     }
-    let display = std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
     let idx = row.index();
     // Every sidebar, this one too, shows the bookmarks as they are now
     // (another entry for the same folder goes as well, and the separator
@@ -986,12 +993,23 @@ impl WayfinderSidebar {
 
     pub fn rebuild(&self) {
         let list = &self.imp().places_list;
+        // (Focus in this list — or nowhere, its row just gone from under
+        // a closing dialog — goes back to that row, or near it, after.)
+        let refocus = list
+            .root()
+            .is_none_or(|r| r.focus().is_none_or(|f| f.is_ancestor(list)))
+            .then(|| list.selected_row())
+            .flatten()
+            .map(|r| (r.widget_name().to_string(), r.index()));
         while let Some(child) = list.first_child() {
             list.remove(&child);
         }
         self.populate_places();
         // The new Bin row needs its menu again.
         self.wire_trash_right_click();
+        if let Some((name, index)) = refocus {
+            refocus_row(list, &name, index);
+        }
     }
 
     pub fn connect_sidebar_edit_menu(&self, parent_window: &gtk::Window) {
@@ -1066,6 +1084,13 @@ impl WayfinderSidebar {
                 if name.starts_with("bookmark:") {
                     show_bookmark_menu(&sidebar2, &parent2, &list2, &row);
                     return glib::Propagation::Stop;
+                }
+                // The Bin's own menu, as right-click gives (Empty Bin).
+                if name == "place:trash:///" {
+                    if let Some(menu) = sidebar2.imp().trash_menu.borrow().clone() {
+                        menu();
+                        return glib::Propagation::Stop;
+                    }
                 }
             }
 
