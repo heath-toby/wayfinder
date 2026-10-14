@@ -31,6 +31,9 @@ fn known_mountpoints_path() -> PathBuf {
 /// Append `mountpoint` to the known-mountpoints file if it isn't already
 /// present. Best-effort — failures are silent.
 pub fn record_mountpoint(mountpoint: &str) {
+    // (Pins record theirs from their own threads.)
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = known_mountpoints_path();
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == mountpoint) {
@@ -45,7 +48,8 @@ pub fn record_mountpoint(mountpoint: &str) {
     }
     new.push_str(mountpoint);
     new.push('\n');
-    let _ = std::fs::write(&path, new);
+    // Whole: read meanwhile, it mustn't seem empty.
+    let _ = crate::state::write_atomically(&path, new.as_bytes());
 }
 
 /// Read the persisted known-mountpoints. Returns an empty vec on missing
@@ -317,6 +321,9 @@ impl Drop for Unpinning {
 }
 
 pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
+    // Marked first, then checked: a refresh starting meanwhile marks
+    // itself, then sees this (each sees the other).
+    let _unpinning = Unpinning::new(original_path);
     // Deleting a copy the startup refresh is writing into would leave a
     // stray part of it behind.
     if REFRESHING
@@ -327,7 +334,6 @@ pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
     {
         return Err("it's being refreshed right now; try again in a moment".to_string());
     }
-    let _unpinning = Unpinning::new(original_path);
     let (was_pinned, manifest) =
         update_manifest(|manifest| (manifest.remove(original_path).is_some(), manifest.clone()))?;
     // Its record of what was fetched goes too — except for what pins

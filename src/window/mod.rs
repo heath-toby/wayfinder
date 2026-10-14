@@ -87,8 +87,12 @@ impl WayfinderWindow {
         }
         // The Bin or Recent Files themselves (asked for over D-Bus, say):
         // not folders to list as paths.
-        if path.starts_with("trash:") || path.starts_with("recent:") {
-            self.load_special_uri(path);
+        if path.starts_with("trash:") {
+            self.load_special_uri("trash:///");
+            return;
+        }
+        if path.starts_with("recent:") {
+            self.load_special_uri("recent:///");
             return;
         }
         self.imp().nav.borrow_mut().navigate_to(PathBuf::from(path));
@@ -3368,11 +3372,17 @@ fn theme_font_size() -> f64 {
 
 /// The size at the end of a font name (`Noto Sans Bold 11.5` is 11.5).
 fn font_size(name: &str) -> Option<f64> {
-    name.rsplit(' ')
-        .next()?
-        .parse()
-        .ok()
-        .filter(|s: &f64| *s > 0.0)
+    let desc = gtk::pango::FontDescription::from_string(name);
+    let size = desc.size() as f64 / gtk::pango::SCALE as f64;
+    if size <= 0.0 {
+        return None;
+    }
+    // In pixels (`Sans 13px`): as points, at 96 dots per inch.
+    Some(if desc.is_size_absolute() {
+        size * 0.75
+    } else {
+        size
+    })
 }
 
 fn apply_zoom_css(level: i32) {
@@ -3706,6 +3716,7 @@ mod tests {
         assert_eq!(super::font_size("Cantarell 11"), Some(11.0));
         assert_eq!(super::font_size("Noto Sans Bold 11.5"), Some(11.5));
         assert_eq!(super::font_size("Sans"), None);
+        assert_eq!(super::font_size("Sans 16px"), Some(12.0));
     }
 
     #[test]

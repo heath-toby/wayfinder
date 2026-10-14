@@ -98,7 +98,11 @@ fn install_menu_nav(
                     glib::Propagation::Proceed
                 }
             }
-            _ => glib::Propagation::Proceed,
+            // Escape closes the menu, Tab moves in it; any other key the
+            // menu has no use for stops here, rather than reaching the
+            // window's shortcuts (Backspace, Delete…) behind the menu.
+            gdk::Key::Escape | gdk::Key::Tab | gdk::Key::ISO_Left_Tab => glib::Propagation::Proceed,
+            _ => glib::Propagation::Stop,
         }
     });
     container.add_controller(key_ctrl);

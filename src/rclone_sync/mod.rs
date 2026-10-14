@@ -120,7 +120,10 @@ pub fn set_pair(local_path: &str, sync_local_path: &str, remote: &str) -> Result
     // A mount's folder syncs through its offline copy, which holds the old
     // remote's files: a first sync with another remote would merge the two.
     if let Some(old) = pairs.get(local_path) {
-        if old.remote != remote
+        // (Not one never synced yet: nothing of it is there. Nor the same
+        // remote written another way.)
+        if old.initial_resync_done
+            && old.remote.trim_end_matches('/') != remote.trim_end_matches('/')
             && std::path::Path::new(&old.sync_local_path).starts_with(crate::offline::cache_root())
         {
             return Err(format!(
