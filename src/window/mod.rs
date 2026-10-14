@@ -3623,7 +3623,9 @@ fn landing_paths(sources: &[String], dest_dir: &str) -> Vec<String> {
 
 /// Whether renaming `old` to `new` would replace another file. A name that
 /// differs only in case is the same file on a case-insensitive remote —
-/// but on a case-sensitive one it's another file, so compare identities.
+/// but on a case-sensitive one it's another file: so, whether the folder
+/// holds something spelled exactly so (inode numbers may differ by
+/// spelling); if it can't be listed, whether the two are the same file.
 fn rename_clash(old: &str, new: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
     // Only the case changing: taken only if the folder holds something
@@ -3641,11 +3643,12 @@ fn rename_clash(old: &str, new: &str) -> bool {
                 &new_name.to_string_lossy(),
             )
         {
-            return std::fs::read_dir(dir)
-                .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
-                .map_or(true, |entries| {
-                    entries.iter().any(|e| e.file_name() == new_name)
-                });
+            // (Not listed: told by identity, below.)
+            if let Ok(entries) =
+                std::fs::read_dir(dir).and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+            {
+                return entries.iter().any(|e| e.file_name() == new_name);
+            }
         }
     }
     let Ok(new_meta) = std::fs::symlink_metadata(new) else {
