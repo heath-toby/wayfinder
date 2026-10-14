@@ -68,30 +68,29 @@ pub fn show_dialog(
             .to_string_lossy()
             .to_string();
     let is_on_rclone_mount = crate::rclone_ops::is_rclone_fuse_path(&real_path);
-    // A mount's folder with its drive down, or its offline copy (as the
-    // offline view shows it): which remote it's mounted from, and which
-    // copy it syncs, can't be told. Set up while it's mounted.
-    let offline_copy = std::path::Path::new(&real_path).starts_with(crate::offline::cache_root());
-    if offline_copy
-        || (!is_on_rclone_mount && crate::offline::path_is_in_known_mountpoint(&real_path))
-    {
-        parent.announce(
-            "Two-way sync of a drive's folder is set up while the drive is mounted. Connect it and try again.",
-            AccessibleAnnouncementPriority::High,
-        );
+    let offline_copy = crate::offline::is_offline_copy(std::path::Path::new(local_path))
+        || crate::offline::is_offline_copy(std::path::Path::new(&real_path));
+    let in_mountpoint = crate::offline::path_is_in_known_mountpoint(&real_path);
+    if let Some(why) = setup_refusal(
+        offline_copy,
+        is_on_rclone_mount,
+        in_mountpoint,
+        existing.is_some(),
+    ) {
+        parent.announce(why, AccessibleAnnouncementPriority::High);
         on_close();
         return;
     }
     // Remembered as a mount, so that while it's down a pairing isn't made
     // with its bare mountpoint, nor synced into it.
     if is_on_rclone_mount {
-        for mount in crate::rclone_ops::current_rclone_fuse_mountpoints() {
-            if std::path::Path::new(&real_path).starts_with(&mount) {
-                crate::offline::record_mountpoint(&mount);
-            }
-        }
+        crate::offline::record_mountpoints_containing(&real_path);
     }
-    let sync_local_path = if is_on_rclone_mount {
+    // An existing pairing keeps the side it syncs (its drive may be down
+    // now: the bare folder isn't it).
+    let sync_local_path = if let Some(ref pair) = existing {
+        pair.sync_local_path.clone()
+    } else if is_on_rclone_mount {
         crate::offline::cache_path_for(local_path)
             .to_string_lossy()
             .to_string()
@@ -386,6 +385,26 @@ pub fn show_dialog(
     remote_entry.grab_focus();
 }
 
+/// Why setting up two-way sync is refused, if it is: on Wayfinder's own
+/// offline copy (it's what a drive's folder syncs through, not a folder to
+/// pair itself); or, with no pairing yet, on a drive's folder while it isn't
+/// mounted (which remote, and which copy, can't be told). An existing
+/// pairing can still be edited or removed.
+fn setup_refusal(
+    offline_copy: bool,
+    on_mount: bool,
+    in_known_mountpoint: bool,
+    paired: bool,
+) -> Option<&'static str> {
+    if offline_copy {
+        Some("This is Wayfinder's offline copy of a drive's folder. Set up two-way sync on the folder itself, with its drive mounted.")
+    } else if !on_mount && in_known_mountpoint && !paired {
+        Some("Two-way sync of a drive's folder is set up while the drive is mounted. Connect it and try again.")
+    } else {
+        None
+    }
+}
+
 /// Run a sync via the shared `rclone_ops::progress::show` dialog. Builds
 /// bisync args from the configured pair, dispatches `rclone bisync`, and
 /// reports conflict count in the success announcement.
@@ -552,4 +571,21 @@ fn format_duration(secs: i64) -> String {
 fn suggest_remote_for_local(local_path: &str) -> Option<String> {
     let real = crate::rclone_ops::resolve_links_outside_mounts(std::path::Path::new(local_path));
     crate::rclone_ops::rclone_for_path(&real.to_string_lossy()).map(|t| t.full_remote_spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::setup_refusal;
+
+    #[test]
+    fn sync_is_set_up_on_a_drives_folder_only_while_it_is_mounted() {
+        // (offline copy, on the mount, in a known mountpoint, paired)
+        assert!(setup_refusal(true, false, false, false).is_some());
+        assert!(setup_refusal(true, false, false, true).is_some());
+        assert!(setup_refusal(false, false, true, false).is_some());
+        // Paired already: can be edited or removed with the drive down.
+        assert!(setup_refusal(false, false, true, true).is_none());
+        assert!(setup_refusal(false, true, true, false).is_none());
+        assert!(setup_refusal(false, false, false, false).is_none());
+    }
 }

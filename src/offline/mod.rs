@@ -99,6 +99,24 @@ pub fn cache_root() -> PathBuf {
         .join("offline")
 }
 
+/// Whether `path` is in the offline copies (the cache folder reached
+/// through a link too).
+pub fn is_offline_copy(path: &Path) -> bool {
+    let root = cache_root();
+    path.starts_with(&root) || std::fs::canonicalize(&root).is_ok_and(|real| path.starts_with(real))
+}
+
+/// Record the rclone mounts that `path` is in (the offline copies of
+/// their folders are shown while they're down; nothing is synced into
+/// their bare mountpoints).
+pub fn record_mountpoints_containing(path: &str) {
+    for mount in crate::rclone_ops::current_rclone_fuse_mountpoints() {
+        if Path::new(path).starts_with(&mount) {
+            record_mountpoint(&mount);
+        }
+    }
+}
+
 /// Compute the cache path for a remote path.
 ///
 /// We mirror the directory structure under `cache_root()` so the same
@@ -204,11 +222,7 @@ pub fn record_pin(original_path: &str) -> Result<(), String> {
     check_downloaded(&meta, &cached)?;
     // Its mount is one whose offline copies are shown when it's down, even
     // if it was mounted after Wayfinder started.
-    for mount in crate::rclone_ops::current_rclone_fuse_mountpoints() {
-        if Path::new(original_path).starts_with(&mount) {
-            record_mountpoint(&mount);
-        }
-    }
+    record_mountpoints_containing(original_path);
     // All of it as fetched, so a refresh can tell the user's changes from
     // it. (If this can't be saved, the copy is refreshed as one pinned
     // before the record existed.)
