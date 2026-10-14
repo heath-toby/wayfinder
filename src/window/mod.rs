@@ -806,25 +806,36 @@ impl WayfinderWindow {
             ];
             // Wrap the script in a shell that keeps the terminal open after
             // the script exits so output stays visible.
+            // It runs in its own folder (a `./configure` in it works): the
+            // shell goes there, not this process, which mustn't wait on a
+            // slow mount.
+            let dir = std::path::Path::new(path)
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/".to_string());
             let wrapped = format!(
-                "{} ; echo ; echo \"[Press Enter to close]\" ; read",
+                "cd {} ; {} ; echo ; echo \"[Press Enter to close]\" ; read",
+                shell_quote(&dir),
                 shell_quote(path)
             );
             let tail = ["sh", "-c", wrapped.as_str()];
-            // In the script's own folder (a `./configure` in it works).
-            spawn_first(terminals, &tail, std::path::Path::new(path).parent())?;
+            spawn_first(terminals, &tail)?;
             self.announce(
                 &format!("Running {name} in terminal"),
                 AccessibleAnnouncementPriority::Medium,
             );
             Ok(())
         } else {
-            // Binary executable — spawn directly
-            let mut command = std::process::Command::new(path);
-            if let Some(dir) = std::path::Path::new(path).parent() {
-                command.current_dir(dir);
-            }
-            match command.spawn() {
+            // Binary executable — run in its own folder, gone to by a
+            // shell (see above) and then replaced by the program.
+            let dir = std::path::Path::new(path)
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            match std::process::Command::new("sh")
+                .args(["-c", "cd -- \"$1\" && exec \"$2\"", "sh", &dir, path])
+                .spawn()
+            {
                 Ok(child) => {
                     reap(child);
                     self.announce(
@@ -2852,11 +2863,7 @@ impl WayfinderWindow {
             ("konsole", &["--workdir"]),
         ];
 
-        match spawn_first(
-            terminals,
-            &[path.as_str()],
-            Some(std::path::Path::new(&path)),
-        ) {
+        match spawn_first(terminals, &[path.as_str()]) {
             Ok(()) => self.announce(
                 &format!("Opened terminal in {path}"),
                 AccessibleAnnouncementPriority::Medium,
@@ -3620,20 +3627,14 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
 /// Start the first of `programs` (name, its arguments) that's installed,
 /// with `tail` after its arguments. Each is tried in turn: one that isn't
 /// there, or can't be run, fails to start (no `which` waited for first).
-/// `dir`: the folder it runs in.
-fn spawn_first(
-    programs: &[(&str, &[&str])],
-    tail: &[&str],
-    dir: Option<&std::path::Path>,
-) -> Result<(), String> {
+fn spawn_first(programs: &[(&str, &[&str])], tail: &[&str]) -> Result<(), String> {
     let mut refused = None;
     for (cmd, args) in programs {
-        let mut command = std::process::Command::new(cmd);
-        command.args(*args).args(tail);
-        if let Some(dir) = dir {
-            command.current_dir(dir);
-        }
-        match command.spawn() {
+        match std::process::Command::new(cmd)
+            .args(*args)
+            .args(tail)
+            .spawn()
+        {
             Ok(child) => {
                 reap(child);
                 return Ok(());

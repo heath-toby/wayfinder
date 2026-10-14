@@ -7,22 +7,27 @@ use std::path::PathBuf;
 /// creating the folder if need be. A reader never sees it half written.
 pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     // Through a link (to a dotfiles folder, say) to the file it leads to,
-    // even one not there yet: the link stays. If that can't be written (a
-    // read-only store), the link is replaced, as any file would be.
-    let target = link_target(path);
-    if target != path {
-        if let Ok(()) = write_whole(&target, contents) {
-            return Ok(());
+    // even one not there yet: the link stays. Only if that's on a
+    // read-only filesystem (a Nix store) is the link replaced, as any file
+    // would be; any other failure is reported, the link left as it is.
+    let target = link_target(path)?;
+    if target == path {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
+        return write_whole(path, contents);
     }
-    write_whole(path, contents)
+    match write_whole(&target, contents) {
+        Err(e) if e.raw_os_error() == Some(30) => write_whole(path, contents), // EROFS
+        other => other,
+    }
 }
 
-/// Where `path` leads, following links (to a file that may not exist).
-fn link_target(path: &std::path::Path) -> std::path::PathBuf {
+/// Where `path` leads, following links (to a file that may not exist). An
+/// error for a loop of links.
+fn link_target(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     let mut path = path.to_path_buf();
-    // (A few hops at most: a loop of links leads nowhere.)
-    for _ in 0..8 {
+    for _ in 0..40 {
         match fs::read_link(&path) {
             Ok(next) => {
                 path = match path.parent() {
@@ -30,19 +35,19 @@ fn link_target(path: &std::path::Path) -> std::path::PathBuf {
                     _ => next,
                 }
             }
-            Err(_) => break,
+            Err(_) => return Ok(path),
         }
     }
-    path
+    Err(std::io::Error::other(format!(
+        "{} is a loop of links",
+        path.display()
+    )))
 }
 
 fn write_whole(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let part = path.with_extension(format!("{}-{n}.wayfinder-part", std::process::id()));
     // Made with the file's permissions from the start: a private one is
@@ -97,10 +102,9 @@ fn parse_state(contents: &str) -> HashMap<String, String> {
             // A folder's exactly (its name may end in a space); others as
             // `key = value` may be written by hand.
             let key = key.trim();
-            // (A path starts with `/`: what's before it, and a line end
-            // from another system, isn't part of it.)
+            // (A path starts with `/`: what's before it isn't part of it.)
             let value = if key == "directory" {
-                value.trim_start().trim_end_matches('\r')
+                value.trim_start()
             } else {
                 value.trim()
             };
@@ -390,6 +394,21 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_loop_of_links_is_an_error_not_a_replaced_link() {
+        let d = std::env::temp_dir().join(format!("wayfinder-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::os::unix::fs::symlink("b", d.join("a")).unwrap();
+        std::os::unix::fs::symlink("a", d.join("b")).unwrap();
+        assert!(super::write_atomically(&d.join("a"), b"x").is_err());
+        assert!(std::fs::symlink_metadata(d.join("a"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn a_settings_file_kept_as_a_link_stays_one() {
         let d = std::env::temp_dir().join(format!("wayfinder-link-{}", std::process::id()));
