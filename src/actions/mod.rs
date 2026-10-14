@@ -261,7 +261,8 @@ pub fn matches_mime(action: &CustomAction, mime_type: &str) -> bool {
     if action.mime_types.is_empty() {
         return true; // no restriction = matches all
     }
-    let matches = |pattern: &str| {
+    // `kinds`: whether a type that's a kind of `pattern` counts too.
+    let matches = |pattern: &str, kinds: bool| {
         // Any type, as file-manager actions write it; all/allfiles is
         // any file, not a folder.
         if matches!(pattern, "*" | "*/*" | "all/all") {
@@ -275,7 +276,9 @@ pub fn matches_mime(action: &CustomAction, mime_type: &str) -> bool {
         }
         // A kind of it (text/x-python is a text/plain) — but not by the
         // rule that makes everything an application/octet-stream.
-        if pattern != "application/octet-stream" && gtk::gio::content_type_is_a(mime_type, pattern)
+        if kinds
+            && pattern != "application/octet-stream"
+            && gtk::gio::content_type_is_a(mime_type, pattern)
         {
             return true;
         }
@@ -285,12 +288,12 @@ pub fn matches_mime(action: &CustomAction, mime_type: &str) -> bool {
         }
         false
     };
-    // `!type`: never for that type (itself: not every kind of it, or
-    // `!text/plain` would rule out all text).
+    // `!type`: never for that type, or those `!image/*` names — not for
+    // every kind of it, or `!text/plain` would rule out all text.
     if action
         .mime_types
         .iter()
-        .any(|p| p.strip_prefix('!') == Some(mime_type))
+        .any(|p| p.strip_prefix('!').is_some_and(|p| matches(p, false)))
     {
         return false;
     }
@@ -299,7 +302,7 @@ pub fn matches_mime(action: &CustomAction, mime_type: &str) -> bool {
         .iter()
         .filter(|p| !p.starts_with('!'))
         .collect();
-    positive.is_empty() || positive.iter().any(|p| matches(p))
+    positive.is_empty() || positive.iter().any(|p| matches(p, true))
 }
 
 /// Returns true if this action should show the compress dialog.
@@ -805,6 +808,7 @@ mod tests {
             "image/png"
         ));
         assert!(matches_mime(&action(&["*", "!text/plain"]), "text/html"));
+        assert!(!matches_mime(&action(&["*", "!image/*"]), "image/png"));
     }
 
     fn files(names: &[&str]) -> Vec<String> {

@@ -111,13 +111,11 @@ fn complete_with(partial: &str, home: Option<&Path>) -> Completion {
 
     // Split at the last `/` as typed: `Path` would tidy away a trailing
     // `.`, turning `~/.` (hidden files, please) into `~`.
-    let (dir_str, prefix) = match expanded.rfind('/') {
-        Some(i) => (&expanded[..=i], &expanded[i + 1..]),
-        None => ("", expanded.as_str()),
-    };
+    // (There's one: it starts with `/`.)
+    let i = expanded.rfind('/').unwrap_or(0);
+    let (dir_str, prefix) = (&expanded[..=i], &expanded[i + 1..]);
 
-    let dir = if dir_str.is_empty() { "." } else { dir_str };
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(dir_str) else {
         return Completion::NoMatch;
     };
 

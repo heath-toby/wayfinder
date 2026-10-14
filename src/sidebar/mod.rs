@@ -72,10 +72,8 @@ fn save_bookmarks(bookmarks: &[(String, String)]) -> Result<(), String> {
         .map(|(uri, name)| format!("{uri} {name}"))
         .collect::<Vec<_>>()
         .join("\n");
-    // Through a link (to a dotfiles folder, say), to the file it leads to.
-    let file = bookmarks_file();
-    let file = std::fs::canonicalize(&file).unwrap_or(file);
-    crate::state::write_atomically(&file, contents.as_bytes())
+    // (Through a link, to a dotfiles folder say, to the file it leads to.)
+    crate::state::write_atomically(&bookmarks_file(), contents.as_bytes())
         .map_err(|e| format!("Couldn't save the bookmarks: {e}"))
 }
 

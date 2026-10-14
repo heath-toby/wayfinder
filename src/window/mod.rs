@@ -804,44 +804,24 @@ impl WayfinderWindow {
                 ("konsole", &["-e"]),
                 ("xterm", &["-e"]),
             ];
-            for (cmd, args) in terminals {
-                if std::process::Command::new("which")
-                    .arg(cmd)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-                {
-                    // Wrap the script in a shell that keeps the terminal
-                    // open after the script exits so output stays visible.
-                    let wrapped = format!(
-                        "{} ; echo ; echo \"[Press Enter to close]\" ; read",
-                        shell_quote(path)
-                    );
-                    let mut cmd_args: Vec<&str> = args.to_vec();
-                    cmd_args.push("sh");
-                    cmd_args.push("-c");
-                    cmd_args.push(&wrapped);
-                    match std::process::Command::new(cmd).args(&cmd_args).spawn() {
-                        Ok(_) => {
-                            self.announce(
-                                &format!("Running {name} in terminal"),
-                                AccessibleAnnouncementPriority::Medium,
-                            );
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            return Err(format!("failed to spawn {cmd}: {e}"));
-                        }
-                    }
-                }
-            }
-            Err("no terminal emulator found".to_string())
+            // Wrap the script in a shell that keeps the terminal open after
+            // the script exits so output stays visible.
+            let wrapped = format!(
+                "{} ; echo ; echo \"[Press Enter to close]\" ; read",
+                shell_quote(path)
+            );
+            let tail = ["sh", "-c", wrapped.as_str()];
+            spawn_first(terminals, &tail)?;
+            self.announce(
+                &format!("Running {name} in terminal"),
+                AccessibleAnnouncementPriority::Medium,
+            );
+            Ok(())
         } else {
             // Binary executable — spawn directly
             match std::process::Command::new(path).spawn() {
-                Ok(_) => {
+                Ok(child) => {
+                    reap(child);
                     self.announce(
                         &format!("Running {name}"),
                         AccessibleAnnouncementPriority::Medium,
@@ -2108,12 +2088,7 @@ impl WayfinderWindow {
             file.name()
         ))]);
         // Select the name without extension for convenience
-        // (A folder has no extension: `v1.2` is all name.)
-        if file.is_directory() {
-            entry.select_region(0, -1);
-        } else {
-            entry.select_region(0, stem_chars(&file.name()));
-        }
+        entry.select_region(0, stem_chars(&file.name(), file.is_directory()));
 
         let dlg = gtk::Window::builder()
             .title(format!("Rename {}", file.name()))
@@ -2872,40 +2847,13 @@ impl WayfinderWindow {
             ("konsole", &["--workdir"]),
         ];
 
-        // Each tried in turn: one that isn't installed fails to start
-        // (no `which` run first, waited for on this thread).
-        for (cmd, args) in terminals {
-            match std::process::Command::new(cmd)
-                .args(*args)
-                .arg(&path)
-                .spawn()
-            {
-                Ok(mut child) => {
-                    // Waited for once it's closed, or it lingers until
-                    // Wayfinder exits.
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                    });
-                    self.announce(
-                        &format!("Opened terminal in {path}"),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                    return;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    self.announce(
-                        &format!("Couldn't open {cmd}: {e}"),
-                        AccessibleAnnouncementPriority::High,
-                    );
-                    return;
-                }
-            }
+        match spawn_first(terminals, &[path.as_str()]) {
+            Ok(()) => self.announce(
+                &format!("Opened terminal in {path}"),
+                AccessibleAnnouncementPriority::Medium,
+            ),
+            Err(e) => self.announce(&e, AccessibleAnnouncementPriority::High),
         }
-        self.announce(
-            "No terminal emulator found",
-            AccessibleAnnouncementPriority::High,
-        );
     }
 
     pub fn show_shortcuts(&self) {
@@ -3660,10 +3608,48 @@ fn position_near_removed(old_pos: u32, n_items: u32) -> Option<u32> {
     }
 }
 
+/// Start the first of `programs` (name, its arguments) that's installed,
+/// with `tail` after its arguments. Each is tried in turn: one that isn't
+/// there, or can't be run, fails to start (no `which` waited for first).
+fn spawn_first(programs: &[(&str, &[&str])], tail: &[&str]) -> Result<(), String> {
+    for (cmd, args) in programs {
+        match std::process::Command::new(cmd)
+            .args(*args)
+            .args(tail)
+            .spawn()
+        {
+            Ok(child) => {
+                reap(child);
+                return Ok(());
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(format!("Couldn't start {cmd}: {e}")),
+        }
+    }
+    Err("No terminal emulator found".to_string())
+}
+
+/// Have the main loop collect `child` when it exits, or it lingers as a
+/// defunct process until Wayfinder does.
+fn reap(child: std::process::Child) {
+    glib::child_watch_add_local(glib::Pid(child.id() as i32), |_, _| {});
+}
+
 /// How many characters of `name` come before its extension: what Rename
 /// selects. (In characters, as the entry counts: `Résumé.pdf` is 6.) A
-/// leading dot isn't an extension's: all of `.bashrc` is selected.
-fn stem_chars(name: &str) -> i32 {
+/// leading dot isn't an extension's: all of `.bashrc` is selected, as is
+/// all of a folder's name (`v1.2`): -1.
+fn stem_chars(name: &str, is_dir: bool) -> i32 {
+    if is_dir {
+        return -1;
+    }
     match name.rfind('.').filter(|&dot| dot > 0) {
         Some(dot) => name[..dot].chars().count() as i32,
         None => -1,
@@ -3674,10 +3660,11 @@ fn stem_chars(name: &str) -> i32 {
 mod tests {
     #[test]
     fn rename_selects_the_name_before_the_extension_in_characters() {
-        assert_eq!(super::stem_chars("Résumé.pdf"), 6);
-        assert_eq!(super::stem_chars("a.tar.gz"), 5);
-        assert_eq!(super::stem_chars(".bashrc"), -1);
-        assert_eq!(super::stem_chars("README"), -1);
+        assert_eq!(super::stem_chars("Résumé.pdf", false), 6);
+        assert_eq!(super::stem_chars("a.tar.gz", false), 5);
+        assert_eq!(super::stem_chars(".bashrc", false), -1);
+        assert_eq!(super::stem_chars("README", false), -1);
+        assert_eq!(super::stem_chars("v1.2", true), -1);
     }
 
     use super::{

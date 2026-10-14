@@ -12,6 +12,9 @@ pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Res
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // Through a link (to a dotfiles folder, say), to the file it leads to:
+    // the link stays.
+    let path = &fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let part = path.with_extension(format!("{}-{n}.wayfinder-part", std::process::id()));
     // Made with the file's permissions from the start: a private one is
@@ -53,20 +56,28 @@ fn state_file() -> PathBuf {
 }
 
 fn load_state() -> HashMap<String, String> {
-    let file = state_file();
-    match fs::read_to_string(&file) {
-        Ok(contents) => {
-            let mut map = HashMap::new();
-            for line in contents.lines() {
-                if let Some((key, value)) = line.split_once('=') {
-                    // The value exactly: a folder's name may end in a space.
-                    map.insert(key.trim().to_string(), value.to_string());
-                }
-            }
-            map
+    fs::read_to_string(state_file())
+        .map(|contents| parse_state(&contents))
+        .unwrap_or_default()
+}
+
+/// `key=value` lines.
+fn parse_state(contents: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in contents.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            // A folder's exactly (its name may end in a space); others as
+            // `key = value` may be written by hand.
+            let key = key.trim();
+            let value = if key == "directory" {
+                value
+            } else {
+                value.trim()
+            };
+            map.insert(key.to_string(), value.to_string());
         }
-        Err(_) => HashMap::new(),
     }
+    map
 }
 
 fn save_state(map: &HashMap<String, String>) {
@@ -226,7 +237,7 @@ pub fn load_window_session() -> Vec<PathBuf> {
     match fs::read_to_string(&file) {
         Ok(contents) => contents
             .lines()
-            .filter(|l| !l.is_empty())
+            .filter(|l| !l.trim().is_empty())
             // Not checked here (see load_last_directory). Exactly as
             // written: a folder's name may end in a space.
             .map(PathBuf::from)
@@ -366,7 +377,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    use super::parse_file_app;
+    use super::{parse_file_app, parse_state};
+
+    #[test]
+    fn settings_read_back_as_written_and_by_hand() {
+        let map = parse_state("directory=/home/u/notes \nshow_hidden = true\nzoom=120");
+        assert_eq!(map["directory"], "/home/u/notes ");
+        assert_eq!(map["show_hidden"], "true");
+        assert_eq!(map["zoom"], "120");
+    }
 
     #[test]
     fn paths_with_equals_signs_keep_their_app() {
