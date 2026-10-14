@@ -191,8 +191,26 @@ pub fn rename_file(file: &gio::File, new_name: &str) -> Result<gio::File, glib::
     let case_only = old_name
         .as_deref()
         .is_some_and(|old| is_case_only_change(old, new_name));
+    // (The name "taken" by the file itself, not by another one beside it.)
+    let same_file = || {
+        use std::os::unix::fs::MetadataExt;
+        let (Some(from), Some(parent)) = (
+            file.path(),
+            file.path()
+                .and_then(|p| p.parent().map(std::path::Path::to_path_buf)),
+        ) else {
+            return false;
+        };
+        match (
+            std::fs::symlink_metadata(&from),
+            std::fs::symlink_metadata(parent.join(new_name)),
+        ) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    };
     match direct {
-        Err(e) if case_only && e.matches(gio::IOErrorEnum::Exists) => {
+        Err(e) if case_only && e.matches(gio::IOErrorEnum::Exists) && same_file() => {
             let step = format!(".{new_name}.wayfinder-renaming");
             let between = file.set_display_name(&step, gio::Cancellable::NONE)?;
             between
@@ -1303,6 +1321,19 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_long_name_changes_case_directly() {
+        let d = std::env::temp_dir().join(format!("wayfinder-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let name = format!("{}.txt", "a".repeat(240));
+        let upper = format!("A{}", &name[1..]);
+        std::fs::write(d.join(&name), "x").unwrap();
+        let result = rename_file(&gio::File::for_path(d.join(&name)), &upper);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(result.is_ok());
+    }
+
     #[test]
     fn a_case_only_rename_goes_through() {
         assert!(is_case_only_change("report.txt", "Report.txt"));

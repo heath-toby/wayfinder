@@ -2277,6 +2277,10 @@ impl WayfinderWindow {
                             &format!("Rename failed: {e}"),
                             AccessibleAnnouncementPriority::High,
                         );
+                        // It may have been left under another name (see
+                        // rename_file): show the folder as it is.
+                        w.forget_moved(&moved);
+                        w.reload_after_change(&changed);
                     }
                 },
             );
@@ -3732,6 +3736,18 @@ fn special_uri_root(uri: &str) -> &str {
     }
 }
 
+/// What Ctrl+D bookmarks for the folder shown at `current`: in the
+/// offline copies (the drive down, or a folder opened from one), the folder
+/// it's a copy of; a two-way sync folder's working copy (`in_sync`), and
+/// anything else, as itself.
+pub(crate) fn bookmark_target(current: &str, in_sync: bool) -> String {
+    if in_sync {
+        return current.to_string();
+    }
+    wayfinder::offline::original_of_copy(std::path::Path::new(current))
+        .unwrap_or_else(|| current.to_string())
+}
+
 /// Whether `dir` (a local folder: an offline copy) has anything in it.
 fn has_items(dir: &std::path::Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_some())
@@ -3753,6 +3769,19 @@ fn stem_chars(name: &str, is_dir: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bookmarks_in_the_offline_copies_are_of_the_folders_they_copy() {
+        let copy = wayfinder::offline::cache_root().join("home/u/Drive/Docs");
+        let copy = copy.to_string_lossy();
+        assert_eq!(super::bookmark_target(&copy, false), "/home/u/Drive/Docs");
+        // A sync folder's working copy is a place of its own.
+        assert_eq!(super::bookmark_target(&copy, true), copy);
+        assert_eq!(
+            super::bookmark_target("/home/u/Work", false),
+            "/home/u/Work"
+        );
+    }
+
     #[test]
     fn the_bin_and_recent_files_have_one_uri_each() {
         assert_eq!(super::special_uri_root("trash:"), "trash:///");
