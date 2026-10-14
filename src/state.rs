@@ -5,11 +5,14 @@ use std::path::PathBuf;
 /// Write `contents` to `path` whole or not at all: to a part file of its
 /// own (two saves at once mustn't share one), then renamed into place,
 /// creating the folder if need be. A reader never sees it half written.
-/// (A link is written through instead, as it always was.)
+/// (A link, or a hard-linked file, is written in place instead, as it
+/// always was.)
 pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    // A link (to a dotfiles folder, say) is written through, as it always
-    // was: the link stays, and a failure is reported.
-    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+    // A link (to a dotfiles folder, say), or a file linked to from
+    // elsewhere (a hard link), is written in place, as it always was: the
+    // link stays, and a failure is reported.
+    use std::os::unix::fs::MetadataExt;
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink() || m.nlink() > 1) {
         return fs::write(path, contents);
     }
     if let Some(parent) = path.parent() {
@@ -369,18 +372,32 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_hard_linked_settings_file_stays_linked() {
+        let d = std::env::temp_dir().join(format!("wayfinder-hard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("dotfiles-state"), b"old").unwrap();
+        std::fs::hard_link(d.join("dotfiles-state"), d.join("state")).unwrap();
+        super::write_atomically(&d.join("state"), b"new").unwrap();
+        let other = std::fs::read(d.join("dotfiles-state")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(other, b"new");
+    }
+
+    #[test]
     fn a_link_that_cant_be_written_through_stays_a_link() {
         use std::os::unix::fs::PermissionsExt;
         // (Root may write anywhere: nothing to show then.)
-        if std::fs::metadata("/proc/self")
-            .is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0)
-        {
-            return;
-        }
         let d = std::env::temp_dir().join(format!("wayfinder-ro-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("mnt")).unwrap();
         std::fs::set_permissions(d.join("mnt"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // (Able to write there anyway — as root, say: nothing to show.)
+        if std::fs::write(d.join("mnt/probe"), b"").is_ok() {
+            let _ = std::fs::set_permissions(d.join("mnt"), std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
         std::os::unix::fs::symlink(d.join("mnt/state"), d.join("state")).unwrap();
         let result = super::write_atomically(&d.join("state"), b"x");
         let still_link = std::fs::symlink_metadata(d.join("state"))
