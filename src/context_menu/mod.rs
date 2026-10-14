@@ -82,21 +82,19 @@ fn install_menu_nav(
                 focus_button(&buttons, next);
                 glib::Propagation::Stop
             }
+            // (Kept here even with no submenu to go into or out of: behind
+            // the menu they'd move the selection, or go Back.)
             gdk::Key::Right => {
                 if let Some(ref cb) = on_right {
                     cb();
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
                 }
+                glib::Propagation::Stop
             }
             gdk::Key::Left => {
                 if let Some(ref cb) = on_left {
                     cb();
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
                 }
+                glib::Propagation::Stop
             }
             // Escape closes the menu, Tab moves in it; any other key the
             // menu has no use for stops here, rather than reaching the

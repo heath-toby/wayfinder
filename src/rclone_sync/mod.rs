@@ -109,6 +109,15 @@ pub fn pair_for(local_path: &str) -> Option<SyncPair> {
     load_pairs().get(local_path).cloned()
 }
 
+/// Whether pairing `old`'s folder with `remote` instead is refused: a
+/// mount's folder syncs through its offline copy, which holds the old
+/// remote's files (some, even if its first sync didn't finish), and a
+/// first sync with another remote would merge them into it. (Compared as
+/// written: `server:` and `server:/` may be different places.)
+fn refuses_new_remote(old: &SyncPair, remote: &str, cache_root: &std::path::Path) -> bool {
+    old.remote != remote && std::path::Path::new(&old.sync_local_path).starts_with(cache_root)
+}
+
 /// Add or update a sync pair. Does not run a sync — the user must trigger
 /// that explicitly so they can review the dialog first.
 ///
@@ -117,15 +126,8 @@ pub fn pair_for(local_path: &str) -> Option<SyncPair> {
 /// for rclone FUSE mounts this should be the offline cache path.
 pub fn set_pair(local_path: &str, sync_local_path: &str, remote: &str) -> Result<(), String> {
     let mut pairs = load_pairs();
-    // A mount's folder syncs through its offline copy, which holds the old
-    // remote's files: a first sync with another remote would merge the two.
     if let Some(old) = pairs.get(local_path) {
-        // (Not one never synced yet: nothing of it is there. Nor the same
-        // remote written another way.)
-        if old.initial_resync_done
-            && old.remote.trim_end_matches('/') != remote.trim_end_matches('/')
-            && std::path::Path::new(&old.sync_local_path).starts_with(crate::offline::cache_root())
-        {
+        if refuses_new_remote(old, remote, &crate::offline::cache_root()) {
             return Err(format!(
                 "this folder is synced with {}, and its offline copy holds that remote's files: it can't be synced with another",
                 old.remote
@@ -233,4 +235,33 @@ pub fn count_conflicts(stdout: &str, stderr: &str) -> usize {
                     || line.contains("renaming"))
         })
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{refuses_new_remote, SyncPair};
+    use std::path::Path;
+
+    #[test]
+    fn a_mount_folders_sync_keeps_its_remote() {
+        let pair = |sync_local: &str| SyncPair {
+            local_path: "/home/u/proton/Work".into(),
+            sync_local_path: sync_local.into(),
+            remote: "Proton:Work".into(),
+            last_sync_time: 0,
+            initial_resync_done: false,
+        };
+        let cache = Path::new("/home/u/.cache/wayfinder/offline");
+        let mount = pair("/home/u/.cache/wayfinder/offline/home/u/proton/Work");
+        // Even if it never finished syncing: some files may be there.
+        assert!(refuses_new_remote(&mount, "Proton:Personal", cache));
+        assert!(refuses_new_remote(&mount, "Proton:Work/", cache));
+        assert!(!refuses_new_remote(&mount, "Proton:Work", cache));
+        // A folder of the user's own may sync with another remote.
+        assert!(!refuses_new_remote(
+            &pair("/home/u/Work"),
+            "Proton:Personal",
+            cache
+        ));
+    }
 }

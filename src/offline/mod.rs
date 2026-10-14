@@ -39,9 +39,6 @@ pub fn record_mountpoint(mountpoint: &str) {
     if existing.lines().any(|l| l.trim() == mountpoint) {
         return;
     }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let mut new = existing;
     if !new.is_empty() && !new.ends_with('\n') {
         new.push('\n');
@@ -326,12 +323,20 @@ pub fn unpin_path(original_path: &str) -> Result<Unpinned, String> {
     let _unpinning = Unpinning::new(original_path);
     // Deleting a copy the startup refresh is writing into would leave a
     // stray part of it behind.
-    if REFRESHING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|p| paths_overlap(Path::new(p), Path::new(original_path)))
-    {
+    // (A refresh that's only just begun sees this and stops at once: give
+    // it a moment.)
+    let refreshing = || {
+        REFRESHING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|p| paths_overlap(Path::new(p), Path::new(original_path)))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while refreshing() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if refreshing() {
         return Err("it's being refreshed right now; try again in a moment".to_string());
     }
     let (was_pinned, manifest) =
