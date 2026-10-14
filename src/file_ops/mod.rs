@@ -183,6 +183,25 @@ pub fn empty_trash() -> Result<u32, glib::Error> {
 }
 
 pub fn rename_file(file: &gio::File, new_name: &str) -> Result<gio::File, glib::Error> {
+    // Only the case changing: on a drive that ignores case (FAT, exFAT, a
+    // Windows share) the new name is "taken" by the file itself, and GIO
+    // refuses. Through a name of its own first.
+    let old_name = file.basename().map(|n| n.to_string_lossy().to_string());
+    if old_name
+        .as_deref()
+        .is_some_and(|old| is_case_only_change(old, new_name))
+    {
+        let step = format!(".{new_name}.wayfinder-renaming");
+        let between = file.set_display_name(&step, gio::Cancellable::NONE)?;
+        return between
+            .set_display_name(new_name, gio::Cancellable::NONE)
+            .inspect_err(|_| {
+                // Put it back as it was.
+                if let Some(old) = &old_name {
+                    let _ = between.set_display_name(old, gio::Cancellable::NONE);
+                }
+            });
+    }
     let new_file = file.set_display_name(new_name, gio::Cancellable::NONE)?;
     Ok(new_file)
 }
@@ -1224,6 +1243,11 @@ fn clear_before_replace(src: gio::FileType, dst: gio::FileType, is_move: bool) -
     dst != gio::FileType::Unknown && (is_dir(src) != is_dir(dst) || (is_move && is_dir(src)))
 }
 
+/// Whether renaming `old` to `new` changes only the case of its letters.
+fn is_case_only_change(old: &str, new: &str) -> bool {
+    old != new && old.to_lowercase() == new.to_lowercase()
+}
+
 /// Whether something is at `file` — a link too, even one leading nowhere
 /// (`query_exists` follows links, so a broken one looks free).
 fn exists_here(file: &gio::File) -> bool {
@@ -1268,11 +1292,31 @@ fn get_unique_dest(dest: &gio::File) -> gio::File {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_case_only_rename_goes_through() {
+        assert!(is_case_only_change("report.txt", "Report.txt"));
+        assert!(!is_case_only_change("report.txt", "report.txt"));
+        assert!(!is_case_only_change("report.txt", "summary.txt"));
+        let d = std::env::temp_dir().join(format!("wayfinder-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("report.txt"), "x").unwrap();
+        let renamed =
+            rename_file(&gio::File::for_path(d.join("report.txt")), "Report.txt").unwrap();
+        assert_eq!(
+            renamed.basename().unwrap(),
+            std::path::PathBuf::from("Report.txt")
+        );
+        assert!(d.join("Report.txt").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     use super::{
         clear_before_replace, copy_directory_recursive, copy_keeping_links, in_drive_bin,
-        numbered_name, placement, Placement,
+        is_case_only_change, numbered_name, placement, rename_file, Placement,
     };
     use gtk::gio;
+    use gtk::gio::prelude::*;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 

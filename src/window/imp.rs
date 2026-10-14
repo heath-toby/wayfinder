@@ -795,6 +795,10 @@ impl WayfinderWindowInner {
         let action = gio::SimpleAction::new("bookmark", None);
         action.connect_activate(move |_, _| {
             let path = w.imp().model.current_path();
+            // In the offline copy (the drive down): the folder it's a copy
+            // of, which the location shows — not Wayfinder's cache.
+            let path =
+                wayfinder::offline::original_of_copy(std::path::Path::new(&path)).unwrap_or(path);
             // The Bin and Recent Files aren't folders: a bookmark to them
             // would open nothing.
             if !path.starts_with('/') {

@@ -177,13 +177,21 @@ impl WayfinderWindow {
         let imp = self.imp();
         // A folder that no longer exists resolves to its nearest parent.
         let resolved = imp.model.current_path();
-        if live_result.is_ok() && resolved != requested {
+        // Walked up from a folder on a drive that's been unmounted (to its
+        // empty mountpoint, say): the folder asked for has an offline copy
+        // of its own, to show rather than the one further up.
+        let walked_up = live_result.is_ok() && resolved != requested;
+        let offline_requested = walked_up
+            && wayfinder::offline::path_is_in_known_mountpoint(requested)
+            && !is_fuse_mount(requested)
+            && has_items(&wayfinder::offline::cache_path_for(requested));
+        if walked_up && !offline_requested {
             imp.nav
                 .borrow_mut()
                 .replace_current(PathBuf::from(&resolved));
             self.show_location(&resolved, resolved != "/");
         }
-        let path = if live_result.is_ok() {
+        let path = if live_result.is_ok() && !offline_requested {
             resolved.as_str()
         } else {
             requested
@@ -204,10 +212,7 @@ impl WayfinderWindow {
         let path_is_fuse = is_fuse_mount(path);
         let in_known_mount = wayfinder::offline::path_is_in_known_mountpoint(path);
         let cache = wayfinder::offline::cache_path_for(path);
-        let cache_has_items = cache.is_dir()
-            && std::fs::read_dir(&cache)
-                .map(|d| d.count() > 0)
-                .unwrap_or(false);
+        let cache_has_items = has_items(&cache);
 
         // Two triggers, both gated on `in_known_mount`:
         // 1. Live load errored (stale mount, read_dir failed).
@@ -215,7 +220,7 @@ impl WayfinderWindow {
         //    (i.e. cleanly unmounted), and the cache has content.
         let use_cache = in_known_mount
             && cache_has_items
-            && (live_result.is_err() || (live_count == 0 && !path_is_fuse));
+            && (offline_requested || live_result.is_err() || (live_count == 0 && !path_is_fuse));
 
         if use_cache {
             let cache_str = cache.to_string_lossy().to_string();
@@ -579,6 +584,19 @@ impl WayfinderWindow {
     /// Get selected files — if multi-selection has files, use those; otherwise use the focused file
     pub fn get_selected_files(&self) -> Vec<FileObject> {
         let imp = self.imp();
+        // Marks of files no longer here (moved out from another window,
+        // renamed, deleted) aren't marks: forget them.
+        {
+            let store = &imp.model.store;
+            let here: std::collections::HashSet<String> = (0..store.n_items())
+                .filter_map(|i| store.item(i).and_downcast::<FileObject>())
+                .map(|f| f.path())
+                .collect();
+            imp.file_selection
+                .borrow_mut()
+                .selected
+                .retain(|path| here.contains(path));
+        }
         let sel = imp.file_selection.borrow();
         if sel.count() > 0 {
             // Return all files matching the selected paths
@@ -1669,15 +1687,21 @@ impl WayfinderWindow {
         }
 
         // Announce failures FIRST (before focus changes trigger Orca)
+        // (With what did go, if some did: no other word is said of them.)
         if failed > 0 {
+            let went = match success {
+                0 => String::new(),
+                1 => "1 file moved to Bin. ".to_string(),
+                n => format!("{n} files moved to Bin. "),
+            };
             if failed == 1 {
                 self.announce(
-                    &format!("Could not move to Bin: {last_error}"),
+                    &format!("{went}Could not move to Bin: {last_error}"),
                     AccessibleAnnouncementPriority::High,
                 );
             } else {
                 self.announce(
-                    &format!("{failed} files could not be moved to Bin"),
+                    &format!("{went}{failed} files could not be moved to Bin"),
                     AccessibleAnnouncementPriority::High,
                 );
             }
@@ -2027,15 +2051,21 @@ impl WayfinderWindow {
                             },
                             move |window, (success, failed, last_error, first_name)| {
                                 // Announce failures first
+                                // (With what was deleted, if anything was.)
                                 if failed > 0 {
+                                    let went = match success {
+                                        0 => String::new(),
+                                        1 => "1 file deleted. ".to_string(),
+                                        n => format!("{n} files deleted. "),
+                                    };
                                     if failed == 1 {
                                         window.announce(
-                                            &format!("Could not delete: {last_error}"),
+                                            &format!("{went}Could not delete: {last_error}"),
                                             AccessibleAnnouncementPriority::High,
                                         );
                                     } else {
                                         window.announce(
-                                            &format!("{failed} files could not be deleted"),
+                                            &format!("{went}{failed} files could not be deleted"),
                                             AccessibleAnnouncementPriority::High,
                                         );
                                     }
@@ -3700,6 +3730,11 @@ fn special_uri_root(uri: &str) -> &str {
     } else {
         uri
     }
+}
+
+/// Whether `dir` (a local folder: an offline copy) has anything in it.
+fn has_items(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_some())
 }
 
 /// How many characters of `name` come before its extension: what Rename
