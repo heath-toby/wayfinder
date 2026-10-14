@@ -95,17 +95,30 @@ fn main() {
             let response_tx = request.response_tx;
             glib::spawn_future_local(async move {
                 if let Ok(mut result) = result_rx.await {
+                    let mut failed = false;
                     if let (Some(names), false) = (save_files, result.cancelled) {
                         // Checking for existing files may touch a slow mount.
                         let folder = result.uris.first().cloned().unwrap_or_default();
-                        result.uris =
+                        let uris =
                             gtk::gio::spawn_blocking(move || save_files_uris(&folder, &names))
                                 .await
-                                .unwrap_or_default();
+                                .ok()
+                                .flatten();
+                        match uris {
+                            Some(uris) => result.uris = uris,
+                            // No safe names: the app is told it failed.
+                            None => failed = true,
+                        }
                     }
-                    let response = if result.cancelled { 1u32 } else { 0u32 };
+                    let response = if failed {
+                        2u32
+                    } else if result.cancelled {
+                        1u32
+                    } else {
+                        0u32
+                    };
                     let mut results = HashMap::<String, OwnedValue>::new();
-                    if !result.cancelled {
+                    if !result.cancelled && !failed {
                         if let Ok(val) =
                             OwnedValue::try_from(zbus::zvariant::Value::from(result.uris))
                         {
@@ -127,12 +140,12 @@ fn main() {
 /// The URIs to save `names` under in the folder `folder_uri`: a name taken
 /// by an existing file gets a number ("report (2).pdf"), so nothing is
 /// overwritten without being asked.
-fn save_files_uris(folder_uri: &str, names: &[String]) -> Vec<String> {
+/// `None` if a name that's surely free can't be found for every file (the
+/// folder can't be looked in): the save fails rather than risk one.
+fn save_files_uris(folder_uri: &str, names: &[String]) -> Option<Vec<String>> {
     use gtk::gio::prelude::FileExt;
     let folder = gtk::gio::File::for_uri(folder_uri);
-    let Some(dir) = folder.path() else {
-        return Vec::new();
-    };
+    let dir = folder.path()?;
     let mut taken: Vec<std::path::PathBuf> = Vec::new();
     names
         .iter()
@@ -147,9 +160,9 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Vec<String> {
             let path = free_name(&dir, &name, |p| {
                 !wayfinder::file_ops::name_free(p).unwrap_or(false)
                     || taken.contains(&p.to_path_buf())
-            });
+            })?;
             taken.push(path.clone());
-            gtk::gio::File::for_path(&path).uri().to_string()
+            Some(gtk::gio::File::for_path(&path).uri().to_string())
         })
         .collect()
 }
@@ -168,35 +181,23 @@ fn free_name(
     dir: &std::path::Path,
     name: &str,
     taken: impl Fn(&std::path::Path) -> bool,
-) -> std::path::PathBuf {
+) -> Option<std::path::PathBuf> {
     let first = dir.join(name);
     if !taken(&first) {
-        return first;
+        return Some(first);
     }
     // (Not forever: if every number is "taken" — the folder can't be looked
-    // in, or holds them all — numbers from the time, checked as any.)
+    // in, or holds them all — numbers from the time, checked as any; and if
+    // none is free, none: never a name found taken, nor one unchecked.)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let base = u32::try_from(now % 1_000_000_000).unwrap_or(0) + 1000;
     (2..1000)
+        .chain(base..base + 3)
         .map(|n| dir.join(wayfinder::file_ops::numbered_name(name, n)))
-        .chain((0..3).map(|k| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let n = u32::try_from(now % 1_000_000_000).unwrap_or(0) + 1000 + k;
-            dir.join(wayfinder::file_ops::numbered_name(name, n))
-        }))
         .find(|p| !taken(p))
-        // Never the name found taken (an existing file would be written
-        // over): the last tried, which a save there will report if it's no
-        // good either.
-        .unwrap_or_else(|| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let n = u32::try_from(now % 1_000_000_000).unwrap_or(0) + 1002;
-            dir.join(wayfinder::file_ops::numbered_name(name, n))
-        })
 }
 
 #[cfg(test)]
@@ -215,11 +216,10 @@ mod tests {
                         .is_ok_and(|n| n < 1000)
                 })
         };
-        let got = free_name(dir, "scan.pdf", numbered);
+        let got = free_name(dir, "scan.pdf", numbered).unwrap();
         assert!(!numbered(&got), "{got:?}");
-        // Every name taken (a folder that can't be looked in): never the
-        // one there already.
-        assert_ne!(free_name(dir, "scan.pdf", |_| true), dir.join("scan.pdf"));
+        // Every name taken (a folder that can't be looked in): none.
+        assert_eq!(free_name(dir, "scan.pdf", |_| true), None);
     }
 
     /// An app can't save outside the folder chosen.
@@ -242,15 +242,15 @@ mod tests {
             |p: &Path| p == Path::new("/d/report.pdf") || p == Path::new("/d/report (2).pdf");
         assert_eq!(
             free_name(dir, "report.pdf", taken),
-            Path::new("/d/report (3).pdf")
+            Some(Path::new("/d/report (3).pdf").to_path_buf())
         );
         assert_eq!(
             free_name(dir, "notes", |p: &Path| p == Path::new("/d/notes")),
-            Path::new("/d/notes (2)")
+            Some(Path::new("/d/notes (2)").to_path_buf())
         );
         assert_eq!(
             free_name(dir, "new.txt", |_: &Path| false),
-            Path::new("/d/new.txt")
+            Some(Path::new("/d/new.txt").to_path_buf())
         );
     }
 }
