@@ -110,7 +110,7 @@ fn main() {
                             gtk::gio::spawn_blocking(move || save_files_uris(&folder, &names))
                                 .await
                                 .unwrap_or_else(|_| {
-                                    Err("The names couldn't be checked. Try again.".to_string())
+                                    Err("The names couldn't be checked. Try again".to_string())
                                 });
                         match uris {
                             Ok(uris) => result.uris = uris,
@@ -163,15 +163,17 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Result<Vec<String>, St
     use gtk::gio::prelude::FileExt;
     // (No names asked for — a request not understood — is no save either.)
     if names.is_empty() {
-        return Err("No files were asked to be saved".to_string());
+        return Err(
+            "No files were asked to be saved. The app may be able to try again".to_string(),
+        );
     }
     if folder_uri.is_empty() {
-        return Err("No folder was chosen".to_string());
+        return Err("No folder was chosen. Try again, choosing one".to_string());
     }
     let folder = gtk::gio::File::for_uri(folder_uri);
-    let dir = folder
-        .path()
-        .ok_or_else(|| "The folder chosen isn't one on this computer".to_string())?;
+    let dir = folder.path().ok_or_else(|| {
+        "The folder chosen isn't one on this computer. Choose a folder on this computer".to_string()
+    })?;
     let mut taken: Vec<String> = Vec::new();
     names
         .iter()
@@ -190,8 +192,17 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Result<Vec<String>, St
                 let free = match wayfinder::file_ops::name_free(p) {
                     Ok(free) => free,
                     Err(e) => {
-                        // (In plain words: the kind, not the OS's code.)
-                        *error.borrow_mut() = Some(e.kind().to_string());
+                        // (The system's words, without its code number;
+                        // a name too long is the name's fault, not the
+                        // folder's.)
+                        let words = e.to_string();
+                        let words = words
+                            .split(" (os error")
+                            .next()
+                            .unwrap_or(&words)
+                            .to_string();
+                        *error.borrow_mut() =
+                            Some((words, e.kind() == std::io::ErrorKind::InvalidFilename));
                         return None;
                     }
                 };
@@ -201,7 +212,10 @@ fn save_files_uris(folder_uri: &str, names: &[String]) -> Result<Vec<String>, St
             // (Not naming the file: the name is the app's, and its words
             // mustn't speak in this window.)
             .ok_or_else(|| match error.take() {
-                Some(e) => format!(
+                Some((_, true)) => {
+                    "A file's name can't be used in the folder chosen (it may be too long). The app may let you rename it".to_string()
+                }
+                Some((e, false)) => format!(
                     "A name couldn't be checked in the folder chosen: {e}. Try another folder"
                 ),
                 None => "Every name for one of the files is taken in the folder chosen. Try another folder"
