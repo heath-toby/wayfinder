@@ -564,7 +564,12 @@ impl DirectoryModel {
             }
         }
 
-        if listing.path.starts_with('/') && !listing.is_fuse {
+        // (By the path listed too: one through a link kept on a mount is
+        // looked up on the mount.)
+        if listing.path.starts_with('/')
+            && !listing.is_fuse
+            && !crate::rclone_ops::is_fuse_path(&listing.path)
+        {
             // FUSE folders get neither: a monitor's path lookup would touch
             // the mount on this thread (the window refreshes them when it
             // regains focus instead), and sizes would mean walking the

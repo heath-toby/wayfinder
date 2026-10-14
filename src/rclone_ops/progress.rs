@@ -69,7 +69,7 @@ pub fn show<W>(
         .xalign(0.0)
         .wrap(true)
         .build();
-    label.update_property(&[gtk::accessible::Property::Label("Operation target")]);
+    // (Its own text is its name: what's being done, to what.)
 
     let progress = gtk::ProgressBar::new();
     progress.set_show_text(false);

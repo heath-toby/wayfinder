@@ -59,8 +59,15 @@ pub fn load_actions() -> Vec<CustomAction> {
 /// points at an existing file.
 fn has_command(cmd: &str) -> bool {
     // Absolute or explicitly relative paths: check existence directly.
+    // (Not on a mount, through a link either: looking would hold up the
+    // menu; one there is taken to be there.)
+    let on_mount = |p: &Path| {
+        crate::rclone_ops::is_fuse_path(
+            &crate::rclone_ops::resolve_links_outside_mounts(p).to_string_lossy(),
+        )
+    };
     if cmd.starts_with('/') || cmd.starts_with("./") || cmd.starts_with("../") {
-        return Path::new(cmd).is_file();
+        return on_mount(Path::new(cmd)) || Path::new(cmd).is_file();
     }
     // Looked up in $PATH here, not by running `which`: this runs as the
     // menu opens, on the main thread, where starting a process can wait on
@@ -80,7 +87,7 @@ fn has_command(cmd: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let found = std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
-            !crate::rclone_ops::is_fuse_path(&dir.to_string_lossy())
+            !on_mount(&dir)
                 && std::fs::metadata(dir.join(cmd))
                     .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
@@ -669,7 +676,9 @@ fn build_compress_command(
     let quoted_archive = shell_quote(&format!("./{archive_name}"));
 
     match ext {
-        "zip" => format!("zip -r {quoted_archive} {quoted_files}"),
+        // (-y: links kept as links, as tar keeps them — not the folder one
+        // leads to, which may be big, or on a mount.)
+        "zip" => format!("zip -r -y {quoted_archive} {quoted_files}"),
         "7z" => format!("7z a {quoted_archive} {quoted_files}"),
         _ => {
             let options = match ext {
@@ -917,12 +926,10 @@ fn execute_nautilus_script(
     current_dir: &str,
     tx: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
-    let paths = files.join("\n");
-    let uris: String = files
-        .iter()
-        .map(|f| file_uri(f))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Each followed by a newline, as Nautilus gives them (a script's
+    // `while read` loop sees the last one too).
+    let paths: String = files.iter().map(|f| format!("{f}\n")).collect();
+    let uris: String = files.iter().map(|f| format!("{}\n", file_uri(f))).collect();
     let current_uri = file_uri(current_dir);
 
     let exec = action.exec.clone();
@@ -1116,6 +1123,6 @@ mod tests {
     #[test]
     fn compress_names_cant_be_options() {
         let cmd = build_compress_command("zip", "out.zip", &files(&["-T", "a b"]), "tar", false);
-        assert_eq!(cmd, "zip -r './out.zip' './-T' './a b'");
+        assert_eq!(cmd, "zip -r -y './out.zip' './-T' './a b'");
     }
 }

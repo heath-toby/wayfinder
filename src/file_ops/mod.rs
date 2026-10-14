@@ -300,9 +300,6 @@ pub fn delete_with_progress(
         .xalign(0.0)
         .wrap(true)
         .build();
-    title_label.update_property(&[gtk::accessible::Property::Label(
-        "Delete operation in progress",
-    )]);
 
     let progress_bar = gtk::ProgressBar::new();
     progress_bar.set_show_text(true);
@@ -856,6 +853,11 @@ fn copy_directory_recursive(
                 replace,
                 moving,
             )?;
+        } else if info.file_type() == gio::FileType::Special {
+            // A socket or pipe can't be copied (GIO refuses, which would
+            // stop the whole folder partway): left out. (For a move, the
+            // source folder then isn't empty, so it stays.)
+            log::warn!("Left out {}: not a file to copy", child_source.uri());
         } else {
             copy_keeping_links(&child_source, &child_dest, flags, cancellable, progress)?;
         }
@@ -948,6 +950,9 @@ fn run_with_progress(
         .default_width(450)
         .resizable(false)
         .build();
+    dlg.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{op_name} {display_name}"
+    ))]);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
     vbox.set_margin_top(12);
