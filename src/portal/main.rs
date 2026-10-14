@@ -173,12 +173,20 @@ fn free_name(
     if !taken(&first) {
         return first;
     }
-    // (Not forever: if every name is "taken" — the folder can't be looked
-    // in — the first is used, and saving there says why it fails.)
+    // (Not forever: if every number is "taken" — the folder can't be looked
+    // in, or holds them all — one from the time, which no file will have:
+    // never the name already found taken.)
     (2..1000)
         .map(|n| dir.join(wayfinder::file_ops::numbered_name(name, n)))
         .find(|p| !taken(p))
-        .unwrap_or(first)
+        .unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u32)
+                .unwrap_or(1000)
+                .max(1000);
+            dir.join(wayfinder::file_ops::numbered_name(name, now))
+        })
 }
 
 #[cfg(test)]

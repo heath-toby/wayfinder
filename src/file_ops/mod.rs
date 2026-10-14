@@ -853,10 +853,20 @@ fn copy_directory_recursive(
                 replace,
                 moving,
             )?;
-        } else if info.file_type() == gio::FileType::Special && !moving {
+        } else if info.file_type() == gio::FileType::Special {
             // A socket or pipe can't be copied (GIO refuses, which would
-            // stop the whole folder partway): a copy leaves it out. (A move
-            // stops instead: deleting the source after would lose it.)
+            // stop the whole folder partway): a copy leaves it out. A move
+            // stops, saying which (deleting the source after would lose
+            // it).
+            if moving {
+                return Err(glib::Error::new(
+                    gio::IOErrorEnum::NotSupported,
+                    &format!(
+                        "{} is a socket or pipe, which can't be moved to another drive",
+                        child_source.parse_name()
+                    ),
+                ));
+            }
             log::warn!("Left out {}: not a file to copy", child_source.uri());
         } else {
             copy_keeping_links(&child_source, &child_dest, flags, cancellable, progress)?;
