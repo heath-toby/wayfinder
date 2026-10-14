@@ -5,39 +5,17 @@ use std::path::PathBuf;
 /// Write `contents` to `path` whole or not at all: to a part file of its
 /// own (two saves at once mustn't share one), then renamed into place,
 /// creating the folder if need be. A reader never sees it half written.
+/// (A link is written through instead, as it always was.)
 pub fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    // Through a link (to a dotfiles folder, say) to the file it leads to,
-    // even one not there yet: the link stays. If that can't be written
-    // (read-only, a drive not mounted), it's reported, as before; the
-    // link is never replaced.
-    let target = link_target(path)?;
-    if target == path {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    // A link (to a dotfiles folder, say) is written through, as it always
+    // was: the link stays, and a failure is reported.
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return fs::write(path, contents);
     }
-    write_whole(&target, contents)
-}
-
-/// Where `path` leads, following links (to a file that may not exist). An
-/// error for a loop of links.
-fn link_target(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    let mut path = path.to_path_buf();
-    for _ in 0..40 {
-        match fs::read_link(&path) {
-            Ok(next) => {
-                path = match path.parent() {
-                    Some(parent) if next.is_relative() => parent.join(next),
-                    _ => next,
-                }
-            }
-            Err(_) => return Ok(path),
-        }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    Err(std::io::Error::other(format!(
-        "{} is a loop of links",
-        path.display()
-    )))
+    write_whole(path, contents)
 }
 
 fn write_whole(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
@@ -391,7 +369,31 @@ pub fn save_sidebar_config(entries: &[SidebarEntry]) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_loop_of_links_is_an_error_not_a_replaced_link() {
+    fn a_link_that_cant_be_written_through_stays_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        // (Root may write anywhere: nothing to show then.)
+        if std::fs::metadata("/proc/self")
+            .is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0)
+        {
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("wayfinder-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("mnt")).unwrap();
+        std::fs::set_permissions(d.join("mnt"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink(d.join("mnt/state"), d.join("state")).unwrap();
+        let result = super::write_atomically(&d.join("state"), b"x");
+        let still_link = std::fs::symlink_metadata(d.join("state"))
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let _ = std::fs::set_permissions(d.join("mnt"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(result.is_err());
+        assert!(still_link);
+    }
+
+    #[test]
+    fn a_loop_of_links_is_an_error_and_stays_links() {
         let d = std::env::temp_dir().join(format!("wayfinder-loop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();

@@ -3684,13 +3684,18 @@ mod tests {
             cmd,
             "cd -- '/home/u/my dir' && '/home/u/my dir/b.sh' ; echo ; echo \"[Press Enter to close]\" ; read _"
         );
-        // dash wants a name to read into, as POSIX does.
-        let status = std::process::Command::new("sh")
-            .args(["-c", "read _"])
-            .stdin(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.code().is_some());
+        // dash (Debian's sh) wants a name to read into, as POSIX does: a
+        // bare `read` is an error there (2), and the terminal would close.
+        for shell in ["sh", "dash"] {
+            let status = std::process::Command::new(shell)
+                .args(["-c", "read _"])
+                .stdin(std::process::Stdio::null())
+                .status();
+            if let Ok(status) = status {
+                // At the end of input: 1, not an error.
+                assert_eq!(status.code(), Some(1), "{shell}");
+            }
+        }
     }
 
     #[test]
