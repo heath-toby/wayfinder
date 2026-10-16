@@ -1455,9 +1455,21 @@ impl WayfinderWindow {
             .iter()
             .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some());
         let dest_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
+        // A change to an rclone mount goes direct only if the mount can be
+        // told about it (see `can_change_directly`): the destination always
+        // changes, and a move changes the mounts it leaves. Otherwise it
+        // goes through the mount, which keeps its listings right.
+        let changes_known = (!dest_rclone
+            || wayfinder::rclone_ops::can_change_directly(&dest_dir_str))
+            && (state.operation != ClipboardOperation::Cut
+                || source_paths.iter().all(|p| {
+                    wayfinder::rclone_ops::rclone_for_path(p).is_none()
+                        || wayfinder::rclone_ops::can_change_directly(p)
+                }));
         // (Not a folder with another drive mounted inside: rclone would
         // copy what's hidden under it from the remote.)
         let use_rclone = (any_src_rclone || dest_rclone)
+            && changes_known
             && wayfinder::rclone_ops::rclone_available()
             && !source_paths.is_empty()
             && !source_paths
@@ -1809,9 +1821,11 @@ impl WayfinderWindow {
                         if choice == 1 {
                             // Prefer rclone-direct delete when every path is on
                             // a recognised rclone mount.
+                            // (And only if the mounts can be told: see
+                            // `can_change_directly`.)
                             let all_rclone = !file_paths.is_empty()
                                 && file_paths.iter().all(|(_, p)| {
-                                    wayfinder::rclone_ops::rclone_for_path(p).is_some()
+                                    wayfinder::rclone_ops::can_change_directly(p)
                                 })
                                 && wayfinder::rclone_ops::rclone_available();
                             if all_rclone {
@@ -2168,10 +2182,12 @@ impl WayfinderWindow {
                         // If every path lives on an rclone FUSE mount, dispatch
                         // direct to rclone — much faster, real progress, proper
                         // rate-limit handling.
+                        // (And only if the mounts can be told: see
+                        // `can_change_directly`.)
                         let all_rclone = !file_paths.is_empty()
                             && file_paths
                                 .iter()
-                                .all(|(_, p)| wayfinder::rclone_ops::rclone_for_path(p).is_some())
+                                .all(|(_, p)| wayfinder::rclone_ops::can_change_directly(p))
                             && wayfinder::rclone_ops::rclone_available();
                         if all_rclone {
                             let rclone_items: Vec<(String, bool)> = file_paths
@@ -2284,8 +2300,10 @@ impl WayfinderWindow {
                 return;
             }
 
-            // rclone-direct rename: server-side moveto, no FUSE round-trip.
-            if wayfinder::rclone_ops::rclone_for_path(&file_path).is_some()
+            // rclone-direct rename: server-side moveto, no FUSE round-trip
+            // — if the mount can be told (see `can_change_directly`).
+            // Otherwise renaming through the mount is server-side too.
+            if wayfinder::rclone_ops::can_change_directly(&file_path)
                 && wayfinder::rclone_ops::rclone_available()
             {
                 let parent: gtk::Window = w.clone().upcast();
@@ -2636,9 +2654,10 @@ impl WayfinderWindow {
             // If every old path lives on a recognised rclone mount, batch
             // through rclone-direct. Mixed-batch falls back to per-file GIO
             // (existing behaviour).
+            // (And only if the mount can be told: see `can_change_directly`.)
             let all_rclone = pairs
                 .iter()
-                .all(|(old, _)| wayfinder::rclone_ops::rclone_for_path(old).is_some())
+                .all(|(old, _)| wayfinder::rclone_ops::can_change_directly(old))
                 && wayfinder::rclone_ops::rclone_available();
 
             if all_rclone {
@@ -2785,10 +2804,14 @@ impl WayfinderWindow {
         let guard = PastingGuard::new(self.clone());
 
         let dest_dir_str = imp.model.current_path();
+        // (A drop copies, so only the destination changes: direct only if
+        // its mount can be told — see `can_change_directly`.)
+        let dest_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
         let use_rclone = (paths
             .iter()
             .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some())
-            || wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some())
+            || dest_rclone)
+            && (!dest_rclone || wayfinder::rclone_ops::can_change_directly(&dest_dir_str))
             && wayfinder::rclone_ops::rclone_available()
             && !paths
                 .iter()

@@ -69,6 +69,7 @@ This pattern appears in: directory loading, folder size calculation, FUSE async 
 - No file monitor (its path lookup would run on the main thread, and remote changes never reach it); the window calls `refresh_if_idle()` whenever it becomes active instead
 - One-off actions (rename, new folder, trash, properties, pinning, paste clash check, Tab completion) go through `wayfinder::background::run` / `WayfinderWindow::run_blocking`, which also announce "Waiting for rclone." when slow
 - `trash_or_delete()` returns `NeedsPermanentDelete` when trash isn't supported, triggering a confirmation dialog
+- **Changing an rclone mount directly needs its remote control.** rclone caches each folder's listing (`--dir-cache-time`, 5 min) and Proton Drive's backend has no change notifications, so a change made by another rclone process (`rclone moveto`, `purge`, `bisync`) is invisible through the mount until the cache expires. Operations that change a mount go direct only if `rclone_ops::can_change_directly()` (the mount runs `--rc` with `--rc-no-auth` or a login Wayfinder can read from its args or environment); the rclone ops then call `forget_in_mounts()` on the changed folders before their `on_complete`. Otherwise they go through the mount (a move within one mount is still server-side there). Copying *off* a mount changes nothing on it and may always go direct.
 
 ### Action Registration Pattern
 
