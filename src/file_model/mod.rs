@@ -133,10 +133,7 @@ impl DirectoryModel {
 
         let hidden_filter = CustomFilter::new(move |obj| {
             let file = obj.downcast_ref::<FileObject>().unwrap();
-            if !*show_hidden_ref.borrow() && file.hidden() {
-                return false;
-            }
-            true
+            *show_hidden_ref.borrow() || !file.hidden()
         });
 
         let hidden_filter_model =

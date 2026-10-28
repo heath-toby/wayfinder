@@ -13,6 +13,12 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # zbus 6 is a sprawling breaking change (zvariant renames, interface
+      # macro move, builder API). Pin to 5.x until a deliberate migration.
+      - dependency-name: zbus
+        update-types:
+          - version-update:semver-major
     commit-message:
       prefix: "deps"
       include: scope
