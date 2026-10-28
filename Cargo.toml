@@ -15,7 +15,7 @@ path = "src/portal/main.rs"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.10", features = ["v4_14"] }
-dirs = "6"
+dirs = "7"
 log = "0.4"
 env_logger = "0.11"
 chrono = "0.4"
