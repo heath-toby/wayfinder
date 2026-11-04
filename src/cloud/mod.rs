@@ -193,6 +193,28 @@ pub fn sync_items(
     items
 }
 
+/// The sync items as configured now: everything kept offline, and older
+/// two-way pairings, on the drives Wayfinder Sync looks after. (The service
+/// and Wayfinder both go by this, so they agree on what's synced.)
+pub fn current_items() -> Vec<SyncItem> {
+    let pins: Vec<(String, bool)> = crate::offline::load_manifest()
+        .into_values()
+        .map(|p| (p.original_path, p.is_directory))
+        .collect();
+    let pairs: Vec<(String, String, String)> = crate::rclone_sync::load_pairs()
+        .into_values()
+        .map(|p| (p.local_path, p.remote, p.sync_local_path))
+        .collect();
+    sync_items(&load_drives(), &pins, &pairs, &crate::offline::cache_root())
+}
+
+/// The item `path` (an original) is, or is inside.
+pub fn covering_item<'a>(path: &str, items: &'a [SyncItem]) -> Option<&'a SyncItem> {
+    items
+        .iter()
+        .find(|i| path == i.original || (i.is_dir && path.starts_with(&format!("{}/", i.original))))
+}
+
 /// Names never synced: Wayfinder's own part-downloads, and the lock files
 /// LibreOffice keeps beside an open document (synced, they'd make it look
 /// open elsewhere).
@@ -570,6 +592,24 @@ mod tests {
             items[1].local,
             cache.join("home/u/protonDrive/Documents 2/German")
         );
+    }
+
+    /// A pairing (Russian) covers its files as much as a pin does.
+    #[test]
+    fn items_cover_their_files() {
+        let cache = Path::new("/c");
+        let pins = vec![("/home/u/protonDrive/a.m4a".to_string(), false)];
+        let pairs = vec![(
+            "/home/u/protonDrive/Russian".to_string(),
+            "Proton:Russian".to_string(),
+            "/c/home/u/protonDrive/Russian".to_string(),
+        )];
+        let items = sync_items(&[proton()], &pins, &pairs, cache);
+        let name = |p: &str| covering_item(p, &items).map(|i| i.name());
+        assert_eq!(name("/home/u/protonDrive/Russian/2026/essay.docx").as_deref(), Some("Russian"));
+        assert_eq!(name("/home/u/protonDrive/a.m4a").as_deref(), Some("a.m4a"));
+        assert_eq!(name("/home/u/protonDrive/a.m4a/x"), None);
+        assert_eq!(name("/home/u/protonDrive/Russian2/x"), None);
     }
 
     #[test]

@@ -85,16 +85,7 @@ impl SyncIface {
 }
 
 fn current_items() -> Vec<SyncItem> {
-    let drives = cloud::load_drives();
-    let pins: Vec<(String, bool)> = wayfinder::offline::load_manifest()
-        .into_values()
-        .map(|p| (p.original_path, p.is_directory))
-        .collect();
-    let pairs: Vec<(String, String, String)> = wayfinder::rclone_sync::load_pairs()
-        .into_values()
-        .map(|p| (p.local_path, p.remote, p.sync_local_path))
-        .collect();
-    cloud::sync_items(&drives, &pins, &pairs, &wayfinder::offline::cache_root())
+    cloud::current_items()
 }
 
 #[tokio::main(flavor = "current_thread")]

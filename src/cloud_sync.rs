@@ -51,6 +51,11 @@ pub fn file_to_open(path: &str) -> String {
     if !on_sync_drive(path) {
         return path.to_string();
     }
+    // (What the service syncs: kept offline, or an older two-way pairing.)
+    let items = wayfinder::cloud::current_items();
+    if wayfinder::cloud::covering_item(path, &items).is_none() {
+        return path.to_string();
+    }
     match wayfinder::offline::copy_to_open(path) {
         Some(copy) => {
             check_now(path);

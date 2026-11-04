@@ -414,32 +414,18 @@ impl Drop for Pinning {
     }
 }
 
-/// The kept-offline item covering `path`: `path` itself, or a folder kept
-/// offline that holds it (`pins`: original path, is a folder).
-pub fn covering_pin_in(path: &str, pins: &[(String, bool)]) -> Option<String> {
-    pins.iter()
-        .filter(|(pin, is_dir)| path == pin || (*is_dir && path.starts_with(&format!("{pin}/"))))
-        .map(|(pin, _)| pin.clone())
-        .max_by_key(|pin| pin.len())
-}
-
 /// The offline copy to open instead of the file at `original` on its
-/// mount (which would stream it): only once it's all there — kept offline,
-/// not being downloaded or removed, and a file. (Callers only use it where
-/// the copy is synced both ways, so what's saved to it reaches the drive.)
-/// Checks the local cache only: safe on the main thread.
+/// mount (which would stream it), for a file the caller knows is synced
+/// (`cloud::covering_item`): only once it's all there — not being
+/// downloaded or removed, and a file. Checks the local cache only: safe on
+/// the main thread.
 pub fn copy_to_open(original: &str) -> Option<PathBuf> {
-    let pins: Vec<(String, bool)> = load_manifest()
-        .into_values()
-        .map(|p| (p.original_path, p.is_directory))
-        .collect();
-    let pin = covering_pin_in(original, &pins)?;
     let busy = PINNING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .any(|p| paths_overlap(Path::new(p), Path::new(&pin)));
-    if busy || is_unpinning(&pin) {
+        .any(|p| paths_overlap(Path::new(p), Path::new(original)));
+    if busy || is_unpinning(original) {
         return None;
     }
     let copy = cache_path_for(original);
@@ -1284,27 +1270,6 @@ fn remote_child(remote: &str, name: &str) -> String {
         format!("{remote}{name}")
     } else {
         format!("{remote}/{name}")
-    }
-}
-
-#[cfg(test)]
-mod covering_pin_tests {
-    use super::covering_pin_in;
-
-    #[test]
-    fn the_item_covering_a_file() {
-        let pins = vec![
-            ("/d/Docs".to_string(), true),
-            ("/d/Docs/Sub".to_string(), true),
-            ("/d/a.m4a".to_string(), false),
-        ];
-        assert_eq!(covering_pin_in("/d/Docs/x.odt", &pins).as_deref(), Some("/d/Docs"));
-        assert_eq!(covering_pin_in("/d/Docs/Sub/y", &pins).as_deref(), Some("/d/Docs/Sub"));
-        assert_eq!(covering_pin_in("/d/a.m4a", &pins).as_deref(), Some("/d/a.m4a"));
-        // A file kept offline doesn't cover things "inside" it, nor a
-        // folder its look-alikes.
-        assert_eq!(covering_pin_in("/d/a.m4a/z", &pins), None);
-        assert_eq!(covering_pin_in("/d/Docs2/x", &pins), None);
     }
 }
 
