@@ -510,9 +510,15 @@ fn parse_rclone_mount(
         return None;
     }
     let args = &tokens[mount_idx + 1..];
+    // (`rclone mount Proton: ~/protonDrive/` is fine by rclone, but
+    // /proc/mounts lists it without the slash.)
+    let same_place = |t: &str, m: &str| {
+        let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
+        t == m
+    };
     let mount_pos = args
         .iter()
-        .position(|t| fuse_mounts.iter().any(|m| m == t))?;
+        .position(|t| fuse_mounts.iter().any(|m| same_place(t, m)))?;
     // Candidates: `name:` or `name:path` (or `:backend:…`), not `:5572`.
     let before = &args[..mount_pos];
     let candidates: Vec<usize> = (0..before.len())
@@ -547,7 +553,11 @@ fn parse_rclone_mount(
     if stray {
         return None;
     }
-    Some((args[mount_pos].to_string(), before[remote_idx].to_string()))
+    let mountpoint = fuse_mounts
+        .iter()
+        .find(|m| same_place(args[mount_pos], m))?
+        .to_string();
+    Some((mountpoint, before[remote_idx].to_string()))
 }
 
 /// Whether rclone can be run. Checked once per process: it's asked before
@@ -1587,6 +1597,17 @@ mod mount_parse_tests {
     fn plain_mount() {
         assert_eq!(
             parse_rclone_mount("rclone mount Proton: /home/u/proton", &mounts(), &[]),
+            Some(("/home/u/proton".into(), "Proton:".into()))
+        );
+    }
+
+    /// A mountpoint given with a trailing slash is the one /proc/mounts
+    /// lists without it.
+    #[test]
+    fn trailing_slash_on_the_mountpoint() {
+        let line = "rclone --vfs-cache-mode writes mount Proton: /home/u/proton/";
+        assert_eq!(
+            parse_rclone_mount(line, &mounts(), &[]),
             Some(("/home/u/proton".into(), "Proton:".into()))
         );
     }
