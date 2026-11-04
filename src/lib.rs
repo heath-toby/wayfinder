@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod background;
 pub mod clipboard;
+pub mod cloud;
 pub mod file_model;
 pub mod file_object;
 pub mod file_ops;
