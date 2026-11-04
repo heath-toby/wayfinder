@@ -235,15 +235,27 @@ pub fn short_local(item: &SyncItem, state_dir: &Path) -> PathBuf {
     state_dir.join("wayfinder").join("sync").join(item_id(item))
 }
 
+/// The item's own bisync state folder. Kept apart from other items', so
+/// it can be deleted when the item stops being kept offline: kept again
+/// later, it starts afresh, rather than bisync comparing it with how it
+/// was long ago.
+pub fn work_dir(item: &SyncItem, state_dir: &Path) -> PathBuf {
+    state_dir.join("wayfinder").join("bisync").join(item_id(item))
+}
+
 /// The `rclone` arguments to sync a folder item, its offline copy given
-/// as `local` (its `short_local` link). `first` builds the baseline
-/// (`--resync`: copies what's missing either way, deletes nothing) —
-/// needed once, before any other run.
-pub fn bisync_args(item: &SyncItem, local: &Path, first: bool) -> Vec<String> {
+/// as `local` (its `short_local` link), its state in `work` (`work_dir`).
+/// `first` builds the baseline (`--resync`: copies what's missing either
+/// way, deletes nothing) — needed once, before any other run. Where the
+/// two differ then, the newer copy wins: bisync's default would be the
+/// offline copy, which may be older than an edit made elsewhere.
+pub fn bisync_args(item: &SyncItem, local: &Path, work: &Path, first: bool) -> Vec<String> {
     let mut args: Vec<String> = [
         "bisync",
         &local.to_string_lossy(),
         &item.remote,
+        "--workdir",
+        &work.to_string_lossy(),
         "--verbose",
         "--color",
         "NEVER",
@@ -266,7 +278,11 @@ pub fn bisync_args(item: &SyncItem, local: &Path, first: bool) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    args.push(if first { "--resync" } else { "--recover" }.to_string());
+    if first {
+        args.extend(["--resync", "--resync-mode", "newer"].map(String::from));
+    } else {
+        args.push("--recover".to_string());
+    }
     args
 }
 
@@ -623,10 +639,19 @@ INFO  : Bisync successful
         let id = item_id(&item);
         assert_eq!(id.len(), 16);
         assert_eq!(link, Path::new("/home/u/.local/state/wayfinder/sync").join(&id));
-        let args = bisync_args(&item, &link, true);
-        assert_eq!(&args[..3], ["bisync", link.to_str().unwrap(), "Proton:German"]);
+        let work = work_dir(&item, Path::new("/s"));
+        assert_eq!(work, Path::new("/s/wayfinder/bisync").join(&id));
+        let args = bisync_args(&item, &link, &work, true);
+        assert_eq!(
+            &args[..5],
+            ["bisync", link.to_str().unwrap(), "Proton:German", "--workdir", work.to_str().unwrap()]
+        );
         assert!(args.contains(&"--max-lock".to_string()));
+        // A first sync lets the newer copy win, not the offline one.
+        let mode = args.iter().position(|a| a == "--resync-mode").unwrap();
+        assert_eq!(args[mode + 1], "newer");
         assert!(args.contains(&"--resync".to_string()));
-        assert!(bisync_args(&item, &link, false).contains(&"--recover".to_string()));
+        let later = bisync_args(&item, &link, &work, false);
+        assert!(later.contains(&"--recover".to_string()) && !later.contains(&"--resync".to_string()));
     }
 }

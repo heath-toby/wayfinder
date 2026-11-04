@@ -215,8 +215,12 @@ async fn main() {
                 || (s.changed_at.is_none() && s.due.is_some_and(|d| now >= d))
         });
         let Some(item) = ready.cloned() else {
-            // (A due check for an item no longer kept: forget it.)
+            // (A due check for an item no longer kept: forget it. Not
+            // with no drives read at all — a passing read error.)
             state.retain(|k, _| items.iter().any(|i| i.original == *k));
+            if !cloud::load_drives().is_empty() {
+                forget_old_items(&items);
+            }
             for i in &items {
                 let s = state.entry(i.original.clone()).or_default();
                 if s.due.is_none() {
@@ -293,21 +297,69 @@ async fn run_item(item: &SyncItem) -> cloud::Outcome {
             }
         }
     };
-    let out = rclone(&cloud::bisync_args(item, &link, false)).await;
+    let work = cloud::work_dir(item, &state_dir());
+    let out = rclone(&cloud::bisync_args(item, &link, &work, false)).await;
     log::debug!("bisync {}:\n{out}", item.original);
     let outcome = cloud::parse_bisync(&out);
-    if outcome.needs_first_run {
-        log::info!("first sync of {}: building its baseline", item.original);
-        return cloud::parse_bisync(&rclone(&cloud::bisync_args(item, &link, true)).await);
+    if !outcome.needs_first_run {
+        return outcome;
     }
-    outcome
+    // An offline copy made before it was synced both ways was refreshed
+    // only when Wayfinder started, so it may be behind the drive: bring
+    // it up to date first (Wayfinder's refresh keeps edits made offline).
+    // Otherwise the baseline, which deletes nothing, would put back files
+    // deleted on the drive since.
+    if let Some(entry) = wayfinder::offline::load_manifest().get(&item.original).cloned() {
+        if !wayfinder::rclone_ops::is_fuse_path(&item.original) {
+            return cloud::Outcome {
+                error: Some("its first sync waits for the drive to be mounted".into()),
+                ..Default::default()
+            };
+        }
+        log::info!("first sync of {}: refreshing its offline copy", item.original);
+        let refreshed = tokio::task::spawn_blocking(move || wayfinder::offline::refresh_pin(&entry))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        if let Err(e) = refreshed {
+            return cloud::Outcome {
+                error: Some(format!("couldn't bring its offline copy up to date: {e}")),
+                ..Default::default()
+            };
+        }
+    }
+    log::info!("first sync of {}: building its baseline", item.original);
+    cloud::parse_bisync(&rclone(&cloud::bisync_args(item, &link, &work, true)).await)
+}
+
+fn state_dir() -> PathBuf {
+    dirs::state_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Delete the bisync state and links of items no longer kept offline, so
+/// kept again they start afresh.
+fn forget_old_items(items: &[SyncItem]) {
+    let keep: Vec<String> = items.iter().map(cloud::item_id).collect();
+    for dir in ["bisync", "sync"] {
+        let Ok(entries) = std::fs::read_dir(state_dir().join("wayfinder").join(dir)) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if !keep.contains(&e.file_name().to_string_lossy().into_owned()) {
+                let path = e.path();
+                let _ = if path.is_symlink() || path.is_file() {
+                    std::fs::remove_file(&path)
+                } else {
+                    std::fs::remove_dir_all(&path)
+                };
+            }
+        }
+    }
 }
 
 /// The item's `cloud::short_local` link, made (or put right) to point at
 /// its offline copy.
 fn short_link(item: &SyncItem) -> std::io::Result<PathBuf> {
-    let state = dirs::state_dir().unwrap_or_else(|| PathBuf::from("."));
-    let link = cloud::short_local(item, &state);
+    let link = cloud::short_local(item, &state_dir());
     if std::fs::read_link(&link).ok().as_deref() != Some(item.local.as_path()) {
         if let Some(dir) = link.parent() {
             std::fs::create_dir_all(dir)?;
