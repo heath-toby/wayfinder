@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **Wayfinder Sync** — what you keep offline is now kept in step with your cloud drive both ways, as with a native cloud app. Changes you make are sent up a few seconds after you save (LibreOffice saving into the offline copy, say); changes made elsewhere come down within five minutes, straight away when you open the folder, or when you choose Sync now. Moves and deletions go both ways; a file changed in both places keeps both copies, and you're told. It runs as a background service (`wayfinder-sync`), so it carries on while Wayfinder is closed, and works with any rclone remote. Wayfinder announces what changed ("Sync updated: German, 2 changes from Proton."); with Wayfinder closed, you get a desktop notification.
+- **Setup guide** — the first time you keep something offline on an rclone drive, Wayfinder offers to set up Wayfinder Sync: check the remote's top level (Proton:, say) and where it's mounted, and choose whether the service runs the drive's mount (it then mounts it at login, and again if it drops, and the mount's folder listings never lag behind what the sync changed).
+- **Back online by itself** — while an offline copy is shown, Wayfinder notices when the drive answers again (mounted again, or the network back) and opens the real folder, saying so. Folders opened from an offline copy now go by their real path, so the next start no longer stays on the copy.
+
+### Fixed
+
+- **rclone mounts with a trailing slash** (`rclone mount Proton: ~/protonDrive/`) weren't recognised: Wayfinder suggested the wrong remote for a sync (Proton:Russian for Documents 2/Russian) and didn't use rclone directly on that drive.
+- **Moves and deletes on an rclone mount showed in the old place** for up to five minutes: done with rclone directly, they went unseen by the mount, whose folder listings are cached. Changes to a mount now go through it, or — with a mount run with remote control, as Wayfinder Sync runs it — directly, with the mount told what changed.
+
 ## 2.6.0
 
 ### New

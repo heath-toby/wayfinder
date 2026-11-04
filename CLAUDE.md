@@ -13,13 +13,13 @@ cargo fmt                      # Format
 cargo run                      # Run main file manager
 ```
 
-Two binaries: `wayfinder` (main app) and `wayfinder-portal` (XDG Desktop Portal backend).
+Three binaries: `wayfinder` (main app), `wayfinder-portal` (XDG Desktop Portal backend) and `wayfinder-sync` (the Wayfinder Sync user service, below).
 
 ```bash
 cargo test                     # Unit tests (no display needed)
 ```
 
-Unit tests cover logic that can run without GTK: path completion (`path_complete.rs`), location naming (`file_model::display_name`), selection after removal (`window/mod.rs`), and the suspend-time download retry (`offline/sleep.rs`). When fixing a bug in logic like this, move it into a plain function and add a test that fails without the fix.
+Unit tests cover logic that can run without GTK: path completion (`path_complete.rs`), location naming (`file_model::display_name`), selection after removal (`window/mod.rs`), the suspend-time download retry (`offline/sleep.rs`), and Wayfinder Sync's logic (`cloud/mod.rs`: drives file, sync items, bisync arguments and output, messages). When fixing a bug in logic like this, move it into a plain function and add a test that fails without the fix.
 
 ## Architecture
 
@@ -71,6 +71,17 @@ This pattern appears in: directory loading, folder size calculation, FUSE async 
 - `trash_or_delete()` returns `NeedsPermanentDelete` when trash isn't supported, triggering a confirmation dialog
 - **Changing an rclone mount directly needs its remote control.** rclone caches each folder's listing (`--dir-cache-time`, 5 min) and Proton Drive's backend has no change notifications, so a change made by another rclone process (`rclone moveto`, `purge`, `bisync`) is invisible through the mount until the cache expires. Operations that change a mount go direct only if `rclone_ops::can_change_directly()` (the mount runs `--rc` with `--rc-no-auth` or a login Wayfinder can read from its args or environment); the rclone ops then call `forget_in_mounts()` on the changed folders before their `on_complete`. Otherwise they go through the mount (a move within one mount is still server-side there). Copying *off* a mount changes nothing on it and may always go direct.
 
+### Wayfinder Sync
+
+`wayfinder-sync` (`src/sync_service/main.rs`) is a systemd user service (`~/.config/systemd/user/wayfinder-sync.service`, installed by Wayfinder's setup guide in `src/cloud_sync.rs`, offered the first time something is kept offline on an rclone drive). Drives are in `~/.config/wayfinder/drives` (`cloud::Drive`: remote top level, mountpoint, whether the service runs the mount, rc port). Everything kept offline on such a drive — plus older two-way sync pairings whose local side is an offline copy — is a `cloud::SyncItem`, kept in step with `rclone bisync` (folders) or a newer-wins `copyto` (single files): a few seconds after its offline copy changes (inotify), every five minutes (Proton can't announce changes), on `org.wayfinder.Sync.SyncNow`/`CheckNow` from Wayfinder, and when its drive is mounted again. One sync at a time. Results go out as the `Synced(item, message)` signal (Wayfinder announces it and refreshes windows showing the item) or, with Wayfinder closed, a desktop notification. A managed mount runs as the service's child with `--rc` and a per-run login in its environment, so `forget_in_mounts` can tell it what the sync changed. On such drives offline copies may be changed in Wayfinder (`refuse_in_offline_view` allows it), and `offline::sync_all` leaves their pins to the service.
+
+Gotchas (each found the hard way):
+- bisync names its state files after both of its paths joined together; an offline copy's path repeats the original's in full, so deep folders passed the 255-byte file-name limit and every run failed. It's given a short link instead (`cloud::short_local`). rclone aliases don't help: the names come from the underlying path.
+- A stopped run leaves a lock that refuses all later runs: `--max-lock`.
+- Count changes from what bisync *did* (`Copied`/`Deleted` under "Do queued copies to Path1/Path2"), not what it noticed: the run after a conflict sees the winner "new" on both sides and skips it.
+- A first sync (`--resync`) deletes nothing and by default lets the local side win: use `--resync-mode newer`, and refresh an existing offline copy (`offline::refresh_pin`, which keeps offline edits) before the baseline, or files deleted on the drive come back. Each item has its own `--workdir` (`cloud::work_dir`), deleted when it stops being kept offline.
+- Opening anything in the offline copies goes by its real path (`offline::real_location`), so a session never gets stuck on a cache path; while a copy is shown, `check_back_online` switches to the real folder once it answers.
+
 ### Action Registration Pattern
 
 Window actions use `gio::SimpleAction` registered via `window.add_action()`. Shortcuts use `GtkShortcutController` with `NamedAction` pointing to `win.action-name`. All shortcuts are centralized in `shortcuts/mod.rs`. Actions are set up in `window/imp.rs::setup_actions()`.
@@ -121,4 +132,4 @@ Sidebar and breadcrumb bar have paired toggle buttons + actions. The button stor
 
 - **gtk4 0.10** with `v4_14` feature
 - **zbus 5** (tokio) + **tokio 1** for D-Bus (portal, FileManager1, logind sleep watcher), **futures-util 0.3** for its signal stream
-- **dirs 6**, **chrono 0.4**, **log 0.4**, **env_logger 0.11**
+- **dirs 7**, **chrono 0.4**, **log 0.4**, **env_logger 0.11**, **notify 8** (wayfinder-sync's watcher)
