@@ -246,9 +246,10 @@ pub fn work_dir(item: &SyncItem, state_dir: &Path) -> PathBuf {
 /// The `rclone` arguments to sync a folder item, its offline copy given
 /// as `local` (its `short_local` link), its state in `work` (`work_dir`).
 /// `first` builds the baseline (`--resync`: copies what's missing either
-/// way, deletes nothing) — needed once, before any other run. Where the
-/// two differ then, the newer copy wins: bisync's default would be the
-/// offline copy, which may be older than an edit made elsewhere.
+/// way, deletes nothing) — needed once, before any other run. Files that
+/// differ in content are first given both copies (`differing_files`), so
+/// what's left to differ is only dates, and the remote's are kept.
+/// (Never the newer: a broken offline copy can have the newer date.)
 pub fn bisync_args(item: &SyncItem, local: &Path, work: &Path, first: bool) -> Vec<String> {
     let mut args: Vec<String> = [
         "bisync",
@@ -279,47 +280,93 @@ pub fn bisync_args(item: &SyncItem, local: &Path, work: &Path, first: bool) -> V
     .map(|s| s.to_string())
     .collect();
     if first {
-        args.extend(["--resync", "--resync-mode", "newer"].map(String::from));
+        args.extend(["--resync", "--resync-mode", "path2"].map(String::from));
     } else {
         args.push("--recover".to_string());
     }
     args
 }
 
-/// Which way a single kept-offline file is copied: bisync works on folders
-/// only, so a file is synced by comparing its two copies.
+/// A file's modification time (seconds) and size.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum FileSync {
-    /// The remote's copy is newer (or the only one): fetch it.
-    Fetch,
-    /// The offline copy is newer (or the only one): send it.
-    Send,
-    Nothing,
+pub struct Stamp {
+    pub mtime: i64,
+    pub size: u64,
 }
 
-/// For a file's offline and remote copies (modification time in seconds,
-/// size), which way to copy. Times within two seconds count as the same
-/// (remotes round them); then a size difference means the remote's copy
-/// wins, being the one shared with other devices.
-pub fn file_sync(local: Option<(i64, u64)>, remote: Option<(i64, u64)>) -> FileSync {
+impl Stamp {
+    /// The same file as far as can be told: same size, times within two
+    /// seconds (remotes round them).
+    pub fn same(&self, other: &Stamp) -> bool {
+        self.size == other.size && (self.mtime - other.mtime).abs() <= 2
+    }
+}
+
+/// What to do to sync a single kept-offline file (bisync works on folders
+/// only), from its two copies now and as they were at its last sync.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FileStep {
+    Nothing,
+    /// Changed on the remote only: fetch it.
+    Fetch,
+    /// Changed offline only: send it.
+    Send,
+    /// Changed in both places, or different with no last sync to say
+    /// which changed: keep the offline copy under a conflict name, and
+    /// fetch the remote's. (Never guessed from dates: a broken copy can
+    /// have the newer one.)
+    KeepBoth,
+}
+
+pub fn file_step(local: Option<Stamp>, remote: Option<Stamp>, last: Option<Stamp>) -> FileStep {
+    let unchanged = |now: &Stamp| last.is_some_and(|l| l.same(now));
     match (local, remote) {
-        (None, None) => FileSync::Nothing,
-        (None, Some(_)) => FileSync::Fetch,
-        (Some(_), None) => FileSync::Send,
-        (Some((lt, ls)), Some((rt, rs))) => {
-            if (lt - rt).abs() <= 2 {
-                if ls == rs {
-                    FileSync::Nothing
-                } else {
-                    FileSync::Fetch
-                }
-            } else if lt > rt {
-                FileSync::Send
+        (None, None) => FileStep::Nothing,
+        (None, Some(_)) => FileStep::Fetch,
+        // Gone from the remote: send it back only if it's new or changed
+        // here (otherwise it was deleted there on purpose).
+        (Some(l), None) => {
+            if unchanged(&l) {
+                FileStep::Nothing
             } else {
-                FileSync::Fetch
+                FileStep::Send
+            }
+        }
+        (Some(l), Some(r)) => {
+            if l.same(&r) {
+                FileStep::Nothing
+            } else if last.is_none() {
+                FileStep::KeepBoth
+            } else if unchanged(&l) {
+                FileStep::Fetch
+            } else if unchanged(&r) {
+                FileStep::Send
+            } else {
+                FileStep::KeepBoth
             }
         }
     }
+}
+
+/// The name a conflict copy of `path` is kept under (as bisync names
+/// them): `a.txt.conflict-local1`, or the first number not taken.
+pub fn conflict_copy_name(path: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    (1..)
+        .map(|n| path.with_file_name(format!("{name}.conflict-local{n}")))
+        .find(|p| !taken(p))
+        .expect("a free name")
+}
+
+/// Files whose contents differ between the two sides, from `rclone check
+/// --combined -` output ("* path" lines). Before a folder's first sync
+/// these keep both copies, rather than letting either side's date decide.
+pub fn differing_files(check_output: &str) -> Vec<String> {
+    check_output
+        .lines()
+        .filter_map(|l| l.strip_prefix("* "))
+        .map(str::to_string)
+        .collect()
 }
 
 /// What a side of a sync found changed.
@@ -616,15 +663,38 @@ INFO  : Bisync successful
         );
     }
 
+    fn st(mtime: i64, size: u64) -> Option<Stamp> {
+        Some(Stamp { mtime, size })
+    }
+
     #[test]
-    fn single_file_direction() {
-        assert_eq!(file_sync(Some((100, 5)), Some((100, 5))), FileSync::Nothing);
-        assert_eq!(file_sync(Some((101, 5)), Some((100, 5))), FileSync::Nothing);
-        assert_eq!(file_sync(Some((200, 5)), Some((100, 5))), FileSync::Send);
-        assert_eq!(file_sync(Some((100, 5)), Some((200, 9))), FileSync::Fetch);
-        assert_eq!(file_sync(Some((100, 5)), Some((100, 9))), FileSync::Fetch);
-        assert_eq!(file_sync(None, Some((1, 1))), FileSync::Fetch);
-        assert_eq!(file_sync(Some((1, 1)), None), FileSync::Send);
+    fn single_file_steps() {
+        // Same now: nothing, whatever the last sync was.
+        assert_eq!(file_step(st(100, 5), st(101, 5), None), FileStep::Nothing);
+        // Different, and no last sync to say which changed: keep both,
+        // never guess from dates (a broken copy can be newer).
+        assert_eq!(file_step(st(900, 48), st(100, 48_295_922), None), FileStep::KeepBoth);
+        // One side changed since the last sync.
+        assert_eq!(file_step(st(100, 5), st(200, 9), st(100, 5)), FileStep::Fetch);
+        assert_eq!(file_step(st(200, 9), st(100, 5), st(100, 5)), FileStep::Send);
+        // Both changed.
+        assert_eq!(file_step(st(200, 9), st(300, 7), st(100, 5)), FileStep::KeepBoth);
+        // Only one copy.
+        assert_eq!(file_step(None, st(1, 1), None), FileStep::Fetch);
+        assert_eq!(file_step(st(1, 1), None, None), FileStep::Send);
+        // Deleted on the remote, unchanged here: deleted on purpose.
+        assert_eq!(file_step(st(1, 1), None, st(1, 1)), FileStep::Nothing);
+    }
+
+    #[test]
+    fn conflict_names_and_differences() {
+        let taken = |p: &Path| p.ends_with("a.txt.conflict-local1");
+        assert_eq!(
+            conflict_copy_name(Path::new("/c/a.txt"), taken),
+            Path::new("/c/a.txt.conflict-local2")
+        );
+        let out = "= same.txt\n* sizes differ.mp3\n+ only here.txt\n- only there.txt\n";
+        assert_eq!(differing_files(out), vec!["sizes differ.mp3".to_string()]);
     }
 
     #[test]
@@ -647,9 +717,9 @@ INFO  : Bisync successful
             ["bisync", link.to_str().unwrap(), "Proton:German", "--workdir", work.to_str().unwrap()]
         );
         assert!(args.contains(&"--max-lock".to_string()));
-        // A first sync lets the newer copy win, not the offline one.
+        // A first sync never lets a date decide (see bisync_args).
         let mode = args.iter().position(|a| a == "--resync-mode").unwrap();
-        assert_eq!(args[mode + 1], "newer");
+        assert_eq!(args[mode + 1], "path2");
         assert!(args.contains(&"--resync".to_string()));
         let later = bisync_args(&item, &link, &work, false);
         assert!(later.contains(&"--recover".to_string()) && !later.contains(&"--resync".to_string()));

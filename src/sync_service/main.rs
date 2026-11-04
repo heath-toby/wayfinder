@@ -298,9 +298,10 @@ async fn run_item(item: &SyncItem) -> cloud::Outcome {
         }
     };
     let work = cloud::work_dir(item, &state_dir());
-    let out = rclone(&cloud::bisync_args(item, &link, &work, false)).await;
+    let (ok, out) = rclone(&cloud::bisync_args(item, &link, &work, false)).await;
     log::debug!("bisync {}:\n{out}", item.original);
-    let outcome = cloud::parse_bisync(&out);
+    let mut outcome = cloud::parse_bisync(&out);
+    outcome.ok &= ok;
     if !outcome.needs_first_run {
         return outcome;
     }
@@ -309,7 +310,14 @@ async fn run_item(item: &SyncItem) -> cloud::Outcome {
     // it up to date first (Wayfinder's refresh keeps edits made offline).
     // Otherwise the baseline, which deletes nothing, would put back files
     // deleted on the drive since.
-    if let Some(entry) = wayfinder::offline::load_manifest().get(&item.original).cloned() {
+    // (Not without a record of what was fetched: then a refresh keeps the
+    // newer by date, and an older edit made offline would be lost. Every
+    // file that differs keeps both copies instead, below.)
+    let entry = wayfinder::offline::load_manifest()
+        .get(&item.original)
+        .cloned()
+        .filter(|_| wayfinder::offline::is_recorded(&item.original));
+    if let Some(entry) = entry {
         if !wayfinder::rclone_ops::is_fuse_path(&item.original) {
             return cloud::Outcome {
                 error: Some("its first sync waits for the drive to be mounted".into()),
@@ -327,8 +335,38 @@ async fn run_item(item: &SyncItem) -> cloud::Outcome {
             };
         }
     }
+    // Whatever still differs in content keeps both copies: the offline
+    // one under a conflict name, sent up as a file of its own.
+    let (_, check) = rclone(&[
+        "check".into(),
+        link.to_string_lossy().into_owned(),
+        item.remote.clone(),
+        "--combined".into(),
+        "-".into(),
+        "--exclude".into(),
+        "*.wayfinder-part".into(),
+        "--exclude".into(),
+        ".~lock.*#".into(),
+    ])
+    .await;
+    let mut kept_both = 0;
+    for rel in cloud::differing_files(&check) {
+        let here = item.local.join(&rel);
+        let copy = cloud::conflict_copy_name(&here, |p| p.exists());
+        match std::fs::rename(&here, &copy) {
+            Ok(()) => {
+                log::info!("{} differs from the drive's: kept as {}", here.display(), copy.display());
+                kept_both += 1;
+            }
+            Err(e) => return failed(format!("couldn't keep both copies of {rel}: {e}")),
+        }
+    }
     log::info!("first sync of {}: building its baseline", item.original);
-    cloud::parse_bisync(&rclone(&cloud::bisync_args(item, &link, &work, true)).await)
+    let (ok, out) = rclone(&cloud::bisync_args(item, &link, &work, true)).await;
+    let mut outcome = cloud::parse_bisync(&out);
+    outcome.ok &= ok;
+    outcome.conflicts += kept_both;
+    outcome
 }
 
 fn state_dir() -> PathBuf {
@@ -370,8 +408,9 @@ fn short_link(item: &SyncItem) -> std::io::Result<PathBuf> {
     Ok(link)
 }
 
-/// Run rclone; its stdout and stderr together.
-async fn rclone(args: &[String]) -> String {
+/// Run rclone: whether it succeeded (its exit status: its messages can't
+/// be relied on to say), and its stdout and stderr together.
+async fn rclone(args: &[String]) -> (bool, String) {
     match tokio::process::Command::new("rclone")
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -382,69 +421,155 @@ async fn rclone(args: &[String]) -> String {
         Ok(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&o.stderr));
-            s
+            (o.status.success(), s)
         }
-        Err(e) => format!("ERROR : Bisync can't run rclone: {e}"),
+        Err(e) => (false, format!("ERROR : Bisync can't run rclone: {e}")),
     }
 }
 
-async fn sync_file(item: &SyncItem) -> cloud::Outcome {
-    let local = std::fs::metadata(&item.local).ok().map(|m| {
-        let t = m
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        (t, m.len())
-    });
+/// rclone's own reason in its output, for a failed command.
+fn reason(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .find_map(|l| {
+            ["CRITICAL: ", "ERROR : ", "Failed to "]
+                .iter()
+                .find_map(|m| l.split_once(m).map(|(_, why)| why.trim().to_string()))
+        })
+        .unwrap_or_else(|| "rclone failed".to_string())
+}
+
+fn failed(why: impl Into<String>) -> cloud::Outcome {
+    cloud::Outcome {
+        error: Some(why.into()),
+        ..Default::default()
+    }
+}
+
+/// Where a single file's state at its last sync is kept: "size<TAB>mtime".
+fn file_state_path(item: &SyncItem) -> PathBuf {
+    state_dir().join("wayfinder").join("files").join(cloud::item_id(item))
+}
+
+fn load_file_state(item: &SyncItem) -> Option<cloud::Stamp> {
+    let text = std::fs::read_to_string(file_state_path(item)).ok()?;
+    let (size, mtime) = text.trim().split_once('\t')?;
+    Some(cloud::Stamp { size: size.parse().ok()?, mtime: mtime.parse().ok()? })
+}
+
+fn save_file_state(item: &SyncItem, stamp: cloud::Stamp) {
+    let path = file_state_path(item);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, format!("{}\t{}\n", stamp.size, stamp.mtime));
+}
+
+fn local_stamp(path: &std::path::Path) -> Option<cloud::Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some(cloud::Stamp { mtime, size: m.len() })
+}
+
+/// The remote copy's stamp: `Ok(None)` if it isn't there.
+async fn remote_stamp(remote: &str) -> Result<Option<cloud::Stamp>, String> {
     // `lsf --format tsp`: "2026-11-04 14:42:18;123;name", local time.
-    let listing = rclone(&[
+    let (ok, listing) = rclone(&[
         "lsf".into(),
         "--format".into(),
         "tsp".into(),
         "--files-only".into(),
-        item.remote.clone(),
+        remote.to_string(),
     ])
     .await;
-    let remote = listing.lines().next().and_then(|l| {
+    if !ok {
+        // (A file that isn't there is "not found": not a failure.)
+        if listing.contains("not found") || listing.contains("doesn't exist") {
+            return Ok(None);
+        }
+        return Err(reason(&listing));
+    }
+    Ok(listing.lines().next().and_then(|l| {
         let mut f = l.splitn(3, ';');
         let t = chrono::NaiveDateTime::parse_from_str(f.next()?, "%Y-%m-%d %H:%M:%S").ok()?;
-        let t = t.and_local_timezone(chrono::Local).single()?.timestamp();
-        Some((t, f.next()?.parse().ok()?))
-    });
-    if remote.is_none() && listing.contains("ERROR") {
-        return cloud::Outcome {
-            error: listing
-                .lines()
-                .find(|l| l.contains("ERROR"))
-                .map(|l| l.split_once("ERROR : ").map_or(l, |x| x.1).trim().to_string()),
-            ..Default::default()
-        };
+        let mtime = t.and_local_timezone(chrono::Local).single()?.timestamp();
+        Some(cloud::Stamp { mtime, size: f.next()?.parse().ok()? })
+    }))
+}
+
+/// Sync a single kept-offline file (see `cloud::file_step`).
+async fn sync_file(item: &SyncItem) -> cloud::Outcome {
+    if item.local.is_dir() {
+        return failed(format!(
+            "its offline copy is a folder, not a file ({})",
+            item.local.display()
+        ));
     }
-    let one = cloud::Changes { modified: 1, ..Default::default() };
-    let (args, sent) = match cloud::file_sync(local, remote) {
-        cloud::FileSync::Nothing => {
-            return cloud::Outcome { ok: true, ..Default::default() };
-        }
-        cloud::FileSync::Fetch => (
-            vec!["copyto".into(), item.remote.clone(), item.local.to_string_lossy().into_owned()],
-            false,
-        ),
-        cloud::FileSync::Send => (
-            vec!["copyto".into(), item.local.to_string_lossy().into_owned(), item.remote.clone()],
-            true,
-        ),
+    let local = local_stamp(&item.local);
+    let remote = match remote_stamp(&item.remote).await {
+        Ok(r) => r,
+        Err(why) => return failed(why),
     };
-    let out = rclone(&args).await;
-    let failed = out.lines().find(|l| l.contains("ERROR"));
-    cloud::Outcome {
-        ok: failed.is_none(),
-        sent: if sent && failed.is_none() { one } else { Default::default() },
-        fetched: if !sent && failed.is_none() { one } else { Default::default() },
-        error: failed.map(|l| l.split_once("ERROR : ").map_or(l, |x| x.1).trim().to_string()),
-        ..Default::default()
+    let step = cloud::file_step(local, remote, load_file_state(item));
+    let one = cloud::Changes { modified: 1, ..Default::default() };
+    let local_path = item.local.to_string_lossy().into_owned();
+    let mut outcome = cloud::Outcome { ok: true, ..Default::default() };
+    let fetch = || vec!["copyto".to_string(), item.remote.clone(), local_path.clone()];
+    match step {
+        cloud::FileStep::Nothing => {}
+        cloud::FileStep::Send => {
+            let (ok, out) = rclone(&["copyto".into(), local_path.clone(), item.remote.clone()]).await;
+            if !ok {
+                return failed(reason(&out));
+            }
+            outcome.sent = one;
+        }
+        cloud::FileStep::Fetch => {
+            let (ok, out) = rclone(&fetch()).await;
+            if !ok {
+                return failed(reason(&out));
+            }
+            outcome.fetched = one;
+        }
+        cloud::FileStep::KeepBoth => {
+            let copy = cloud::conflict_copy_name(&item.local, |p| p.exists());
+            if let Err(e) = std::fs::rename(&item.local, &copy) {
+                return failed(format!("couldn't keep both copies: {e}"));
+            }
+            log::info!("{} differs from the drive's: kept as {}", local_path, copy.display());
+            // Both copies on the drive, as bisync leaves a folder's: the
+            // offline one beside the original under its conflict name.
+            let copy_name = copy.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let remote_copy = match item.remote.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{copy_name}"),
+                None => match item.remote.split_once(':') {
+                    Some((remote, _)) => format!("{remote}:{copy_name}"),
+                    None => copy_name.clone(),
+                },
+            };
+            let (ok, out) = rclone(&["copyto".into(), copy.to_string_lossy().into_owned(), remote_copy]).await;
+            if !ok {
+                return failed(reason(&out));
+            }
+            let (ok, out) = rclone(&fetch()).await;
+            if !ok {
+                return failed(reason(&out));
+            }
+            outcome.fetched = one;
+            outcome.conflicts = 1;
+        }
     }
+    // As it now is on both sides: the next sync's "last time".
+    if let Some(now) = local_stamp(&item.local) {
+        save_file_state(item, now);
+    }
+    outcome
 }
 
 /// Tell Wayfinder (the signal) or, if it isn't running, the desktop (a

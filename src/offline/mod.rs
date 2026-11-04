@@ -105,6 +105,14 @@ pub fn real_location(path: &str) -> String {
     }
 }
 
+/// Whether Wayfinder keeps a record of what it fetched for the pin at
+/// `original` (pins made before the record existed have none). Without
+/// one, a refresh can't tell an offline edit from a copy that's behind,
+/// and keeps the newer by date.
+pub fn is_recorded(original: &str) -> bool {
+    load_record().is_ok_and(|r| r.pins.contains(&cache_path_for(original)))
+}
+
 /// A single pinned entry in the manifest.
 #[derive(Clone, Debug)]
 pub struct PinnedEntry {
