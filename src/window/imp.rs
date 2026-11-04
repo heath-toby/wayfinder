@@ -82,6 +82,10 @@ pub struct WayfinderWindowInner {
     /// Showing a folder's offline copy because its mount is unreachable:
     /// what's listed lives in the cache, not on the drive.
     pub offline_view: Cell<bool>,
+    /// While `offline_view`: the drive folder the copy stands in for.
+    pub offline_original: RefCell<Option<String>>,
+    /// A back-online check (`check_back_online`) is waiting for an answer.
+    pub online_probe: Cell<bool>,
     /// A restore from the Bin is under way.
     pub restoring: Cell<bool>,
     /// This window's place in the session (see join_session).
@@ -227,6 +231,8 @@ impl Default for WayfinderWindowInner {
             clipboard: RefCell::new(None),
             pasting: Cell::new(false),
             offline_view: Cell::new(false),
+            offline_original: RefCell::new(None),
+            online_probe: Cell::new(false),
             restoring: Cell::new(false),
             session_id: Cell::new(0),
             current_view: Cell::new(ViewMode::List),
@@ -449,6 +455,23 @@ impl ObjectImpl for WayfinderWindowInner {
         // When the window regains focus (e.g. returning from an external app),
         // restore focus to the selected file item
         let w = window.clone();
+        // A drive mounted again (Proton back, say): an offline copy shown
+        // gives way to the real folder.
+        let weak = window.downgrade();
+        let monitor = gio::UnixMountMonitor::get();
+        let handler = monitor.connect_mounts_changed(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.check_back_online();
+            }
+        });
+        // (The monitor outlives the window: drop the handler with it.)
+        let handler = std::cell::Cell::new(Some(handler));
+        window.connect_destroy(move |_| {
+            if let Some(h) = handler.take() {
+                monitor.disconnect(h);
+            }
+        });
+
         window.connect_is_active_notify(move |win| {
             if win.is_active() {
                 // FUSE folders have no file monitor (setting one up would
@@ -457,6 +480,8 @@ impl ObjectImpl for WayfinderWindowInner {
                 // comes back to the window instead.
                 // (The Bin too: another window may have emptied it, or
                 // restored from it, and it has no monitor.)
+                // An offline copy shown: is its drive back?
+                w.check_back_online();
                 let model = &w.imp().model;
                 if (model.is_fuse() || w.is_in_trash()) && !model.is_loading() {
                     let w = w.clone();

@@ -69,6 +69,42 @@ pub fn path_is_in_known_mountpoint(path: &str) -> bool {
         .any(|mp| path == mp || path.starts_with(&format!("{mp}/")))
 }
 
+/// Where to go when asked to open `path`: a folder in the offline copies
+/// is opened as the drive folder it's a copy of, if that's on a drive
+/// Wayfinder knows (`known`, mountpoints), so the location shown and saved
+/// is always the real one — opening it shows the offline copy anyway while
+/// the drive can't be reached, and the real folder once it's back. Anything
+/// else (the store of copies itself, say) is opened as itself.
+pub fn real_location_in(path: &str, cache_root: &Path, known: &[String]) -> String {
+    let Ok(rel) = Path::new(path).strip_prefix(cache_root) else {
+        return path.to_string();
+    };
+    let original = format!("/{}", rel.to_string_lossy());
+    let on_known_drive = known
+        .iter()
+        .any(|mp| original == *mp || original.starts_with(&format!("{mp}/")));
+    if on_known_drive {
+        original
+    } else {
+        path.to_string()
+    }
+}
+
+/// `real_location_in` with this user's cache and known drives.
+pub fn real_location(path: &str) -> String {
+    let root = cache_root();
+    let known = known_mountpoints();
+    let first = real_location_in(path, &root, &known);
+    if first != path {
+        return first;
+    }
+    // (The cache reached through a link.)
+    match std::fs::canonicalize(&root) {
+        Ok(real) if real != root => real_location_in(path, &real, &known),
+        _ => first,
+    }
+}
+
 /// A single pinned entry in the manifest.
 #[derive(Clone, Debug)]
 pub struct PinnedEntry {
@@ -1202,6 +1238,52 @@ fn remote_child(remote: &str, name: &str) -> String {
         format!("{remote}{name}")
     } else {
         format!("{remote}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod real_location_tests {
+    use super::real_location_in;
+    use std::path::Path;
+
+    const CACHE: &str = "/home/u/.cache/wayfinder/offline";
+
+    fn known() -> Vec<String> {
+        vec!["/home/u/protonDrive".to_string()]
+    }
+
+    #[test]
+    fn a_copy_opens_as_its_drive_folder() {
+        assert_eq!(
+            real_location_in(
+                "/home/u/.cache/wayfinder/offline/home/u/protonDrive/Documents 2/Russian",
+                Path::new(CACHE),
+                &known()
+            ),
+            "/home/u/protonDrive/Documents 2/Russian"
+        );
+        assert_eq!(
+            real_location_in(
+                "/home/u/.cache/wayfinder/offline/home/u/protonDrive",
+                Path::new(CACHE),
+                &known()
+            ),
+            "/home/u/protonDrive"
+        );
+    }
+
+    /// The store itself, a copy of no known drive, and anything outside it
+    /// stay as they are.
+    #[test]
+    fn other_paths_stay() {
+        for p in [
+            CACHE,
+            "/home/u/.cache/wayfinder/offline/home/u",
+            "/home/u/.cache/wayfinder/offline/home/u/protonDrive_old/x",
+            "/home/u/Documents",
+        ] {
+            assert_eq!(real_location_in(p, Path::new(CACHE), &known()), p);
+        }
     }
 }
 

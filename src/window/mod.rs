@@ -71,7 +71,10 @@ impl WayfinderWindow {
         // and the folder's live updates would go by the literal path.
         let cleaned;
         let path = if path.starts_with('/') && !path.contains("://") {
-            cleaned = wayfinder::path_complete::clean(path);
+            // A folder opened from an offline copy goes by the drive folder
+            // it's a copy of: that's what's shown and saved, so next time
+            // the real folder is tried first (see `offline::real_location`).
+            cleaned = wayfinder::offline::real_location(&wayfinder::path_complete::clean(path));
             cleaned.as_str()
         } else {
             path
@@ -101,14 +104,61 @@ impl WayfinderWindow {
             // The Bin or Recent Files, in the history.
             self.open_special_uri(path);
         } else {
-            self.open_directory(path, false);
+            // (An offline copy in the history from before: as its folder.)
+            self.open_directory(&wayfinder::offline::real_location(path), false);
         }
+    }
+
+    /// While an offline copy is shown, see quietly whether the drive folder
+    /// it stands in for answers again — the mount back, the network back —
+    /// and open it if it does. Called when mounts change, when the window
+    /// is focused, and every half minute while the copy is shown.
+    pub(crate) fn check_back_online(&self) {
+        let imp = self.imp();
+        if !imp.offline_view.get() || imp.online_probe.get() {
+            return;
+        }
+        let Some(original) = imp.offline_original.borrow().clone() else {
+            return;
+        };
+        // (Not mounted at all: nothing to ask yet, and asking the bare
+        // mountpoint would say yes.)
+        if !is_fuse_mount(&original) {
+            return;
+        }
+        imp.online_probe.set(true);
+        let probe = original.clone();
+        let w = self.clone();
+        // Off the main thread: a mount still waiting on the network can
+        // take as long as it likes to answer.
+        wayfinder::background::run(
+            move || std::fs::read_dir(&probe).is_ok(),
+            move |answers| {
+                let imp = w.imp();
+                imp.online_probe.set(false);
+                let still_shown = imp.offline_view.get()
+                    && imp.offline_original.borrow().as_deref() == Some(original.as_str());
+                if answers && still_shown {
+                    let name = PathBuf::from(&original)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| original.clone());
+                    w.announce(
+                        &format!("Back online: opening {name} from the drive."),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    w.load_directory(&original);
+                }
+            },
+            || {},
+        );
     }
 
     /// Remember the selection in the location being left, and clear search.
     fn leave_location(&self, new_location: &str) {
         let imp = self.imp();
         imp.offline_view.set(false);
+        imp.offline_original.replace(None);
         let old_path = imp.model.current_path();
         if !old_path.is_empty() && old_path != new_location {
             if let Some(item) = imp.selection.selected_item() {
@@ -229,6 +279,23 @@ impl WayfinderWindow {
             let w = self.clone();
             let path = path.to_string();
             imp.offline_view.set(true);
+            imp.offline_original.replace(Some(path.clone()));
+            // Back to the drive folder as soon as it answers again.
+            let watcher = self.downgrade();
+            let watched = path.clone();
+            glib::timeout_add_seconds_local(30, move || {
+                let Some(w) = watcher.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let imp = w.imp();
+                if !imp.offline_view.get()
+                    || imp.offline_original.borrow().as_deref() != Some(watched.as_str())
+                {
+                    return glib::ControlFlow::Break;
+                }
+                w.check_back_online();
+                glib::ControlFlow::Continue
+            });
             imp.model.load_directory(&cache_str, false, move |result| {
                 if let Err(e) = result {
                     w.update_status();
