@@ -41,6 +41,25 @@ fn call(method: &str, path: &str) {
     );
 }
 
+/// What to open for the file at `path`: its offline copy, if it's kept
+/// offline on a drive Wayfinder Sync keeps in step and the copy is all
+/// there — instant, no streaming through the mount, and what the app
+/// saves is sent to the drive by the service. Otherwise `path` itself.
+/// Opening it also has the item checked, so a change made elsewhere comes
+/// down promptly.
+pub fn file_to_open(path: &str) -> String {
+    if !on_sync_drive(path) {
+        return path.to_string();
+    }
+    match wayfinder::offline::copy_to_open(path) {
+        Some(copy) => {
+            check_now(path);
+            copy.to_string_lossy().into_owned()
+        }
+        None => path.to_string(),
+    }
+}
+
 /// Sync the item holding `path` now, and hear back even if nothing changed.
 pub fn sync_now(path: &str) {
     call("SyncNow", path);

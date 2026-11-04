@@ -509,7 +509,10 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                     let f = file.clone();
                     let a = app.clone();
                     move || {
-                        let gio_file = gio::File::for_path(f.path());
+                        // (The offline copy, as opening it does: see
+                        // `cloud_sync::file_to_open`.)
+                        let gio_file =
+                            gio::File::for_path(crate::cloud_sync::file_to_open(&f.path()));
                         let ctx = WidgetExt::display(&w).app_launch_context();
                         if let Err(e) = a.launch(&[gio_file], Some(&ctx)) {
                             w.announce(

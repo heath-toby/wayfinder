@@ -949,6 +949,9 @@ impl WayfinderWindow {
 
     fn open_file_now(&self, file: &FileObject) {
         let path = file.path();
+        // Kept offline on a synced drive: the offline copy, not a stream
+        // through the mount (see `cloud_sync::file_to_open`).
+        let opened = crate::cloud_sync::file_to_open(&path);
 
         // Check for per-file app association (always takes priority)
         if let Some(desktop_id) = wayfinder::state::load_file_app(&path) {
@@ -957,7 +960,7 @@ impl WayfinderWindow {
                 .iter()
                 .find(|a| a.id().map(|id| id.to_string()) == Some(desktop_id.clone()))
             {
-                let gio_file = gio::File::for_path(&path);
+                let gio_file = gio::File::for_path(&opened);
                 let ctx = WidgetExt::display(self).app_launch_context();
                 if let Err(e) = app.launch(&[gio_file], Some(&ctx)) {
                     log::error!("Failed to open with preferred app: {e}");
@@ -981,7 +984,7 @@ impl WayfinderWindow {
             || self.imp().model.is_fuse()
         {
             let ctx = WidgetExt::display(self).app_launch_context();
-            let gio_file = gio::File::for_path(&path);
+            let gio_file = gio::File::for_path(&opened);
             let app = gio::AppInfo::default_for_type(&file.mime_type(), false);
             let launched = match app {
                 Some(app) => app
