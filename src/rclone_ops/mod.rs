@@ -242,6 +242,13 @@ pub fn rclone_for_path(local_path: &str) -> Option<RcloneTarget> {
     })
 }
 
+/// The running rclone mount `path` is on: (mountpoint, remote's top level
+/// as mounted, e.g. `Proton:`).
+pub fn mount_of(path: &str) -> Option<(String, String)> {
+    let mounts = list_rclone_fuse_mounts();
+    mount_for(path, &mounts, &fuse_mountpoints()).cloned()
+}
+
 /// Of the rclone `mounts` (mountpoint, remote) known, the one `path` is on
 /// — only if it's the innermost FUSE mount holding it (of `fuse`): one
 /// inside it that couldn't be named (started with `--config`, say) isn't

@@ -342,159 +342,49 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
                                 }
                         );
                     } else {
-                        // Inside a two-way sync folder, the copy is already
-                        // kept (both ways); downloading over it would undo
-                        // local changes not yet synced.
-                        if wayfinder::offline::is_unpinning(&p) {
-                            w.announce(
-                                "The old offline copy is still being removed. Try again in a moment.",
-                                gtk::AccessibleAnnouncementPriority::Medium,
-                            );
-                            return;
-                        }
-                        // Other pins' copies overlap this one's: don't download
-                        // over (or clear) them.
-                        if let Some(msg) = wayfinder::offline::pin_overlap(&p) {
-                            w.announce(&msg, gtk::AccessibleAnnouncementPriority::Medium);
-                            return;
-                        }
-                        let cached = wayfinder::offline::cache_path_for(&p);
-                        if wayfinder::offline::in_sync_folder(&cached) {
-                            let msg = if wayfinder::offline::inside_sync_folder(&cached) {
-                                "Already available offline through two-way sync"
-                            } else {
-                                "Can't keep this folder offline: it holds a two-way sync folder, which keeps its own copy. Keep the folders beside it offline instead."
-                            };
-                            w.announce(msg, gtk::AccessibleAnnouncementPriority::Medium);
-                            return;
-                        }
-                        // (Pressed again while downloading: not a second
-                        // download into the same copy. Held until the pin is
-                        // recorded, or the download given up.)
-                        let Some(pinning) = wayfinder::offline::start_pinning(&p) else {
-                            w.announce(
-                                "Already being downloaded for offline use",
-                                gtk::AccessibleAnnouncementPriority::Medium,
-                            );
-                            return;
-                        };
-                        let parent_window: gtk::Window = w.clone().upcast();
-                        let pin_path_str = p.clone();
-                        let w_done = w.clone();
-                        let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
-                            Some(Box::new(move |downloaded| {
-                                // A cancelled or failed download isn't a pin
-                                // (the progress dialog has said what happened).
-                                if !downloaded {
-                                    drop(pinning);
-                                    return;
-                                }
-                                // Recording the pin stats the original on the mount.
-                                let path = pin_path_str.clone();
-                                w_done.run_blocking(
-                                    &pin_path_str,
-                                    move || wayfinder::offline::record_pin(&path),
-                                    move |w, result| {
-                                        drop(pinning);
-                                        match result {
-                                            Ok(()) => w.announce(
-                                                "Available offline",
-                                                gtk::AccessibleAnnouncementPriority::Medium,
-                                            ),
-                                            Err(e) => w.announce(
-                                                &format!("Not available offline: {e}"),
-                                                gtk::AccessibleAnnouncementPriority::High,
-                                            ),
-                                        }
-                                    },
-                                );
-                            }));
-
-                        // Prefer rclone-direct copy when the source lives on
-                        // an rclone FUSE mount — much faster than reading
-                        // through the FUSE layer, and it shows real progress.
-                        // (Not with another drive mounted inside: rclone
-                        // would fetch what's hidden under it.)
-                        if wayfinder::rclone_ops::rclone_for_path(&p).is_some()
+                        // Wayfinder Sync not set up for this drive yet: offer
+                        // it first (once it is, what's kept offline here is
+                        // kept in step both ways).
+                        if !crate::cloud_sync::on_sync_drive(&p)
                             && wayfinder::rclone_ops::rclone_available()
-                            && !wayfinder::rclone_ops::has_mounts_inside(&p)
+                            && wayfinder::rclone_ops::rclone_for_path(&p).is_some()
                         {
-                            wayfinder::rclone_ops::pin_with_progress(
-                                &p,
-                                &parent_window,
-                                on_complete,
-                            );
-                        } else {
-                            // Fallback: GIO copy through the filesystem.
-                            let cache_path = wayfinder::offline::cache_path_for(&p);
-                            let Some(cache_parent) = cache_path.parent().map(|p| p.to_path_buf())
-                            else {
-                                w.announce(
-                                    "Pin failed: cannot determine cache location",
-                                    gtk::AccessibleAnnouncementPriority::High,
-                                );
-                                return;
-                            };
-                            if let Err(e) = std::fs::create_dir_all(&cache_parent) {
-                                w.announce(
-                                    &format!("Pin failed: {e}"),
-                                    gtk::AccessibleAnnouncementPriority::High,
-                                );
-                                return;
-                            }
-                            // An old copy there (from an earlier pin, or kept for
-                            // one inside) would raise "already exists": this is a
-                            // fresh download, so clear it first (off the main
-                            // thread: it may be big).
-                            let source_path = p.clone();
-                            let old_copy = cache_path.clone();
-                            w.run_blocking(
-                                &p,
-                                move || {
-                                    // (Not cleared: no pin — the copy would
-                                    // land beside the stale one, or ask.)
-                                    if old_copy.is_dir() {
-                                        std::fs::remove_dir_all(&old_copy)
-                                    } else if old_copy.symlink_metadata().is_ok() {
-                                        std::fs::remove_file(&old_copy)
-                                    } else {
-                                        Ok(())
-                                    }
-                                },
-                                move |w, cleared| {
-                                    if let Err(e) = cleared {
-                                        w.announce(
-                                            &format!(
-                                                "Pin failed: the old offline copy couldn't be removed: {e}"
-                                            ),
-                                            gtk::AccessibleAnnouncementPriority::High,
-                                        );
-                                        if let Some(cb) = on_complete {
-                                            cb(false);
-                                        }
-                                        return;
-                                    }
-                                    let parent_window: gtk::Window = w.clone().upcast();
-                                    wayfinder::file_ops::copy_with_outcome(
-                                        &gio::File::for_path(&source_path),
-                                        &gio::File::for_path(&cache_parent),
-                                        &parent_window,
-                                        move |downloaded| {
-                                            if let Some(cb) = on_complete {
-                                                cb(downloaded);
-                                            }
-                                        },
-                                    );
-                                },
-                            );
+                            let w2 = w.clone();
+                            let p2 = p.clone();
+                            crate::cloud_sync::setup_guide(&w, &p, move |_| keep_offline(&w2, &p2));
+                            return;
                         }
+                        keep_offline(&w, &p);
                     }
                 }
             });
         }
 
-        // Two-way sync via rclone — only show on directories
-        if file.is_directory() {
+        // On a drive Wayfinder Sync looks after, what's kept offline (or
+        // was paired before) is synced by it: Sync now asks it to.
+        let synced_by_service = {
+            let p = file.path();
+            crate::cloud_sync::on_sync_drive(&p)
+                && (wayfinder::offline::is_pinned(&p)
+                    || wayfinder::rclone_sync::pair_for(&p).is_some())
+        };
+        if synced_by_service {
+            add_menu_item(&main_box, "Sync now", &popover, {
+                let w = window.clone();
+                let p = file.path();
+                let name = file.name();
+                move || {
+                    crate::cloud_sync::sync_now(&p);
+                    w.announce(
+                        &format!("Syncing {name}"),
+                        gtk::AccessibleAnnouncementPriority::Medium,
+                    );
+                }
+            });
+        }
+        // Two-way sync via rclone — only show on directories (on a synced
+        // drive, Keep Available Offline does it)
+        if file.is_directory() && !synced_by_service && !crate::cloud_sync::on_sync_drive(&file.path()) {
             let sync_path = file.path();
             let pair = wayfinder::rclone_sync::pair_for(&sync_path);
             if pair.is_some() {
@@ -691,6 +581,169 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
     });
 
     popover.popup();
+}
+
+/// Keep `p` available offline: download its copy, then record it (and,
+/// on a drive Wayfinder Sync looks after, have it synced from then on).
+fn keep_offline(w: &WayfinderWindow, p: &str) {
+    let w = w.clone();
+    let p = p.to_string();
+    // Inside a two-way sync folder, the copy is already
+    // kept (both ways); downloading over it would undo
+    // local changes not yet synced.
+    if wayfinder::offline::is_unpinning(&p) {
+        w.announce(
+            "The old offline copy is still being removed. Try again in a moment.",
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
+        return;
+    }
+    // Other pins' copies overlap this one's: don't download
+    // over (or clear) them.
+    if let Some(msg) = wayfinder::offline::pin_overlap(&p) {
+        w.announce(&msg, gtk::AccessibleAnnouncementPriority::Medium);
+        return;
+    }
+    let cached = wayfinder::offline::cache_path_for(&p);
+    if wayfinder::offline::in_sync_folder(&cached) {
+        let msg = if wayfinder::offline::inside_sync_folder(&cached) {
+            "Already available offline through two-way sync"
+        } else {
+            "Can't keep this folder offline: it holds a two-way sync folder, which keeps its own copy. Keep the folders beside it offline instead."
+        };
+        w.announce(msg, gtk::AccessibleAnnouncementPriority::Medium);
+        return;
+    }
+    // (Pressed again while downloading: not a second
+    // download into the same copy. Held until the pin is
+    // recorded, or the download given up.)
+    let Some(pinning) = wayfinder::offline::start_pinning(&p) else {
+        w.announce(
+            "Already being downloaded for offline use",
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
+        return;
+    };
+    let parent_window: gtk::Window = w.clone().upcast();
+    let pin_path_str = p.clone();
+    let w_done = w.clone();
+    let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
+        Some(Box::new(move |downloaded| {
+            // A cancelled or failed download isn't a pin
+            // (the progress dialog has said what happened).
+            if !downloaded {
+                drop(pinning);
+                return;
+            }
+            // Recording the pin stats the original on the mount.
+            let path = pin_path_str.clone();
+            let synced_path = pin_path_str.clone();
+            w_done.run_blocking(
+                &pin_path_str,
+                move || wayfinder::offline::record_pin(&path),
+                move |w, result| {
+                    drop(pinning);
+                    match result {
+                        Ok(()) if crate::cloud_sync::on_sync_drive(&synced_path) => {
+                            // Wayfinder Sync builds its baseline now, not at
+                            // its next routine check.
+                            crate::cloud_sync::check_now(&synced_path);
+                            w.announce(
+                                "Available offline, and kept in sync",
+                                gtk::AccessibleAnnouncementPriority::Medium,
+                            );
+                        }
+                        Ok(()) => w.announce(
+                            "Available offline",
+                            gtk::AccessibleAnnouncementPriority::Medium,
+                        ),
+                        Err(e) => w.announce(
+                            &format!("Not available offline: {e}"),
+                            gtk::AccessibleAnnouncementPriority::High,
+                        ),
+                    }
+                },
+            );
+        }));
+
+    // Prefer rclone-direct copy when the source lives on
+    // an rclone FUSE mount — much faster than reading
+    // through the FUSE layer, and it shows real progress.
+    // (Not with another drive mounted inside: rclone
+    // would fetch what's hidden under it.)
+    if wayfinder::rclone_ops::rclone_for_path(&p).is_some()
+        && wayfinder::rclone_ops::rclone_available()
+        && !wayfinder::rclone_ops::has_mounts_inside(&p)
+    {
+        wayfinder::rclone_ops::pin_with_progress(
+            &p,
+            &parent_window,
+            on_complete,
+        );
+    } else {
+        // Fallback: GIO copy through the filesystem.
+        let cache_path = wayfinder::offline::cache_path_for(&p);
+        let Some(cache_parent) = cache_path.parent().map(|p| p.to_path_buf())
+        else {
+            w.announce(
+                "Pin failed: cannot determine cache location",
+                gtk::AccessibleAnnouncementPriority::High,
+            );
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(&cache_parent) {
+            w.announce(
+                &format!("Pin failed: {e}"),
+                gtk::AccessibleAnnouncementPriority::High,
+            );
+            return;
+        }
+        // An old copy there (from an earlier pin, or kept for
+        // one inside) would raise "already exists": this is a
+        // fresh download, so clear it first (off the main
+        // thread: it may be big).
+        let source_path = p.clone();
+        let old_copy = cache_path.clone();
+        w.run_blocking(
+            &p,
+            move || {
+                // (Not cleared: no pin — the copy would
+                // land beside the stale one, or ask.)
+                if old_copy.is_dir() {
+                    std::fs::remove_dir_all(&old_copy)
+                } else if old_copy.symlink_metadata().is_ok() {
+                    std::fs::remove_file(&old_copy)
+                } else {
+                    Ok(())
+                }
+            },
+            move |w, cleared| {
+                if let Err(e) = cleared {
+                    w.announce(
+                        &format!(
+                            "Pin failed: the old offline copy couldn't be removed: {e}"
+                        ),
+                        gtk::AccessibleAnnouncementPriority::High,
+                    );
+                    if let Some(cb) = on_complete {
+                        cb(false);
+                    }
+                    return;
+                }
+                let parent_window: gtk::Window = w.clone().upcast();
+                wayfinder::file_ops::copy_with_outcome(
+                    &gio::File::for_path(&source_path),
+                    &gio::File::for_path(&cache_parent),
+                    &parent_window,
+                    move |downloaded| {
+                        if let Some(cb) = on_complete {
+                            cb(downloaded);
+                        }
+                    },
+                );
+            },
+        );
+    }
 }
 
 fn add_menu_item(

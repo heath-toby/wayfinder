@@ -691,7 +691,13 @@ pub fn sync_all() -> (usize, usize) {
     }
     let mut updated = 0;
     let mut errors = 0;
+    // Pins on a drive Wayfinder Sync looks after are synced both ways by
+    // it; a one-way refresh here would race it.
+    let drives = crate::cloud::load_drives();
     for entry in manifest.values() {
+        if crate::cloud::drive_for(&entry.original_path, &drives).is_some() {
+            continue;
+        }
         match refresh_pin(entry) {
             Ok(true) => updated += 1,
             Ok(false) => {}

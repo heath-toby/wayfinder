@@ -32,8 +32,9 @@ const QUIET: Duration = Duration::from_secs(4);
 enum Event {
     /// Something changed in the offline copies.
     Changed(PathBuf),
-    /// Wayfinder asked for the item holding this path to be synced now.
-    SyncNow(String),
+    /// Wayfinder asked for the item holding this path to be synced now;
+    /// `true` to hear back even if nothing changed.
+    SyncNow(String, bool),
     /// A managed drive was mounted (again).
     Mounted(String),
 }
@@ -59,7 +60,13 @@ struct SyncIface {
 impl SyncIface {
     /// Sync the item holding `path` (an original or its offline copy) now.
     fn sync_now(&self, path: String) {
-        let _ = self.tx.send(Event::SyncNow(path));
+        let _ = self.tx.send(Event::SyncNow(path, true));
+    }
+
+    /// Like `SyncNow`, but quiet unless something changed (Wayfinder
+    /// checks a synced folder when it's opened).
+    fn check_now(&self, path: String) {
+        let _ = self.tx.send(Event::SyncNow(path, false));
     }
 
     /// The originals of everything synced, one per line.
@@ -173,12 +180,12 @@ async fn main() {
                             state.entry(i.original.clone()).or_default().changed_at = Some(Instant::now());
                         }
                     }
-                    Event::SyncNow(path) => {
+                    Event::SyncNow(path, tell) => {
                         items = current_items();
                         let real = wayfinder::offline::real_location(&path);
                         if let Some(i) = items.iter().find(|i| real == i.original || real.starts_with(&format!("{}/", i.original))) {
                             let s = state.entry(i.original.clone()).or_default();
-                            s.asked = true;
+                            s.asked |= tell;
                             s.due = Some(Instant::now());
                         }
                     }

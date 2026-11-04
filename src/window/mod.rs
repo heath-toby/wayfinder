@@ -255,6 +255,12 @@ impl WayfinderWindow {
         // trigger cache fallback for ordinary directories.
         let live_count = live_result.as_ref().copied().unwrap_or(0);
 
+        // A folder Wayfinder Sync keeps in step: have it check for changes
+        // now (quietly, unless there are some).
+        if crate::cloud_sync::on_sync_drive(path) {
+            crate::cloud_sync::check_now(path);
+        }
+
         // Decide whether to substitute the offline cache. We want the cache
         // to kick in ONLY for paths that are at-or-inside a known rclone
         // FUSE mountpoint (the user has seen mounted at some point).
@@ -2047,6 +2053,11 @@ impl WayfinderWindow {
     /// changed and return true: the change would land on the copy, not the
     /// drive the location bar names.
     pub(crate) fn refuse_in_offline_view(&self) -> bool {
+        // On a drive Wayfinder Sync looks after, the offline copy is kept in
+        // step both ways: changes made to it are sent to the drive.
+        if crate::cloud_sync::on_sync_drive(&self.imp().model.current_path()) {
+            return false;
+        }
         // Also inside it (a subfolder opened from the offline copy is
         // listed by its cache path): changes there would be undone by the
         // next offline refresh. A two-way sync folder's local side lives

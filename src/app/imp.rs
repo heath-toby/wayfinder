@@ -29,6 +29,8 @@ impl ApplicationImpl for WayfinderApplicationInner {
         crate::menubar::install(app.upcast_ref());
         let rx = crate::dbus::start_service();
         crate::dbus::connect_to_app(app.upcast_ref(), rx);
+        // What Wayfinder Sync reports, announced.
+        crate::cloud_sync::listen(app.upcast_ref());
 
         // Record any rclone FUSE mountpoints we can see right now. The list
         // persists across sessions so cache fallback still works after the
