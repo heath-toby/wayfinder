@@ -232,7 +232,9 @@ pub fn item_for_change<'a>(path: &Path, items: &'a [SyncItem]) -> Option<&'a Syn
     {
         return None;
     }
-    items.iter().find(|i| path == i.local || path.starts_with(&i.local))
+    items
+        .iter()
+        .find(|i| path == i.local || path.starts_with(&i.local))
 }
 
 /// A short, stable name for the item (from its original path), for the
@@ -262,7 +264,10 @@ pub fn short_local(item: &SyncItem, state_dir: &Path) -> PathBuf {
 /// later, it starts afresh, rather than bisync comparing it with how it
 /// was long ago.
 pub fn work_dir(item: &SyncItem, state_dir: &Path) -> PathBuf {
-    state_dir.join("wayfinder").join("bisync").join(item_id(item))
+    state_dir
+        .join("wayfinder")
+        .join("bisync")
+        .join(item_id(item))
 }
 
 /// The `rclone` arguments to sync a folder item, its offline copy given
@@ -373,7 +378,10 @@ pub fn file_step(local: Option<Stamp>, remote: Option<Stamp>, last: Option<Stamp
 /// The name a conflict copy of `path` is kept under (as bisync names
 /// them): `a.txt.conflict-local1`, or the first number not taken.
 pub fn conflict_copy_name(path: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     (1..)
         .map(|n| path.with_file_name(format!("{name}.conflict-local{n}")))
         .find(|p| !taken(p))
@@ -445,7 +453,9 @@ pub fn parse_bisync(output: &str) -> Outcome {
         } else if line.contains("Updating listings") {
             into_local = None;
         } else if out.error.is_none() && line.contains("ERROR : ") && line.contains("Bisync") {
-            out.error = line.split_once("ERROR : ").map(|(_, e)| e.trim().to_string());
+            out.error = line
+                .split_once("ERROR : ")
+                .map(|(_, e)| e.trim().to_string());
         } else if let Some((_, why)) = line.split_once("Failed to bisync: ") {
             // (The run's last word on it; an earlier, fuller reason wins.)
             if out.error.is_none() {
@@ -461,7 +471,11 @@ pub fn parse_bisync(output: &str) -> Outcome {
             if name.contains(".conflict-local") || name.contains(".conflict-remote") {
                 continue;
             }
-            let side = if local { &mut out.fetched } else { &mut out.sent };
+            let side = if local {
+                &mut out.fetched
+            } else {
+                &mut out.sent
+            };
             match what.trim() {
                 "Copied (new)" => side.new += 1,
                 "Copied (replaced existing)" => side.modified += 1,
@@ -487,20 +501,23 @@ fn count(n: usize, noun: &str) -> String {
 /// worth hearing about).
 pub fn describe(item_name: &str, drive_name: &str, outcome: &Outcome) -> Option<String> {
     if !outcome.ok {
-        let why = outcome
-            .error
-            .as_deref()
-            .unwrap_or("the sync didn't finish");
+        let why = outcome.error.as_deref().unwrap_or("the sync didn't finish");
         return Some(format!(
             "Couldn't sync {item_name} with {drive_name}: {why}. Wayfinder will try again."
         ));
     }
     let mut parts = Vec::new();
     if outcome.fetched.total() > 0 {
-        parts.push(format!("{} from {drive_name}", count(outcome.fetched.total(), "change")));
+        parts.push(format!(
+            "{} from {drive_name}",
+            count(outcome.fetched.total(), "change")
+        ));
     }
     if outcome.sent.total() > 0 {
-        parts.push(format!("{} sent to {drive_name}", count(outcome.sent.total(), "change")));
+        parts.push(format!(
+            "{} sent to {drive_name}",
+            count(outcome.sent.total(), "change")
+        ));
     }
     if outcome.conflicts > 0 {
         parts.push(format!(
@@ -568,7 +585,10 @@ mod tests {
             // Not on a drive the service looks after.
             ("/media/usb/x".to_string(), true),
             // Inside another item: covered by it.
-            ("/home/u/protonDrive/Documents 2/German/Literature".to_string(), true),
+            (
+                "/home/u/protonDrive/Documents 2/German/Literature".to_string(),
+                true,
+            ),
         ];
         let pairs = vec![(
             "/home/u/protonDrive/Documents 2/Russian".to_string(),
@@ -583,9 +603,21 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("/home/u/protonDrive/Audio/a.m4a", "Proton:Audio/a.m4a", false),
-                ("/home/u/protonDrive/Documents 2/German", "Proton:Documents 2/German", true),
-                ("/home/u/protonDrive/Documents 2/Russian", "Proton:Documents 2/Russian", true),
+                (
+                    "/home/u/protonDrive/Audio/a.m4a",
+                    "Proton:Audio/a.m4a",
+                    false
+                ),
+                (
+                    "/home/u/protonDrive/Documents 2/German",
+                    "Proton:Documents 2/German",
+                    true
+                ),
+                (
+                    "/home/u/protonDrive/Documents 2/Russian",
+                    "Proton:Documents 2/Russian",
+                    true
+                ),
             ]
         );
         assert_eq!(
@@ -606,7 +638,10 @@ mod tests {
         )];
         let items = sync_items(&[proton()], &pins, &pairs, cache);
         let name = |p: &str| covering_item(p, &items).map(|i| i.name());
-        assert_eq!(name("/home/u/protonDrive/Russian/2026/essay.docx").as_deref(), Some("Russian"));
+        assert_eq!(
+            name("/home/u/protonDrive/Russian/2026/essay.docx").as_deref(),
+            Some("Russian")
+        );
         assert_eq!(name("/home/u/protonDrive/a.m4a").as_deref(), Some("a.m4a"));
         assert_eq!(name("/home/u/protonDrive/a.m4a/x"), None);
         assert_eq!(name("/home/u/protonDrive/Russian2/x"), None);
@@ -618,13 +653,20 @@ mod tests {
         let pins = vec![("/home/u/protonDrive/German".to_string(), true)];
         let items = sync_items(&[proton()], &pins, &[], cache);
         let doc = Path::new("/c/home/u/protonDrive/German/essay.odt");
-        assert_eq!(item_for_change(doc, &items).map(|i| i.name()), Some("German".into()));
+        assert_eq!(
+            item_for_change(doc, &items).map(|i| i.name()),
+            Some("German".into())
+        );
         for ignored in [
             "/c/home/u/protonDrive/German/.~lock.essay.odt#",
             "/c/home/u/protonDrive/German/big.pdf.wayfinder-part",
             "/c/home/u/protonDrive/Russian/x",
         ] {
-            assert_eq!(item_for_change(Path::new(ignored), &items), None, "{ignored}");
+            assert_eq!(
+                item_for_change(Path::new(ignored), &items),
+                None,
+                "{ignored}"
+            );
         }
     }
 
@@ -658,8 +700,22 @@ INFO  : Bisync successful
     fn reads_a_run() {
         let o = parse_bisync(RUN);
         assert!(o.ok);
-        assert_eq!(o.sent, Changes { new: 0, modified: 1, deleted: 0 });
-        assert_eq!(o.fetched, Changes { new: 2, modified: 0, deleted: 1 });
+        assert_eq!(
+            o.sent,
+            Changes {
+                new: 0,
+                modified: 1,
+                deleted: 0
+            }
+        );
+        assert_eq!(
+            o.fetched,
+            Changes {
+                new: 2,
+                modified: 0,
+                deleted: 1
+            }
+        );
         assert_eq!(o.conflicts, 1);
         assert_eq!(
             describe("German", "Proton", &o).as_deref(),
@@ -713,12 +769,24 @@ INFO  : Bisync successful
         assert_eq!(file_step(st(100, 5), st(101, 5), None), FileStep::Nothing);
         // Different, and no last sync to say which changed: keep both,
         // never guess from dates (a broken copy can be newer).
-        assert_eq!(file_step(st(900, 48), st(100, 48_295_922), None), FileStep::KeepBoth);
+        assert_eq!(
+            file_step(st(900, 48), st(100, 48_295_922), None),
+            FileStep::KeepBoth
+        );
         // One side changed since the last sync.
-        assert_eq!(file_step(st(100, 5), st(200, 9), st(100, 5)), FileStep::Fetch);
-        assert_eq!(file_step(st(200, 9), st(100, 5), st(100, 5)), FileStep::Send);
+        assert_eq!(
+            file_step(st(100, 5), st(200, 9), st(100, 5)),
+            FileStep::Fetch
+        );
+        assert_eq!(
+            file_step(st(200, 9), st(100, 5), st(100, 5)),
+            FileStep::Send
+        );
         // Both changed.
-        assert_eq!(file_step(st(200, 9), st(300, 7), st(100, 5)), FileStep::KeepBoth);
+        assert_eq!(
+            file_step(st(200, 9), st(300, 7), st(100, 5)),
+            FileStep::KeepBoth
+        );
         // Only one copy.
         assert_eq!(file_step(None, st(1, 1), None), FileStep::Fetch);
         assert_eq!(file_step(st(1, 1), None, None), FileStep::Send);
@@ -748,13 +816,22 @@ INFO  : Bisync successful
         let link = short_local(&item, Path::new("/home/u/.local/state"));
         let id = item_id(&item);
         assert_eq!(id.len(), 16);
-        assert_eq!(link, Path::new("/home/u/.local/state/wayfinder/sync").join(&id));
+        assert_eq!(
+            link,
+            Path::new("/home/u/.local/state/wayfinder/sync").join(&id)
+        );
         let work = work_dir(&item, Path::new("/s"));
         assert_eq!(work, Path::new("/s/wayfinder/bisync").join(&id));
         let args = bisync_args(&item, &link, &work, true);
         assert_eq!(
             &args[..5],
-            ["bisync", link.to_str().unwrap(), "Proton:German", "--workdir", work.to_str().unwrap()]
+            [
+                "bisync",
+                link.to_str().unwrap(),
+                "Proton:German",
+                "--workdir",
+                work.to_str().unwrap()
+            ]
         );
         assert!(args.contains(&"--max-lock".to_string()));
         // A first sync never lets a date decide (see bisync_args).
@@ -762,6 +839,8 @@ INFO  : Bisync successful
         assert_eq!(args[mode + 1], "path2");
         assert!(args.contains(&"--resync".to_string()));
         let later = bisync_args(&item, &link, &work, false);
-        assert!(later.contains(&"--recover".to_string()) && !later.contains(&"--resync".to_string()));
+        assert!(
+            later.contains(&"--recover".to_string()) && !later.contains(&"--resync".to_string())
+        );
     }
 }

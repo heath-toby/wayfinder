@@ -1900,9 +1900,9 @@ impl WayfinderWindow {
                             // (And only if the mounts can be told: see
                             // `can_change_directly`.)
                             let all_rclone = !file_paths.is_empty()
-                                && file_paths.iter().all(|(_, p)| {
-                                    wayfinder::rclone_ops::can_change_directly(p)
-                                })
+                                && file_paths
+                                    .iter()
+                                    .all(|(_, p)| wayfinder::rclone_ops::can_change_directly(p))
                                 && wayfinder::rclone_ops::rclone_available();
                             if all_rclone {
                                 let rclone_items: Vec<(String, bool)> = file_paths

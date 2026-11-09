@@ -315,10 +315,14 @@ async fn run_item(item: &SyncItem) -> cloud::Outcome {
                 ..Default::default()
             };
         }
-        log::info!("first sync of {}: refreshing its offline copy", item.original);
-        let refreshed = tokio::task::spawn_blocking(move || wayfinder::offline::refresh_pin(&entry))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
+        log::info!(
+            "first sync of {}: refreshing its offline copy",
+            item.original
+        );
+        let refreshed =
+            tokio::task::spawn_blocking(move || wayfinder::offline::refresh_pin(&entry))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
         if let Err(e) = refreshed {
             return cloud::Outcome {
                 error: Some(format!("couldn't bring its offline copy up to date: {e}")),
@@ -346,7 +350,11 @@ async fn run_item(item: &SyncItem) -> cloud::Outcome {
         let copy = cloud::conflict_copy_name(&here, |p| p.exists());
         match std::fs::rename(&here, &copy) {
             Ok(()) => {
-                log::info!("{} differs from the drive's: kept as {}", here.display(), copy.display());
+                log::info!(
+                    "{} differs from the drive's: kept as {}",
+                    here.display(),
+                    copy.display()
+                );
                 kept_both += 1;
             }
             Err(e) => return failed(format!("couldn't keep both copies of {rel}: {e}")),
@@ -440,13 +448,19 @@ fn failed(why: impl Into<String>) -> cloud::Outcome {
 
 /// Where a single file's state at its last sync is kept: "size<TAB>mtime".
 fn file_state_path(item: &SyncItem) -> PathBuf {
-    state_dir().join("wayfinder").join("files").join(cloud::item_id(item))
+    state_dir()
+        .join("wayfinder")
+        .join("files")
+        .join(cloud::item_id(item))
 }
 
 fn load_file_state(item: &SyncItem) -> Option<cloud::Stamp> {
     let text = std::fs::read_to_string(file_state_path(item)).ok()?;
     let (size, mtime) = text.trim().split_once('\t')?;
-    Some(cloud::Stamp { size: size.parse().ok()?, mtime: mtime.parse().ok()? })
+    Some(cloud::Stamp {
+        size: size.parse().ok()?,
+        mtime: mtime.parse().ok()?,
+    })
 }
 
 fn save_file_state(item: &SyncItem, stamp: cloud::Stamp) {
@@ -465,7 +479,10 @@ fn local_stamp(path: &std::path::Path) -> Option<cloud::Stamp> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Some(cloud::Stamp { mtime, size: m.len() })
+    Some(cloud::Stamp {
+        mtime,
+        size: m.len(),
+    })
 }
 
 /// The remote copy's stamp: `Ok(None)` if it isn't there.
@@ -490,7 +507,10 @@ async fn remote_stamp(remote: &str) -> Result<Option<cloud::Stamp>, String> {
         let mut f = l.splitn(3, ';');
         let t = chrono::NaiveDateTime::parse_from_str(f.next()?, "%Y-%m-%d %H:%M:%S").ok()?;
         let mtime = t.and_local_timezone(chrono::Local).single()?.timestamp();
-        Some(cloud::Stamp { mtime, size: f.next()?.parse().ok()? })
+        Some(cloud::Stamp {
+            mtime,
+            size: f.next()?.parse().ok()?,
+        })
     }))
 }
 
@@ -508,14 +528,27 @@ async fn sync_file(item: &SyncItem) -> cloud::Outcome {
         Err(why) => return failed(why),
     };
     let step = cloud::file_step(local, remote, load_file_state(item));
-    let one = cloud::Changes { modified: 1, ..Default::default() };
+    let one = cloud::Changes {
+        modified: 1,
+        ..Default::default()
+    };
     let local_path = item.local.to_string_lossy().into_owned();
-    let mut outcome = cloud::Outcome { ok: true, ..Default::default() };
-    let fetch = || vec!["copyto".to_string(), item.remote.clone(), local_path.clone()];
+    let mut outcome = cloud::Outcome {
+        ok: true,
+        ..Default::default()
+    };
+    let fetch = || {
+        vec![
+            "copyto".to_string(),
+            item.remote.clone(),
+            local_path.clone(),
+        ]
+    };
     match step {
         cloud::FileStep::Nothing => {}
         cloud::FileStep::Send => {
-            let (ok, out) = rclone(&["copyto".into(), local_path.clone(), item.remote.clone()]).await;
+            let (ok, out) =
+                rclone(&["copyto".into(), local_path.clone(), item.remote.clone()]).await;
             if !ok {
                 return failed(reason(&out));
             }
@@ -533,10 +566,17 @@ async fn sync_file(item: &SyncItem) -> cloud::Outcome {
             if let Err(e) = std::fs::rename(&item.local, &copy) {
                 return failed(format!("couldn't keep both copies: {e}"));
             }
-            log::info!("{} differs from the drive's: kept as {}", local_path, copy.display());
+            log::info!(
+                "{} differs from the drive's: kept as {}",
+                local_path,
+                copy.display()
+            );
             // Both copies on the drive, as bisync leaves a folder's: the
             // offline one beside the original under its conflict name.
-            let copy_name = copy.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let copy_name = copy
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let remote_copy = match item.remote.rsplit_once('/') {
                 Some((dir, _)) => format!("{dir}/{copy_name}"),
                 None => match item.remote.split_once(':') {
@@ -544,7 +584,12 @@ async fn sync_file(item: &SyncItem) -> cloud::Outcome {
                     None => copy_name.clone(),
                 },
             };
-            let (ok, out) = rclone(&["copyto".into(), copy.to_string_lossy().into_owned(), remote_copy]).await;
+            let (ok, out) = rclone(&[
+                "copyto".into(),
+                copy.to_string_lossy().into_owned(),
+                remote_copy,
+            ])
+            .await;
             if !ok {
                 return failed(reason(&out));
             }
@@ -634,7 +679,8 @@ impl Mounts {
                     self.running.remove(&d.mountpoint);
                     let n = self.retry_at.get(&d.mountpoint).map_or(0, |r| r.1) + 1;
                     let wait = Duration::from_secs((10u64 << n.min(5)).min(300));
-                    self.retry_at.insert(d.mountpoint.clone(), (Instant::now() + wait, n));
+                    self.retry_at
+                        .insert(d.mountpoint.clone(), (Instant::now() + wait, n));
                 }
                 continue;
             }

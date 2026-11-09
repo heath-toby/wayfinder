@@ -75,7 +75,10 @@ pub fn forget_in_mounts(dirs: &[String]) {
     for (rc, rels) in by_mount {
         let addr = &rc.addr;
         let mut cmd = Command::new("rclone");
-        cmd.arg("rc").arg("--url").arg(format!("http://{addr}/")).arg("vfs/forget");
+        cmd.arg("rc")
+            .arg("--url")
+            .arg(format!("http://{addr}/"))
+            .arg("vfs/forget");
         // The login goes in the environment, not on the command line,
         // where any user could read it with `ps`.
         if let (Some(user), Some(pass)) = (&rc.user, &rc.pass) {
@@ -141,10 +144,7 @@ fn parent_dir(path: &str) -> String {
 /// user can read another process's environment, while anyone can read its
 /// command line); not from `--rc-htpasswd`, or `--rc-web-gui`'s made-up
 /// one. The default address is `localhost:5572`; a unix socket isn't used.
-fn rc_access(
-    line: &str,
-    env: &std::collections::HashMap<String, String>,
-) -> Option<RcAccess> {
+fn rc_access(line: &str, env: &std::collections::HashMap<String, String>) -> Option<RcAccess> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     // A flag's value from the command line (`--f v`, `--f=v`, or `true`
     // for a bare boolean flag), else from the environment.
@@ -284,7 +284,10 @@ fn mount_rc_access() -> std::collections::HashMap<String, RcAccess> {
     scan_rclone_mounts().1
 }
 
-type MountScan = (Vec<(String, String)>, std::collections::HashMap<String, RcAccess>);
+type MountScan = (
+    Vec<(String, String)>,
+    std::collections::HashMap<String, RcAccess>,
+);
 
 fn scan_rclone_mounts() -> MountScan {
     type Scan = (std::time::Instant, Vec<String>, MountScan);
@@ -520,7 +523,11 @@ fn parse_rclone_mount(
     // (`rclone mount Proton: ~/protonDrive/` is fine by rclone, but
     // /proc/mounts lists it without the slash.)
     let same_place = |t: &str, m: &str| {
-        let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
+        let t = if t.len() > 1 {
+            t.trim_end_matches('/')
+        } else {
+            t
+        };
         t == m
     };
     let mount_pos = args

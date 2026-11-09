@@ -384,7 +384,10 @@ pub fn show_context_menu(window: &WayfinderWindow, x: f64, y: f64) {
         }
         // Two-way sync via rclone — only show on directories (on a synced
         // drive, Keep Available Offline does it)
-        if file.is_directory() && !synced_by_service && !crate::cloud_sync::on_sync_drive(&file.path()) {
+        if file.is_directory()
+            && !synced_by_service
+            && !crate::cloud_sync::on_sync_drive(&file.path())
+        {
             let sync_path = file.path();
             let pair = wayfinder::rclone_sync::pair_for(&sync_path);
             if pair.is_some() {
@@ -630,44 +633,43 @@ fn keep_offline(w: &WayfinderWindow, p: &str) {
     let parent_window: gtk::Window = w.clone().upcast();
     let pin_path_str = p.clone();
     let w_done = w.clone();
-    let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
-        Some(Box::new(move |downloaded| {
-            // A cancelled or failed download isn't a pin
-            // (the progress dialog has said what happened).
-            if !downloaded {
+    let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> = Some(Box::new(move |downloaded| {
+        // A cancelled or failed download isn't a pin
+        // (the progress dialog has said what happened).
+        if !downloaded {
+            drop(pinning);
+            return;
+        }
+        // Recording the pin stats the original on the mount.
+        let path = pin_path_str.clone();
+        let synced_path = pin_path_str.clone();
+        w_done.run_blocking(
+            &pin_path_str,
+            move || wayfinder::offline::record_pin(&path),
+            move |w, result| {
                 drop(pinning);
-                return;
-            }
-            // Recording the pin stats the original on the mount.
-            let path = pin_path_str.clone();
-            let synced_path = pin_path_str.clone();
-            w_done.run_blocking(
-                &pin_path_str,
-                move || wayfinder::offline::record_pin(&path),
-                move |w, result| {
-                    drop(pinning);
-                    match result {
-                        Ok(()) if crate::cloud_sync::on_sync_drive(&synced_path) => {
-                            // Wayfinder Sync builds its baseline now, not at
-                            // its next routine check.
-                            crate::cloud_sync::check_now(&synced_path);
-                            w.announce(
-                                "Available offline, and kept in sync",
-                                gtk::AccessibleAnnouncementPriority::Medium,
-                            );
-                        }
-                        Ok(()) => w.announce(
-                            "Available offline",
+                match result {
+                    Ok(()) if crate::cloud_sync::on_sync_drive(&synced_path) => {
+                        // Wayfinder Sync builds its baseline now, not at
+                        // its next routine check.
+                        crate::cloud_sync::check_now(&synced_path);
+                        w.announce(
+                            "Available offline, and kept in sync",
                             gtk::AccessibleAnnouncementPriority::Medium,
-                        ),
-                        Err(e) => w.announce(
-                            &format!("Not available offline: {e}"),
-                            gtk::AccessibleAnnouncementPriority::High,
-                        ),
+                        );
                     }
-                },
-            );
-        }));
+                    Ok(()) => w.announce(
+                        "Available offline",
+                        gtk::AccessibleAnnouncementPriority::Medium,
+                    ),
+                    Err(e) => w.announce(
+                        &format!("Not available offline: {e}"),
+                        gtk::AccessibleAnnouncementPriority::High,
+                    ),
+                }
+            },
+        );
+    }));
 
     // Prefer rclone-direct copy when the source lives on
     // an rclone FUSE mount — much faster than reading
@@ -678,16 +680,11 @@ fn keep_offline(w: &WayfinderWindow, p: &str) {
         && wayfinder::rclone_ops::rclone_available()
         && !wayfinder::rclone_ops::has_mounts_inside(&p)
     {
-        wayfinder::rclone_ops::pin_with_progress(
-            &p,
-            &parent_window,
-            on_complete,
-        );
+        wayfinder::rclone_ops::pin_with_progress(&p, &parent_window, on_complete);
     } else {
         // Fallback: GIO copy through the filesystem.
         let cache_path = wayfinder::offline::cache_path_for(&p);
-        let Some(cache_parent) = cache_path.parent().map(|p| p.to_path_buf())
-        else {
+        let Some(cache_parent) = cache_path.parent().map(|p| p.to_path_buf()) else {
             w.announce(
                 "Pin failed: cannot determine cache location",
                 gtk::AccessibleAnnouncementPriority::High,
@@ -723,9 +720,7 @@ fn keep_offline(w: &WayfinderWindow, p: &str) {
             move |w, cleared| {
                 if let Err(e) = cleared {
                     w.announce(
-                        &format!(
-                            "Pin failed: the old offline copy couldn't be removed: {e}"
-                        ),
+                        &format!("Pin failed: the old offline copy couldn't be removed: {e}"),
                         gtk::AccessibleAnnouncementPriority::High,
                     );
                     if let Some(cb) = on_complete {

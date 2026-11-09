@@ -227,7 +227,9 @@ pub fn setup_guide(window: &WayfinderWindow, path: &str, then: impl FnOnce(bool)
     dlg.set_child(Some(&vbox));
     dlg.set_default_widget(Some(&set_up));
 
-    let then = std::rc::Rc::new(std::cell::RefCell::new(Some(Box::new(then) as Box<dyn FnOnce(bool)>)));
+    let then = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        Box::new(then) as Box<dyn FnOnce(bool)>
+    )));
     let finish = {
         let then = then.clone();
         move |ok: bool| {
