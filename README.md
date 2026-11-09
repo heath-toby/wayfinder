@@ -20,6 +20,7 @@ Wayfinder puts accessibility first. Every element is navigable with a keyboard, 
 - **Copy/move with progress** dialog including time estimates and cancellation
 - **Replace/Skip/Rename** conflict dialog when pasting over existing files
 - **FUSE mount support** -- rclone, sshfs, and other FUSE mounts work without freezing. Async file monitoring, trash fallback to permanent delete, cross-device directory move
+- **Wayfinder Sync** -- what you keep offline on an rclone drive stays in step with it both ways, like a native cloud app: your changes are sent up seconds after you save, changes made elsewhere come down within minutes, files kept offline open from the offline copy, and you're told what changed. A background service (`wayfinder-sync`), set up by a guide the first time you keep something offline
 - **Session restore** -- all open windows and their directories are remembered on exit and restored on next launch
 - **Font zoom** -- Ctrl+Plus/Minus/0 to zoom in, out, or reset (50%–300%, persisted)
 - **Breadcrumb path bar** -- clickable path segments for quick navigation, F4 or header button to toggle
@@ -35,14 +36,15 @@ Wayfinder puts accessibility first. Every element is navigable with a keyboard, 
 - Rust 1.70+
 - `gvfs` and `udisks2` for volume management
 - Optional: `bsdtar`, `zip`, `gpg`, `seahorse`, `zenity` for context menu actions
+- Optional: `rclone` for direct rclone operations and Wayfinder Sync (which also needs a systemd user session)
 
 ## Building
 
 ```bash
-cargo build --release --bin wayfinder
+cargo build --release --bin wayfinder --bin wayfinder-sync
 ```
 
-The binary is at `target/release/wayfinder`. Copy it to `~/.local/bin/` or `/usr/bin/`.
+The binaries are at `target/release/`. Copy both to `~/.local/bin/` or `/usr/bin/` — `wayfinder-sync` must sit beside `wayfinder`, where Wayfinder's setup guide looks for it.
 
 To install the bundled context menu actions:
 
@@ -55,6 +57,7 @@ Or for system-wide installation:
 
 ```bash
 install -Dm755 target/release/wayfinder /usr/bin/wayfinder
+install -Dm755 target/release/wayfinder-sync /usr/bin/wayfinder-sync
 install -Dm644 data/actions/*.desktop -t /usr/share/wayfinder/actions/
 ```
 

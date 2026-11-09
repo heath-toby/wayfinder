@@ -256,6 +256,15 @@ pub fn bisync_args(pair: &SyncPair) -> Vec<String> {
 /// from inside the success-message closure once rclone exits cleanly.
 pub fn record_successful_sync(synced: &SyncPair) {
     let _ = mark_synced(synced);
+    // bisync changed the remote behind the mount's back: if the pair's
+    // folder is on an rclone mount with remote control, have it forget its
+    // cached listings (see `rclone_ops::can_change_directly`).
+    let folder = synced.local_path.clone();
+    crate::background::run(
+        move || crate::rclone_ops::forget_in_mounts(&[folder]),
+        |()| {},
+        || {},
+    );
 }
 
 /// Count conflict files in captured rclone output. rclone bisync logs each

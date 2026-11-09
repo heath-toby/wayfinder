@@ -24,6 +24,191 @@ pub struct RcloneTarget {
     /// Full remote spec — what you would pass to `rclone copy`, e.g.
     /// `Proton:Documents/German`.
     pub full_remote_spec: String,
+    /// The path relative to the mountpoint (`Documents/German`).
+    pub relative: String,
+    /// How to reach the mount's remote control, if Wayfinder can (see
+    /// `rc_access`).
+    pub rc: Option<RcAccess>,
+}
+
+/// A running rclone mount's remote control, as Wayfinder can use it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RcAccess {
+    /// `host:port`, e.g. `localhost:5572`.
+    pub addr: String,
+    /// Login, unless the mount runs with `--rc-no-auth`.
+    pub user: Option<String>,
+    pub pass: Option<String>,
+}
+
+/// Whether a change to `local_path` (creating, deleting, moving it) can go
+/// straight to its rclone remote. Only if the mount has remote control:
+/// rclone caches each folder's listing (5 minutes by default) and, with a
+/// backend that doesn't announce changes (Proton Drive doesn't), never
+/// learns of a change made by another rclone — the folder keeps showing
+/// what it held before. With remote control, the changed folders are
+/// forgotten afterwards (`forget_in_mounts`). Otherwise the change goes
+/// through the mount, which keeps its listings right; a move within one
+/// mount is still done server-side by the mount itself.
+pub fn can_change_directly(local_path: &str) -> bool {
+    rclone_for_path(local_path).is_some_and(|t| t.rc.is_some())
+}
+
+/// Tell the rclone mounts holding the folders `dirs` (local paths) to
+/// forget their cached listings, so the next look at them asks the remote.
+/// For mounts without remote control this does nothing. Blocking: call
+/// off the main thread.
+pub fn forget_in_mounts(dirs: &[String]) {
+    let mut by_mount: Vec<(RcAccess, Vec<String>)> = Vec::new();
+    for dir in dirs {
+        let Some(target) = rclone_for_path(dir) else {
+            continue;
+        };
+        let Some(rc) = target.rc else {
+            continue;
+        };
+        match by_mount.iter_mut().find(|(r, _)| *r == rc) {
+            Some((_, rels)) => rels.push(target.relative),
+            None => by_mount.push((rc, vec![target.relative])),
+        }
+    }
+    for (rc, rels) in by_mount {
+        let addr = &rc.addr;
+        let mut cmd = Command::new("rclone");
+        cmd.arg("rc")
+            .arg("--url")
+            .arg(format!("http://{addr}/"))
+            .arg("vfs/forget");
+        // The login goes in the environment, not on the command line,
+        // where any user could read it with `ps`.
+        if let (Some(user), Some(pass)) = (&rc.user, &rc.pass) {
+            cmd.env("RCLONE_USER", user).env("RCLONE_PASS", pass);
+        }
+        // The mount's root has no name to forget by: no arguments forget
+        // every listing.
+        if !rels.iter().any(|r| r.is_empty()) {
+            let mut seen: Vec<&String> = Vec::new();
+            for rel in &rels {
+                if !seen.contains(&rel) {
+                    let key = if seen.is_empty() {
+                        "dir".to_string()
+                    } else {
+                        format!("dir{}", seen.len() + 1)
+                    };
+                    cmd.arg(format!("{key}={rel}"));
+                    seen.push(rel);
+                }
+            }
+        }
+        let ok = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            log::warn!("telling the rclone mount at {addr} to forget {rels:?} failed");
+        }
+    }
+}
+
+/// `then`, run once the rclone mounts holding the folders `touched` have
+/// forgotten them (see `forget_in_mounts`), so whatever `then` lists again
+/// sees the change.
+fn after_forgetting<A: 'static>(
+    touched: Vec<String>,
+    then: impl FnOnce(A) + 'static,
+) -> impl FnOnce(A) + 'static {
+    move |arg| {
+        crate::background::run(
+            move || forget_in_mounts(&touched),
+            move |()| then(arg),
+            || {},
+        )
+    }
+}
+
+/// The folder holding `path`.
+fn parent_dir(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// How to reach the remote control of the rclone mount with command line
+/// `line` and environment `env` (rclone takes any flag from the
+/// environment too: `--rc-user` as `RCLONE_RC_USER`). `--rc` must be on,
+/// and Wayfinder must be able to log in: `vfs/forget` refuses anyone
+/// without a login unless the mount runs with `--rc-no-auth`. A login can
+/// come from `--rc-user`/`--rc-pass` or the environment (better: only this
+/// user can read another process's environment, while anyone can read its
+/// command line); not from `--rc-htpasswd`, or `--rc-web-gui`'s made-up
+/// one. The default address is `localhost:5572`; a unix socket isn't used.
+fn rc_access(line: &str, env: &std::collections::HashMap<String, String>) -> Option<RcAccess> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    // A flag's value from the command line (`--f v`, `--f=v`, or `true`
+    // for a bare boolean flag), else from the environment.
+    let flag = |name: &str, boolean: bool| -> Option<String> {
+        let long = format!("--{name}");
+        tokens
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| {
+                if let Some(v) = t.strip_prefix(&format!("{long}=")) {
+                    Some(v.to_string())
+                } else if *t == long {
+                    if boolean {
+                        Some("true".to_string())
+                    } else {
+                        tokens.get(i + 1).map(|v| v.to_string())
+                    }
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                env.get(&format!("RCLONE_{}", name.to_uppercase().replace('-', "_")))
+                    .cloned()
+            })
+    };
+    let on = |name: &str| flag(name, true).is_some_and(|v| v == "true" || v == "1");
+
+    if !on("rc") || on("rc-web-gui") || flag("rc-htpasswd", false).is_some() {
+        return None;
+    }
+    let (user, pass) = if on("rc-no-auth") {
+        (None, None)
+    } else {
+        match (flag("rc-user", false), flag("rc-pass", false)) {
+            (Some(u), Some(p)) => (Some(u), Some(p)),
+            _ => return None,
+        }
+    };
+    let addr = flag("rc-addr", false).unwrap_or_else(|| "localhost:5572".to_string());
+    if addr.contains("://") || addr.starts_with('/') {
+        return None;
+    }
+    let addr = if addr.starts_with(':') {
+        format!("localhost{addr}")
+    } else {
+        addr
+    };
+    Some(RcAccess { addr, user, pass })
+}
+
+/// A process's environment, if this user can read it.
+fn process_env(pid: &str) -> std::collections::HashMap<String, String> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .map(|raw| {
+            raw.split(|b| *b == 0)
+                .filter_map(|kv| {
+                    let kv = String::from_utf8_lossy(kv);
+                    let (k, v) = kv.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Resolve a local path to its rclone remote, if it lives inside an rclone
@@ -49,9 +234,19 @@ pub fn rclone_for_path(local_path: &str) -> Option<RcloneTarget> {
         format!("{remote_root}/{rel}")
     };
 
+    let rc = mount_rc_access().get(mountpoint).cloned();
     Some(RcloneTarget {
         full_remote_spec: full,
+        relative: rel,
+        rc,
     })
+}
+
+/// The running rclone mount `path` is on: (mountpoint, remote's top level
+/// as mounted, e.g. `Proton:`).
+pub fn mount_of(path: &str) -> Option<(String, String)> {
+    let mounts = list_rclone_fuse_mounts();
+    mount_for(path, &mounts, &fuse_mountpoints()).cloned()
 }
 
 /// Of the rclone `mounts` (mountpoint, remote) known, the one `path` is on
@@ -80,13 +275,28 @@ fn mount_for<'a>(
 /// every few seconds while the set of FUSE mounts stays the same: this is
 /// asked once per file for many actions, some on the main thread.
 fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
-    type Scan = (std::time::Instant, Vec<String>, Vec<(String, String)>);
+    scan_rclone_mounts().0
+}
+
+/// The running rclone mounts' remote controls Wayfinder can use, by
+/// mountpoint (see `rc_access`); from the same `ps` scan.
+fn mount_rc_access() -> std::collections::HashMap<String, RcAccess> {
+    scan_rclone_mounts().1
+}
+
+type MountScan = (
+    Vec<(String, String)>,
+    std::collections::HashMap<String, RcAccess>,
+);
+
+fn scan_rclone_mounts() -> MountScan {
+    type Scan = (std::time::Instant, Vec<String>, MountScan);
     static LAST: std::sync::Mutex<Option<Scan>> = std::sync::Mutex::new(None);
     const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
     let fuse_mounts = fuse_mountpoints();
     if fuse_mounts.is_empty() {
-        return Vec::new();
+        return Default::default();
     }
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, mounts, found)) = last.as_ref() {
@@ -100,19 +310,26 @@ fn list_rclone_fuse_mounts() -> Vec<(String, String)> {
     // its own.)
     // (Not known: none, rather than root's.)
     let Some(uid) = current_uid() else {
-        return Vec::new();
+        return Default::default();
     };
-    let found = match Command::new("ps")
-        .args(["-o", "args=", "-u"])
+    let mut found: MountScan = Default::default();
+    if let Ok(o) = Command::new("ps")
+        .args(["-o", "pid=,args=", "-u"])
         .arg(uid.to_string())
         .output()
     {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter_map(|line| parse_rclone_mount(line, &fuse_mounts, configured_remotes()))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let Some((pid, args)) = line.trim_start().split_once(char::is_whitespace) else {
+                continue;
+            };
+            if let Some(mount) = parse_rclone_mount(args, &fuse_mounts, configured_remotes()) {
+                if let Some(rc) = rc_access(args, &process_env(pid)) {
+                    found.1.insert(mount.0.clone(), rc);
+                }
+                found.0.push(mount);
+            }
+        }
+    }
     *last = Some((std::time::Instant::now(), fuse_mounts, found.clone()));
     found
 }
@@ -303,9 +520,19 @@ fn parse_rclone_mount(
         return None;
     }
     let args = &tokens[mount_idx + 1..];
+    // (`rclone mount Proton: ~/protonDrive/` is fine by rclone, but
+    // /proc/mounts lists it without the slash.)
+    let same_place = |t: &str, m: &str| {
+        let t = if t.len() > 1 {
+            t.trim_end_matches('/')
+        } else {
+            t
+        };
+        t == m
+    };
     let mount_pos = args
         .iter()
-        .position(|t| fuse_mounts.iter().any(|m| m == t))?;
+        .position(|t| fuse_mounts.iter().any(|m| same_place(t, m)))?;
     // Candidates: `name:` or `name:path` (or `:backend:…`), not `:5572`.
     let before = &args[..mount_pos];
     let candidates: Vec<usize> = (0..before.len())
@@ -340,7 +567,11 @@ fn parse_rclone_mount(
     if stray {
         return None;
     }
-    Some((args[mount_pos].to_string(), before[remote_idx].to_string()))
+    let mountpoint = fuse_mounts
+        .iter()
+        .find(|m| same_place(args[mount_pos], m))?
+        .to_string();
+    Some((mountpoint, before[remote_idx].to_string()))
 }
 
 /// Whether rclone can be run. Checked once per process: it's asked before
@@ -909,6 +1140,15 @@ pub fn delete_with_progress(
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce(bool) + 'static>>,
 ) {
+    let touched: Vec<String> = paths.iter().map(|(p, _)| parent_dir(p)).collect();
+    // The mounts must forget the changed folders before anything lists
+    // them again (see `can_change_directly`).
+    let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
+        Some(Box::new(after_forgetting(touched, move |ok| {
+            if let Some(cb) = on_complete {
+                cb(ok);
+            }
+        })));
     // Resolve every path up front. If any can't be resolved, refuse.
     let mut resolved: Vec<(String, RcloneTarget, bool)> = Vec::with_capacity(paths.len());
     let mut on_complete = on_complete;
@@ -998,6 +1238,17 @@ pub fn copy_paths_with_progress(
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce() + 'static>>,
 ) {
+    let touched = vec![dest_dir.clone()];
+    // The mounts must forget the changed folders before anything lists
+    // them again (see `can_change_directly`).
+    let on_complete: Option<Box<dyn FnOnce() + 'static>> = {
+        let then = after_forgetting(touched, move |()| {
+            if let Some(cb) = on_complete {
+                cb();
+            }
+        });
+        Some(Box::new(move || then(())))
+    };
     let total = sources.len();
     if total == 0 {
         if let Some(cb) = on_complete {
@@ -1054,6 +1305,19 @@ pub fn move_paths_with_progress(
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce() + 'static>>,
 ) {
+    let touched: Vec<String> = std::iter::once(dest_dir.clone())
+        .chain(sources.iter().map(|p| parent_dir(p)))
+        .collect();
+    // The mounts must forget the changed folders before anything lists
+    // them again (see `can_change_directly`).
+    let on_complete: Option<Box<dyn FnOnce() + 'static>> = {
+        let then = after_forgetting(touched, move |()| {
+            if let Some(cb) = on_complete {
+                cb();
+            }
+        });
+        Some(Box::new(move || then(())))
+    };
     let total = sources.len();
     if total == 0 {
         if let Some(cb) = on_complete {
@@ -1111,6 +1375,15 @@ pub fn rename_with_progress(
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce(bool) + 'static>>,
 ) {
+    let touched = vec![parent_dir(&old_path), parent_dir(&new_path)];
+    // The mounts must forget the changed folders before anything lists
+    // them again (see `can_change_directly`).
+    let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
+        Some(Box::new(after_forgetting(touched, move |ok| {
+            if let Some(cb) = on_complete {
+                cb(ok);
+            }
+        })));
     let src_spec = spec_for_path(&old_path);
     let dst_spec = spec_for_path(&new_path);
 
@@ -1151,6 +1424,18 @@ pub fn batch_rename_with_progress(
     parent_window: &gtk::Window,
     on_complete: Option<Box<dyn FnOnce(bool) + 'static>>,
 ) {
+    let touched: Vec<String> = pairs
+        .iter()
+        .flat_map(|(old, new)| [parent_dir(old), parent_dir(new)])
+        .collect();
+    // The mounts must forget the changed folders before anything lists
+    // them again (see `can_change_directly`).
+    let on_complete: Option<Box<dyn FnOnce(bool) + 'static>> =
+        Some(Box::new(after_forgetting(touched, move |ok| {
+            if let Some(cb) = on_complete {
+                cb(ok);
+            }
+        })));
     let total = pairs.len();
     if total == 0 {
         if let Some(cb) = on_complete {
@@ -1330,6 +1615,17 @@ mod mount_parse_tests {
         );
     }
 
+    /// A mountpoint given with a trailing slash is the one /proc/mounts
+    /// lists without it.
+    #[test]
+    fn trailing_slash_on_the_mountpoint() {
+        let line = "rclone --vfs-cache-mode writes mount Proton: /home/u/proton/";
+        assert_eq!(
+            parse_rclone_mount(line, &mounts(), &[]),
+            Some(("/home/u/proton".into(), "Proton:".into()))
+        );
+    }
+
     /// Boolean flags used to swallow the remote, so the mount went unseen.
     #[test]
     fn flags_with_and_without_values() {
@@ -1493,5 +1789,77 @@ mod fit_tests {
         let status = "Name:\tx\nUid:\t1000\t1001\t1000\t1000\nGid:\t1\n";
         assert_eq!(super::effective_uid(status), Some(1001));
         assert_eq!(super::effective_uid("Name:\tx\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod rc_tests {
+    use super::{rc_access, RcAccess};
+    use std::collections::HashMap;
+
+    fn no_env() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    fn open(addr: &str) -> Option<RcAccess> {
+        Some(RcAccess {
+            addr: addr.into(),
+            user: None,
+            pass: None,
+        })
+    }
+
+    #[test]
+    fn no_auth_gives_the_default_address() {
+        let line = "rclone mount --rc --rc-no-auth Proton: /home/u/proton";
+        assert_eq!(rc_access(line, &no_env()), open("localhost:5572"));
+        let line = "rclone mount --rc=true --rc-no-auth Proton: /home/u/proton";
+        assert_eq!(rc_access(line, &no_env()), open("localhost:5572"));
+    }
+
+    #[test]
+    fn address_forms() {
+        let line = "rclone mount --rc --rc-no-auth --rc-addr 127.0.0.1:5590 Proton: /home/u/proton";
+        assert_eq!(rc_access(line, &no_env()), open("127.0.0.1:5590"));
+        let line = "rclone mount --rc --rc-no-auth --rc-addr=:5591 Proton: /home/u/proton";
+        assert_eq!(rc_access(line, &no_env()), open("localhost:5591"));
+    }
+
+    /// A login, from the command line or (unseen by `ps`) the environment.
+    #[test]
+    fn login_from_args_or_environment() {
+        let line = "rclone mount --rc --rc-user me --rc-pass secret Proton: /home/u/proton";
+        let want = Some(RcAccess {
+            addr: "localhost:5572".into(),
+            user: Some("me".into()),
+            pass: Some("secret".into()),
+        });
+        assert_eq!(rc_access(line, &no_env()), want);
+        let env: HashMap<String, String> = [
+            ("RCLONE_RC", "true"),
+            ("RCLONE_RC_USER", "me"),
+            ("RCLONE_RC_PASS", "secret"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(rc_access("rclone mount Proton: /home/u/proton", &env), want);
+    }
+
+    /// Off, with no way to log in, or on a socket.
+    #[test]
+    fn unusable_remote_control() {
+        for line in [
+            "rclone mount Proton: /home/u/proton",
+            "rclone mount --rc-addr localhost:5572 --rc-no-auth Proton: /home/u/proton",
+            // vfs/forget refuses without a login.
+            "rclone mount --rc Proton: /home/u/proton",
+            "rclone mount --rc --rc-user me Proton: /home/u/proton",
+            "rclone mount --rc --rc-htpasswd=/etc/htpasswd Proton: /home/u/proton",
+            "rclone mount --rc --rc-web-gui Proton: /home/u/proton",
+            "rclone mount --rc --rc-no-auth --rc-addr unix:///run/rclone.sock Proton: /home/u/proton",
+        ] {
+            assert_eq!(rc_access(line, &no_env()), None, "{line}");
+        }
     }
 }

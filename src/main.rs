@@ -1,4 +1,5 @@
 mod app;
+mod cloud_sync;
 mod context_menu;
 mod dbus;
 mod menubar;

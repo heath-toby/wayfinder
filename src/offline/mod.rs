@@ -69,6 +69,50 @@ pub fn path_is_in_known_mountpoint(path: &str) -> bool {
         .any(|mp| path == mp || path.starts_with(&format!("{mp}/")))
 }
 
+/// Where to go when asked to open `path`: a folder in the offline copies
+/// is opened as the drive folder it's a copy of, if that's on a drive
+/// Wayfinder knows (`known`, mountpoints), so the location shown and saved
+/// is always the real one — opening it shows the offline copy anyway while
+/// the drive can't be reached, and the real folder once it's back. Anything
+/// else (the store of copies itself, say) is opened as itself.
+pub fn real_location_in(path: &str, cache_root: &Path, known: &[String]) -> String {
+    let Ok(rel) = Path::new(path).strip_prefix(cache_root) else {
+        return path.to_string();
+    };
+    let original = format!("/{}", rel.to_string_lossy());
+    let on_known_drive = known
+        .iter()
+        .any(|mp| original == *mp || original.starts_with(&format!("{mp}/")));
+    if on_known_drive {
+        original
+    } else {
+        path.to_string()
+    }
+}
+
+/// `real_location_in` with this user's cache and known drives.
+pub fn real_location(path: &str) -> String {
+    let root = cache_root();
+    let known = known_mountpoints();
+    let first = real_location_in(path, &root, &known);
+    if first != path {
+        return first;
+    }
+    // (The cache reached through a link.)
+    match std::fs::canonicalize(&root) {
+        Ok(real) if real != root => real_location_in(path, &real, &known),
+        _ => first,
+    }
+}
+
+/// Whether Wayfinder keeps a record of what it fetched for the pin at
+/// `original` (pins made before the record existed have none). Without
+/// one, a refresh can't tell an offline edit from a copy that's behind,
+/// and keeps the newer by date.
+pub fn is_recorded(original: &str) -> bool {
+    load_record().is_ok_and(|r| r.pins.contains(&cache_path_for(original)))
+}
+
 /// A single pinned entry in the manifest.
 #[derive(Clone, Debug)]
 pub struct PinnedEntry {
@@ -370,6 +414,24 @@ impl Drop for Pinning {
     }
 }
 
+/// The offline copy to open instead of the file at `original` on its
+/// mount (which would stream it), for a file the caller knows is synced
+/// (`cloud::covering_item`): only once it's all there — not being
+/// downloaded or removed, and a file. Checks the local cache only: safe on
+/// the main thread.
+pub fn copy_to_open(original: &str) -> Option<PathBuf> {
+    let busy = PINNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| paths_overlap(Path::new(p), Path::new(original)));
+    if busy || is_unpinning(original) {
+        return None;
+    }
+    let copy = cache_path_for(original);
+    copy.is_file().then_some(copy)
+}
+
 /// Pins being refreshed right now.
 static REFRESHING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -655,7 +717,13 @@ pub fn sync_all() -> (usize, usize) {
     }
     let mut updated = 0;
     let mut errors = 0;
+    // Pins on a drive Wayfinder Sync looks after are synced both ways by
+    // it; a one-way refresh here would race it.
+    let drives = crate::cloud::load_drives();
     for entry in manifest.values() {
+        if crate::cloud::drive_for(&entry.original_path, &drives).is_some() {
+            continue;
+        }
         match refresh_pin(entry) {
             Ok(true) => updated += 1,
             Ok(false) => {}
@@ -1202,6 +1270,52 @@ fn remote_child(remote: &str, name: &str) -> String {
         format!("{remote}{name}")
     } else {
         format!("{remote}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod real_location_tests {
+    use super::real_location_in;
+    use std::path::Path;
+
+    const CACHE: &str = "/home/u/.cache/wayfinder/offline";
+
+    fn known() -> Vec<String> {
+        vec!["/home/u/protonDrive".to_string()]
+    }
+
+    #[test]
+    fn a_copy_opens_as_its_drive_folder() {
+        assert_eq!(
+            real_location_in(
+                "/home/u/.cache/wayfinder/offline/home/u/protonDrive/Documents 2/Russian",
+                Path::new(CACHE),
+                &known()
+            ),
+            "/home/u/protonDrive/Documents 2/Russian"
+        );
+        assert_eq!(
+            real_location_in(
+                "/home/u/.cache/wayfinder/offline/home/u/protonDrive",
+                Path::new(CACHE),
+                &known()
+            ),
+            "/home/u/protonDrive"
+        );
+    }
+
+    /// The store itself, a copy of no known drive, and anything outside it
+    /// stay as they are.
+    #[test]
+    fn other_paths_stay() {
+        for p in [
+            CACHE,
+            "/home/u/.cache/wayfinder/offline/home/u",
+            "/home/u/.cache/wayfinder/offline/home/u/protonDrive_old/x",
+            "/home/u/Documents",
+        ] {
+            assert_eq!(real_location_in(p, Path::new(CACHE), &known()), p);
+        }
     }
 }
 

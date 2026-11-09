@@ -71,7 +71,10 @@ impl WayfinderWindow {
         // and the folder's live updates would go by the literal path.
         let cleaned;
         let path = if path.starts_with('/') && !path.contains("://") {
-            cleaned = wayfinder::path_complete::clean(path);
+            // A folder opened from an offline copy goes by the drive folder
+            // it's a copy of: that's what's shown and saved, so next time
+            // the real folder is tried first (see `offline::real_location`).
+            cleaned = wayfinder::offline::real_location(&wayfinder::path_complete::clean(path));
             cleaned.as_str()
         } else {
             path
@@ -101,14 +104,61 @@ impl WayfinderWindow {
             // The Bin or Recent Files, in the history.
             self.open_special_uri(path);
         } else {
-            self.open_directory(path, false);
+            // (An offline copy in the history from before: as its folder.)
+            self.open_directory(&wayfinder::offline::real_location(path), false);
         }
+    }
+
+    /// While an offline copy is shown, see quietly whether the drive folder
+    /// it stands in for answers again — the mount back, the network back —
+    /// and open it if it does. Called when mounts change, when the window
+    /// is focused, and every half minute while the copy is shown.
+    pub(crate) fn check_back_online(&self) {
+        let imp = self.imp();
+        if !imp.offline_view.get() || imp.online_probe.get() {
+            return;
+        }
+        let Some(original) = imp.offline_original.borrow().clone() else {
+            return;
+        };
+        // (Not mounted at all: nothing to ask yet, and asking the bare
+        // mountpoint would say yes.)
+        if !is_fuse_mount(&original) {
+            return;
+        }
+        imp.online_probe.set(true);
+        let probe = original.clone();
+        let w = self.clone();
+        // Off the main thread: a mount still waiting on the network can
+        // take as long as it likes to answer.
+        wayfinder::background::run(
+            move || std::fs::read_dir(&probe).is_ok(),
+            move |answers| {
+                let imp = w.imp();
+                imp.online_probe.set(false);
+                let still_shown = imp.offline_view.get()
+                    && imp.offline_original.borrow().as_deref() == Some(original.as_str());
+                if answers && still_shown {
+                    let name = PathBuf::from(&original)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| original.clone());
+                    w.announce(
+                        &format!("Back online: opening {name} from the drive."),
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    w.load_directory(&original);
+                }
+            },
+            || {},
+        );
     }
 
     /// Remember the selection in the location being left, and clear search.
     fn leave_location(&self, new_location: &str) {
         let imp = self.imp();
         imp.offline_view.set(false);
+        imp.offline_original.replace(None);
         let old_path = imp.model.current_path();
         if !old_path.is_empty() && old_path != new_location {
             if let Some(item) = imp.selection.selected_item() {
@@ -205,6 +255,12 @@ impl WayfinderWindow {
         // trigger cache fallback for ordinary directories.
         let live_count = live_result.as_ref().copied().unwrap_or(0);
 
+        // A folder Wayfinder Sync keeps in step: have it check for changes
+        // now (quietly, unless there are some).
+        if crate::cloud_sync::on_sync_drive(path) {
+            crate::cloud_sync::check_now(path);
+        }
+
         // Decide whether to substitute the offline cache. We want the cache
         // to kick in ONLY for paths that are at-or-inside a known rclone
         // FUSE mountpoint (the user has seen mounted at some point).
@@ -229,6 +285,23 @@ impl WayfinderWindow {
             let w = self.clone();
             let path = path.to_string();
             imp.offline_view.set(true);
+            imp.offline_original.replace(Some(path.clone()));
+            // Back to the drive folder as soon as it answers again.
+            let watcher = self.downgrade();
+            let watched = path.clone();
+            glib::timeout_add_seconds_local(30, move || {
+                let Some(w) = watcher.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let imp = w.imp();
+                if !imp.offline_view.get()
+                    || imp.offline_original.borrow().as_deref() != Some(watched.as_str())
+                {
+                    return glib::ControlFlow::Break;
+                }
+                w.check_back_online();
+                glib::ControlFlow::Continue
+            });
             imp.model.load_directory(&cache_str, false, move |result| {
                 if let Err(e) = result {
                     w.update_status();
@@ -876,6 +949,9 @@ impl WayfinderWindow {
 
     fn open_file_now(&self, file: &FileObject) {
         let path = file.path();
+        // Kept offline on a synced drive: the offline copy, not a stream
+        // through the mount (see `cloud_sync::file_to_open`).
+        let opened = crate::cloud_sync::file_to_open(&path);
 
         // Check for per-file app association (always takes priority)
         if let Some(desktop_id) = wayfinder::state::load_file_app(&path) {
@@ -884,7 +960,7 @@ impl WayfinderWindow {
                 .iter()
                 .find(|a| a.id().map(|id| id.to_string()) == Some(desktop_id.clone()))
             {
-                let gio_file = gio::File::for_path(&path);
+                let gio_file = gio::File::for_path(&opened);
                 let ctx = WidgetExt::display(self).app_launch_context();
                 if let Err(e) = app.launch(&[gio_file], Some(&ctx)) {
                     log::error!("Failed to open with preferred app: {e}");
@@ -908,7 +984,7 @@ impl WayfinderWindow {
             || self.imp().model.is_fuse()
         {
             let ctx = WidgetExt::display(self).app_launch_context();
-            let gio_file = gio::File::for_path(&path);
+            let gio_file = gio::File::for_path(&opened);
             let app = gio::AppInfo::default_for_type(&file.mime_type(), false);
             let launched = match app {
                 Some(app) => app
@@ -1455,9 +1531,21 @@ impl WayfinderWindow {
             .iter()
             .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some());
         let dest_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
+        // A change to an rclone mount goes direct only if the mount can be
+        // told about it (see `can_change_directly`): the destination always
+        // changes, and a move changes the mounts it leaves. Otherwise it
+        // goes through the mount, which keeps its listings right.
+        let changes_known = (!dest_rclone
+            || wayfinder::rclone_ops::can_change_directly(&dest_dir_str))
+            && (state.operation != ClipboardOperation::Cut
+                || source_paths.iter().all(|p| {
+                    wayfinder::rclone_ops::rclone_for_path(p).is_none()
+                        || wayfinder::rclone_ops::can_change_directly(p)
+                }));
         // (Not a folder with another drive mounted inside: rclone would
         // copy what's hidden under it from the remote.)
         let use_rclone = (any_src_rclone || dest_rclone)
+            && changes_known
             && wayfinder::rclone_ops::rclone_available()
             && !source_paths.is_empty()
             && !source_paths
@@ -1809,10 +1897,12 @@ impl WayfinderWindow {
                         if choice == 1 {
                             // Prefer rclone-direct delete when every path is on
                             // a recognised rclone mount.
+                            // (And only if the mounts can be told: see
+                            // `can_change_directly`.)
                             let all_rclone = !file_paths.is_empty()
-                                && file_paths.iter().all(|(_, p)| {
-                                    wayfinder::rclone_ops::rclone_for_path(p).is_some()
-                                })
+                                && file_paths
+                                    .iter()
+                                    .all(|(_, p)| wayfinder::rclone_ops::can_change_directly(p))
                                 && wayfinder::rclone_ops::rclone_available();
                             if all_rclone {
                                 let rclone_items: Vec<(String, bool)> = file_paths
@@ -1966,6 +2056,11 @@ impl WayfinderWindow {
     /// changed and return true: the change would land on the copy, not the
     /// drive the location bar names.
     pub(crate) fn refuse_in_offline_view(&self) -> bool {
+        // On a drive Wayfinder Sync looks after, the offline copy is kept in
+        // step both ways: changes made to it are sent to the drive.
+        if crate::cloud_sync::on_sync_drive(&self.imp().model.current_path()) {
+            return false;
+        }
         // Also inside it (a subfolder opened from the offline copy is
         // listed by its cache path): changes there would be undone by the
         // next offline refresh. A two-way sync folder's local side lives
@@ -2168,10 +2263,12 @@ impl WayfinderWindow {
                         // If every path lives on an rclone FUSE mount, dispatch
                         // direct to rclone — much faster, real progress, proper
                         // rate-limit handling.
+                        // (And only if the mounts can be told: see
+                        // `can_change_directly`.)
                         let all_rclone = !file_paths.is_empty()
                             && file_paths
                                 .iter()
-                                .all(|(_, p)| wayfinder::rclone_ops::rclone_for_path(p).is_some())
+                                .all(|(_, p)| wayfinder::rclone_ops::can_change_directly(p))
                             && wayfinder::rclone_ops::rclone_available();
                         if all_rclone {
                             let rclone_items: Vec<(String, bool)> = file_paths
@@ -2284,8 +2381,10 @@ impl WayfinderWindow {
                 return;
             }
 
-            // rclone-direct rename: server-side moveto, no FUSE round-trip.
-            if wayfinder::rclone_ops::rclone_for_path(&file_path).is_some()
+            // rclone-direct rename: server-side moveto, no FUSE round-trip
+            // — if the mount can be told (see `can_change_directly`).
+            // Otherwise renaming through the mount is server-side too.
+            if wayfinder::rclone_ops::can_change_directly(&file_path)
                 && wayfinder::rclone_ops::rclone_available()
             {
                 let parent: gtk::Window = w.clone().upcast();
@@ -2636,9 +2735,10 @@ impl WayfinderWindow {
             // If every old path lives on a recognised rclone mount, batch
             // through rclone-direct. Mixed-batch falls back to per-file GIO
             // (existing behaviour).
+            // (And only if the mount can be told: see `can_change_directly`.)
             let all_rclone = pairs
                 .iter()
-                .all(|(old, _)| wayfinder::rclone_ops::rclone_for_path(old).is_some())
+                .all(|(old, _)| wayfinder::rclone_ops::can_change_directly(old))
                 && wayfinder::rclone_ops::rclone_available();
 
             if all_rclone {
@@ -2785,10 +2885,14 @@ impl WayfinderWindow {
         let guard = PastingGuard::new(self.clone());
 
         let dest_dir_str = imp.model.current_path();
+        // (A drop copies, so only the destination changes: direct only if
+        // its mount can be told — see `can_change_directly`.)
+        let dest_rclone = wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some();
         let use_rclone = (paths
             .iter()
             .any(|p| wayfinder::rclone_ops::rclone_for_path(p).is_some())
-            || wayfinder::rclone_ops::rclone_for_path(&dest_dir_str).is_some())
+            || dest_rclone)
+            && (!dest_rclone || wayfinder::rclone_ops::can_change_directly(&dest_dir_str))
             && wayfinder::rclone_ops::rclone_available()
             && !paths
                 .iter()
