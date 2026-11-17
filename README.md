@@ -105,7 +105,7 @@ In Tab order:
 6. **More options** (Alt+M) -- shows or hides the places sidebar, Back/Forward/Up and the file list. Remembered between uses.
 7. **Cancel**, then the app's **Save** or **Open**.
 
-In the file list: Enter opens a folder; **Space chooses a file, and Space again lets it go** (the name goes back to yours). Type letters to jump to a name. Where the app allows several files, Space chooses each and Ctrl+A chooses every file shown. Alt+Left, Alt+Right and Alt+Up go back, forward and up from anywhere. When opening, you can also type names into File name (`"a.txt" "b.txt"` for several); a folder typed is gone into. Saving over an existing file always asks first. Escape cancels.
+In the file list: Enter opens a folder; **Space chooses a file, and Space again lets it go** (the name goes back to yours). Type letters to jump to a name. Where the app allows several files, Space chooses each and Ctrl+A chooses every file shown. Ctrl+1 shows the files as a grid and Ctrl+2 as a list; the dialog starts in whichever Wayfinder last used, and a change here carries over to Wayfinder. Alt+Left, Alt+Right and Alt+Up go back, forward and up from anywhere. When opening, you can also type names into File name (`"a.txt" "b.txt"` for several); a folder typed is gone into. Saving over an existing file always asks first. Escape cancels.
 
 ## Usage
 

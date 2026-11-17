@@ -98,7 +98,6 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
     selection.set_autoselect(false); // Don't auto-select — user must deliberately choose
 
     let list_view = WayfinderListView::new();
-    list_view.set_model(&selection);
 
     let grid_view = WayfinderGridView::new();
 
@@ -350,6 +349,84 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
     root.append(&bottom_bar);
     dlg.set_child(Some(&root));
 
+    // -- List or grid: as Wayfinder was last left (the same setting) --
+    let grid_shown = Rc::new(Cell::new(false));
+    // To the files, list or grid, at the file selected if any.
+    let focus_files: Rc<dyn Fn()> = {
+        let (lv, gv, sel, grid) = (
+            list_view.clone(),
+            grid_view.clone(),
+            selection.clone(),
+            grid_shown.clone(),
+        );
+        Rc::new(move || {
+            let pos = sel.selected();
+            match (grid.get(), pos != gtk::INVALID_LIST_POSITION) {
+                // (Plain focus in the grid: scrolling it with FOCUS after a
+                // folder change upsets its focus tracking.)
+                (true, _) => gv.grab_focus(),
+                (false, true) => lv.grab_focus_at_selected(pos),
+                (false, false) => lv.grab_focus(),
+            }
+        })
+    };
+    // Only the view shown has the files: a hidden one holding them too
+    // confuses Orca.
+    let show_view: Rc<dyn Fn(bool)> = {
+        let (lv, gv, sel, stack, grid) = (
+            list_view.clone(),
+            grid_view.clone(),
+            selection.clone(),
+            view_stack.clone(),
+            grid_shown.clone(),
+        );
+        Rc::new(move |as_grid: bool| {
+            grid.set(as_grid);
+            if as_grid {
+                lv.column_view().set_model(gtk::SelectionModel::NONE);
+                gv.set_model(&sel);
+                stack.set_visible_child_name("grid");
+            } else {
+                gv.grid_view().set_model(gtk::SelectionModel::NONE);
+                lv.set_model(&sel);
+                stack.set_visible_child_name("list");
+            }
+        })
+    };
+    show_view(wayfinder::state::load_view_mode().as_deref() == Some("grid"));
+    // Ctrl+1 grid, Ctrl+2 list, as in Wayfinder — from anywhere.
+    {
+        let keys = gtk::ShortcutController::new();
+        keys.set_scope(gtk::ShortcutScope::Local);
+        for (accel, as_grid) in [("<Ctrl>1", true), ("<Ctrl>2", false)] {
+            let (show, focus, grid, d) = (
+                show_view.clone(),
+                focus_files.clone(),
+                grid_shown.clone(),
+                dlg.clone(),
+            );
+            let paned = paned.clone();
+            keys.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string(accel),
+                Some(gtk::CallbackAction::new(move |_, _| {
+                    if grid.get() != as_grid {
+                        show(as_grid);
+                        wayfinder::state::save_view_mode(if as_grid { "grid" } else { "list" });
+                    }
+                    d.announce(
+                        if as_grid { "Grid view" } else { "List view" },
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    if paned.is_visible() {
+                        focus();
+                    }
+                    glib::Propagation::Stop
+                })),
+            ));
+        }
+        dlg.add_controller(keys);
+    }
+
     // More options: open as it was left last time.
     paned.set_visible(memory.expanded);
     more_btn.set_active(memory.expanded);
@@ -495,10 +572,11 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
         })
     };
 
-    // Column navigation for list view (Left/Right to read columns, Tab on).
+    // Keys in the files, list or grid: Tab on and back, Ctrl+A, type-ahead;
+    // in the list, Left/Right read its columns (in the grid they move).
     let col_names: &[&str] = &["Name", "Size", "Date Modified", "Kind"];
     let current_column: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-    {
+    let view_keys = |grid: bool| {
         let col_controller = gtk::EventControllerKey::new();
         col_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         let cc = current_column.clone();
@@ -513,6 +591,7 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
         let ahead: Rc<RefCell<(String, Option<std::time::Instant>)>> =
             Rc::new(RefCell::new((String::new(), None)));
         let cv = list_view.column_view().clone();
+        let gv = grid_view.grid_view().clone();
         col_controller.connect_key_pressed(move |_ctrl, key, _code, mods| {
             use gtk::gdk;
             let back = key == gdk::Key::ISO_Left_Tab
@@ -580,19 +659,22 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
                     .and_then(|i| u32::try_from(i).ok())
                 {
                     Some(i) if Some(i as usize) == current => {}
-                    Some(i) => cv.scroll_to(
-                        i,
-                        None::<&gtk::ColumnViewColumn>,
-                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                        None,
-                    ),
+                    Some(i) => {
+                        let flags = gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT;
+                        if grid {
+                            gv.scroll_to(i, flags, None);
+                        } else {
+                            cv.scroll_to(i, None::<&gtk::ColumnViewColumn>, flags, None);
+                        }
+                    }
                     None => d.announce(
                         &format!("Nothing starting with {}", ahead.0),
                         AccessibleAnnouncementPriority::Medium,
                     ),
                 }
                 glib::Propagation::Stop
-            } else if (key == gdk::Key::Left || key == gdk::Key::Right)
+            } else if !grid
+                && (key == gdk::Key::Left || key == gdk::Key::Right)
                 && !mods.contains(gdk::ModifierType::ALT_MASK)
             {
                 let col = cc.get();
@@ -615,8 +697,10 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
                 glib::Propagation::Proceed
             }
         });
-        list_view.column_view().add_controller(col_controller);
-    }
+        col_controller
+    };
+    list_view.column_view().add_controller(view_keys(false));
+    grid_view.grid_view().add_controller(view_keys(true));
 
     // Announce column value on selection change in list view — and whether
     // it's one chosen.
@@ -624,8 +708,10 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
         let cc = current_column.clone();
         let d = dlg.clone();
         let chosen = chosen.clone();
+        let grid = grid_shown.clone();
         selection.connect_selected_item_notify(move |sel| {
-            let col = cc.get();
+            // (The grid has no columns: its name.)
+            let col = if grid.get() { 0 } else { cc.get() };
             if let Some(file) = sel.selected_item().and_downcast::<FileObject>() {
                 let mark = if chosen.borrow().contains(&file.path()) {
                     ", selected"
@@ -681,7 +767,7 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
     {
         let go = go_to.clone();
         let d = dlg.clone();
-        let lv = list_view.clone();
+        let focus = focus_files.clone();
         sidebar.connect_place_activated(move |path| {
             // The Bin and Recent Files aren't folders to choose from.
             if path.starts_with("trash:") || path.starts_with("recent:") {
@@ -696,7 +782,7 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
             }
             go(&path);
             // To its files, as in the main window.
-            lv.grab_focus();
+            focus();
         });
     }
 
@@ -725,7 +811,7 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
     {
         let model = model.clone();
         let d = dlg.clone();
-        let lv = list_view.clone();
+        let focus = focus_files.clone();
         let go = go_to.clone();
         let paned = paned.clone();
         let stay = stay.clone();
@@ -751,10 +837,10 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
             // touch a slow mount, so not on the main thread.
             let check = path.clone();
             let generation = model.generation();
-            let (model, d, lv, go, paned) = (
+            let (model, d, focus, go, paned) = (
                 model.clone(),
                 d.clone(),
-                lv.clone(),
+                focus.clone(),
                 go.clone(),
                 paned.clone(),
             );
@@ -778,7 +864,7 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
                     go(&path);
                     // To its files, if they're shown.
                     if !stay && paned.is_visible() {
-                        lv.grab_focus();
+                        focus();
                     }
                 },
                 move || {
@@ -874,7 +960,10 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
     space_on(grid_view.grid_view().upcast_ref());
 
     // -- Enter opens folders, doesn't select files --
-    {
+    for view in [
+        list_view.column_view().upcast_ref::<gtk::Widget>(),
+        grid_view.grid_view().upcast_ref(),
+    ] {
         let enter_controller = gtk::EventControllerKey::new();
         enter_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         let sel = selection.clone();
@@ -890,7 +979,7 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
             }
             glib::Propagation::Proceed
         });
-        list_view.column_view().add_controller(enter_controller);
+        view.add_controller(enter_controller);
     }
 
     // -- The file type: filters the list; when saving, the name follows --
@@ -976,7 +1065,7 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
     let le_accept = location_entry.clone();
     let go_accept = go_to.clone();
     let paned_accept = paned.clone();
-    let lv_accept = list_view.clone();
+    let focus_accept = focus_files.clone();
     // Save presses, counted: a Replace check under way acts only if it's
     // the latest press's, the dialog is still open, and it still shows the
     // folder and name it checked (otherwise a corrected name, another
@@ -1211,13 +1300,13 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
         let paths: Vec<String> = names.iter().map(|n| resolve_typed(n, &current_dir)).collect();
         let check = paths.clone();
         let generation = model_accept.generation();
-        let (model, d, entry, go, paned, lv, checking) = (
+        let (model, d, entry, go, paned, focus, checking) = (
             model_accept.clone(),
             d_accept.clone(),
             fn_accept.clone(),
             go_accept.clone(),
             paned_accept.clone(),
-            lv_accept.clone(),
+            focus_accept.clone(),
             checking_accept.clone(),
         );
         let typed = typed_accept.clone();
@@ -1262,7 +1351,7 @@ pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<C
                     typed.borrow_mut().clear();
                     go(&paths[0]);
                     if paned.is_visible() {
-                        lv.grab_focus();
+                        focus();
                     }
                     return;
                 }
