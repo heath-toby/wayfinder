@@ -125,7 +125,7 @@ Sidebar and breadcrumb bar have paired toggle buttons + actions. The button stor
 - Type-ahead in the list (`options::type_ahead`): letters jump to names; a 1 s pause starts afresh; one letter repeated cycles. Space is never part of a search (it chooses).
 - Space chooses a file, Space again unchooses; with `multiple`, several (Ctrl+A all). Open mode also accepts typed names (`"a" "b"` for several; a folder typed is gone to).
 - Pure logic (filters, globs, extension swap, typed names, memory) in `portal/options.rs`, tested. Memory: `~/.config/wayfinder/portal-state` (`expanded=`, `recent=` lines).
-- Installed as: `~/.local/bin/wayfinder-portal`, `~/.local/share/dbus-1/services/org.freedesktop.impl.portal.desktop.wayfinder.service`, `/usr/share/xdg-desktop-portal/portals/wayfinder.portal`, and `FileChooser=wayfinder;gnome;` in `~/.config/xdg-desktop-portal/niri-portals.conf`. LibreOffice never reaches it (all its VCL backends build their own dialog).
+- Installed by `install-portal.sh` (also `--system`, `--uninstall`; builds first, needs root only for the .portal file, writes `<desktop>-portals.conf` from the system one plus `FileChooser=wayfinder;<old default>`). On Toby's machine: `~/.local/bin/wayfinder-portal`, `~/.local/share/dbus-1/services/org.freedesktop.impl.portal.desktop.wayfinder.service`, `/usr/share/xdg-desktop-portal/portals/wayfinder.portal`, and `FileChooser=wayfinder;gnome;gtk;` in `~/.config/xdg-desktop-portal/niri-portals.conf`. LibreOffice never reaches it: it draws its own dialog or GTK3's in-process one (`gtk_file_chooser_dialog_new`), whichever is set.
 
 ### Key Modules
 
