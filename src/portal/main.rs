@@ -2,6 +2,7 @@
 
 mod chooser;
 mod dbus;
+mod options;
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -11,6 +12,17 @@ use zbus::zvariant::OwnedValue;
 
 fn main() {
     env_logger::init();
+
+    // We *are* a portal backend: xdg-desktop-portal starts us and waits for
+    // our name before it answers anyone. If GTK asks that same service for
+    // its Settings during init, each waits on the other until both time out
+    // (25 s) and the file chooser is dropped. GNOME's backend does the same.
+    let gdk_debug = match std::env::var("GDK_DEBUG") {
+        Ok(v) if !v.is_empty() => format!("{v},no-portals"),
+        _ => "no-portals".to_string(),
+    };
+    std::env::set_var("GDK_DEBUG", gdk_debug);
+    std::env::set_var("ADW_DISABLE_PORTAL", "1");
 
     gtk::init().expect("Failed to init GTK");
 
@@ -90,12 +102,18 @@ fn main() {
             }
 
             chooser::show_chooser(
-                &request.title,
-                &accept_label,
-                request.is_save && save_files.is_none(),
-                directory || save_files.is_some(),
-                current_folder.as_deref(),
-                current_name.as_deref(),
+                chooser::ChooserSpec {
+                    title: request.title.clone(),
+                    accept_label,
+                    is_save: request.is_save && save_files.is_none(),
+                    directory_mode: directory || save_files.is_some(),
+                    multiple: options::multiple(&request.options),
+                    current_folder,
+                    current_name,
+                    filters: options::filters(&request.options),
+                    current_filter: options::current_filter(&request.options),
+                    choices: options::choices(&request.options),
+                },
                 result_tx,
             );
 
@@ -140,6 +158,20 @@ fn main() {
                             OwnedValue::try_from(zbus::zvariant::Value::from(result.uris))
                         {
                             results.insert("uris".to_string(), val);
+                        }
+                        if !result.choices.is_empty() {
+                            if let Ok(val) = OwnedValue::try_from(zbus::zvariant::Value::from(
+                                std::mem::take(&mut result.choices),
+                            )) {
+                                results.insert("choices".to_string(), val);
+                            }
+                        }
+                        if let Some(f) = result.current_filter.take() {
+                            if let Ok(val) =
+                                OwnedValue::try_from(zbus::zvariant::Value::from((f.name, f.rules)))
+                            {
+                                results.insert("current_filter".to_string(), val);
+                            }
                         }
                     }
                     let _ = response_tx.send((response, results));

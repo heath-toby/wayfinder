@@ -118,6 +118,15 @@ Sidebar and breadcrumb bar have paired toggle buttons + actions. The button stor
 
 `wayfinder-portal` implements `org.freedesktop.impl.portal.FileChooser` via zbus/tokio. Runs a tokio runtime in a background thread for D-Bus, communicates with the GTK main loop via channels. Shares UI patterns with the main app but is a separate binary with its own `main()`.
 
+- The request handle (first argument of OpenFile/SaveFile/SaveFiles) is an **object path** (`zvariant::ObjectPath`), not a string: with `&str` the signature is `ssssa{sv}` and x-d-p rejects every call ("Signature mismatch"), so apps silently get no dialog.
+- **Must set `GDK_DEBUG=no-portals` before `gtk::init`**: xdg-desktop-portal starts the backend and waits for its bus name; GTK asking x-d-p for Settings during init deadlocks both for 25 s and the FileChooser is dropped.
+- Layout / Tab order (Toby's design): File name (focused at start, name part selected), Save as type / Files of type (the app's `filters`; list filtered, extension follows the type when saving), the app's `choices`, Location (Up/Down go to recent folders at once), More options toggle. Expanded (remembered): places sidebar (Tab leaves it via `tab-behavior=item`, set by name at runtime on GTK ≥ 4.18 since we build for 4.14), Back/Forward/Up, file list (Tab → Cancel). Then Cancel, Save/Open.
+- The name field remembers the user's own name (`typed_name`: any text not put there by choosing files, tracked via `auto_text`); unchoosing goes back to it, not the app's. "Reset file name" (beside the field, only while the name differs from the app's, with the current type's extension) goes back to the app's.
+- Type-ahead in the list (`options::type_ahead`): letters jump to names; a 1 s pause starts afresh; one letter repeated cycles. Space is never part of a search (it chooses).
+- Space chooses a file, Space again unchooses; with `multiple`, several (Ctrl+A all). Open mode also accepts typed names (`"a" "b"` for several; a folder typed is gone to).
+- Pure logic (filters, globs, extension swap, typed names, memory) in `portal/options.rs`, tested. Memory: `~/.config/wayfinder/portal-state` (`expanded=`, `recent=` lines).
+- Installed as: `~/.local/bin/wayfinder-portal`, `~/.local/share/dbus-1/services/org.freedesktop.impl.portal.desktop.wayfinder.service`, `/usr/share/xdg-desktop-portal/portals/wayfinder.portal`, and `FileChooser=wayfinder;gnome;` in `~/.config/xdg-desktop-portal/niri-portals.conf`. LibreOffice never reaches it (all its VCL backends build their own dialog).
+
 ### Key Modules
 
 - `window/` — Main window (~3,300 lines across mod.rs/imp.rs): all navigation, file operations, dialogs, breadcrumb, zoom. `paste_from()` uses a `pasting` flag to prevent concurrent paste operations.

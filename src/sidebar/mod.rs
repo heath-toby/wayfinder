@@ -545,6 +545,12 @@ impl WayfinderSidebar {
         &self.imp().container
     }
 
+    /// The list of places itself (the portal lets Tab leave it, on GTK
+    /// versions that can).
+    pub fn places_list(&self) -> &gtk::ListBox {
+        &self.imp().places_list
+    }
+
     pub fn connect_place_activated<F: Fn(String) + 'static>(&self, callback: F) {
         let callback = std::rc::Rc::new(callback);
         self.imp()

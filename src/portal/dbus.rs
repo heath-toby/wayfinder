@@ -19,7 +19,7 @@ pub struct ChooserRequest {
 impl FileChooserBackend {
     async fn open_file(
         &self,
-        _handle: &str,
+        _handle: zbus::zvariant::ObjectPath<'_>,
         _app_id: &str,
         _parent_window: &str,
         title: &str,
@@ -43,7 +43,7 @@ impl FileChooserBackend {
 
     async fn save_file(
         &self,
-        _handle: &str,
+        _handle: zbus::zvariant::ObjectPath<'_>,
         _app_id: &str,
         _parent_window: &str,
         title: &str,
@@ -67,7 +67,7 @@ impl FileChooserBackend {
 
     async fn save_files(
         &self,
-        _handle: &str,
+        _handle: zbus::zvariant::ObjectPath<'_>,
         _app_id: &str,
         _parent_window: &str,
         title: &str,
@@ -90,8 +90,8 @@ impl FileChooserBackend {
     }
 }
 
-/// (directory, current_folder, current_name). Multiple selection isn't
-/// offered, so `multiple` isn't read.
+/// (directory, current_folder, current_name). Filters, choices and
+/// `multiple` are read in `options`.
 pub fn parse_options(
     options: &HashMap<String, OwnedValue>,
 ) -> (bool, Option<String>, Option<String>) {
