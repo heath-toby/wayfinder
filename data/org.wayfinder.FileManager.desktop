@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Wayfinder
+GenericName=File Manager
+Comment=Browse and manage your files
+Exec=wayfinder %U
+TryExec=wayfinder
+Icon=system-file-manager
+Terminal=false
+StartupNotify=true
+Categories=GTK;System;Core;FileTools;FileManager;
+MimeType=inode/directory;
+Keywords=folder;files;explorer;browse;manager;

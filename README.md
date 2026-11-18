@@ -63,7 +63,21 @@ Or for system-wide installation:
 install -Dm755 target/release/wayfinder /usr/bin/wayfinder
 install -Dm755 target/release/wayfinder-sync /usr/bin/wayfinder-sync
 install -Dm644 data/actions/*.desktop -t /usr/share/wayfinder/actions/
+install -Dm644 data/org.wayfinder.FileManager.desktop -t /usr/share/applications/
+install -Dm644 data/org.freedesktop.FileManager1.service -t /usr/share/dbus-1/services/
 ```
+
+### Default file manager
+
+`data/org.wayfinder.FileManager.desktop` puts Wayfinder in app menus and lets it be chosen to open folders. Installed in `~/.local` instead of `/usr`, give its `Exec` and `TryExec` the full path to `wayfinder`, then:
+
+```bash
+install -Dm644 data/org.wayfinder.FileManager.desktop -t ~/.local/share/applications/
+update-desktop-database ~/.local/share/applications
+xdg-mime default org.wayfinder.FileManager.desktop inode/directory
+```
+
+Apps that "show in folder" (a browser's downloads, an editor's "reveal file") ask for `org.freedesktop.FileManager1`. Wayfinder answers while it's running; `data/org.freedesktop.FileManager1.service` starts it to answer when it isn't (in `~/.local/share/dbus-1/services/` it takes precedence over Nautilus's; change its `Exec` path to match). Started that way it opens no window until asked, and exits on its own if nothing asks.
 
 ## File chooser for other apps
 
