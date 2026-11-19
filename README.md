@@ -209,6 +209,23 @@ gdbus call --session \
   "['file:///home']" ""
 ```
 
+### Encrypted drives
+
+A locked (LUKS) drive shows in the sidebar as, say, "909 GB Encrypted (unmounted)". Choosing it asks for its passphrase, then unlocks and mounts it through GVfs and UDisks, as Nautilus does; a btrfs filesystem is mounted at its top level, so each subvolume is a folder. Unmounting it from Wayfinder locks it again.
+
+UDisks mounts with its own default options. To give one drive its own, add a section for its filesystem's UUID (from `lsblk -f`, the UUID of the filesystem inside the encrypted partition) to `/etc/udisks2/mount_options.conf`:
+
+```ini
+[/dev/disk/by-uuid/5023922d-a24e-4cd1-8bd4-d7155a526d46]
+btrfs_defaults=compress=zstd:3,noatime,discard=async
+```
+
+For `discard` to reach an SSD through the encryption, let the LUKS header allow it once, while the drive is unlocked (it asks for the passphrase):
+
+```bash
+sudo cryptsetup refresh --allow-discards --persistent luks-<partition UUID>
+```
+
 ### Sidebar configuration
 
 Right-click or press Menu on the sidebar to access "Edit Sidebar". Toggle places on or off, and reorder with Ctrl+Up/Down. Configuration is saved in `~/.config/wayfinder/sidebar`.

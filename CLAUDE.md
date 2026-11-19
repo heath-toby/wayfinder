@@ -134,7 +134,7 @@ Sidebar and breadcrumb bar have paired toggle buttons + actions. The button stor
 - `file_model/` — Directory loading (background jobs and FUSE listing cache in `loader.rs`), sorting, filtering, file monitoring, FUSE detection
 - `offline/` — "Keep Available Offline" pins: incremental, atomic (`.wayfinder-part` + rename) refresh at startup; `sleep.rs` holds a logind delay inhibitor and pauses the sync before suspend
 - `file_ops/` — Copy/move (`transfer.rs`: everything pasted in one progress window — clashes settled in turn, renames first, then counted (`Tally`) and copied, with item countdown, bytes, time left and speed), trash, delete, rename, conflict resolution (Replace/Skip/Rename), cross-device directory move fallback. `on_complete` callback is guaranteed to fire on all code paths (success, error, cancel, early return).
-- `sidebar/` — Places, bookmarks (GTK3 format), volumes (GIO VolumeMonitor), editable order/visibility
+- `sidebar/` — Places, bookmarks (GTK3 format), volumes (GIO VolumeMonitor), editable order/visibility. Encrypted (LUKS) volumes: GVfs unlocks on `Volume::mount` and locks on unmount; its passphrase prompt is taken from GtkMountOperation by `sidebar/passphrase.rs` (stops the `ask-password` emission when only a password is needed), and a wrong passphrase re-runs the mount (`mount_volume`). Mount options come from UDisks (`/etc/udisks2/mount_options.conf`), never from Wayfinder
 - `context_menu/` — Accessible popover menus with arrow-key navigation and custom actions
 - `actions/` — Desktop file parser, TryExec detection, Nautilus script compatibility, completion announcements
 - `properties/` — File properties dialog with interactive permission editor (3×3 checkbox grid + octal entry)
