@@ -1,4 +1,5 @@
 mod imp;
+mod passphrase;
 
 use std::path::PathBuf;
 
@@ -262,9 +263,15 @@ fn eject_mount_at(widget: &gtk::Widget, mount_path: &str, label: &str) {
     // Said by the window: the drive's row goes once it's ejected.
     let w: gtk::Widget = window.map(|w| w.upcast()).unwrap_or_else(|| widget.clone());
     let name = label.to_string();
+    // GVfs locks an encrypted drive again once it's unmounted.
+    let locks = is_encrypted(&mount);
     let done = move |result: Result<(), glib::Error>| match result {
         Ok(()) => w.announce(
-            &format!("{name} can be removed"),
+            &if locks {
+                format!("{name} unmounted and locked")
+            } else {
+                format!("{name} can be removed")
+            },
             gtk::AccessibleAnnouncementPriority::Medium,
         ),
         Err(e) => {
@@ -295,6 +302,96 @@ fn eject_mount_at(widget: &gtk::Widget, mount_path: &str, label: &str) {
             gtk::AccessibleAnnouncementPriority::Medium,
         );
     }
+}
+
+/// Whether `mount` is of an unlocked encrypted (LUKS) device: its
+/// device-mapper device was set up by cryptsetup.
+fn is_encrypted(mount: &gio::Mount) -> bool {
+    let Some(device) = mount
+        .volume()
+        .and_then(|v| v.identifier(gio::VOLUME_IDENTIFIER_KIND_UNIX_DEVICE))
+    else {
+        return false;
+    };
+    let Ok(real) = std::fs::canonicalize(device.as_str()) else {
+        return false;
+    };
+    let Some(dm) = real.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    std::fs::read_to_string(format!("/sys/block/{dm}/dm/uuid"))
+        .is_ok_and(|uuid| is_crypt_uuid(&uuid))
+}
+
+/// A device-mapper UUID cryptsetup gave its device ("CRYPT-LUKS2-…").
+fn is_crypt_uuid(uuid: &str) -> bool {
+    uuid.starts_with("CRYPT-")
+}
+
+/// Mount `vol` (named `label`, `vol_id` in MOUNTING), asking for a
+/// passphrase if it's encrypted, then open it with `open` unless the user
+/// has chosen another place since `activation`. After a wrong passphrase
+/// it's asked for again (`wrong`).
+fn mount_volume(
+    list: &gtk::ListBox,
+    vol: gio::Volume,
+    label: String,
+    vol_id: String,
+    activation: u64,
+    open: std::rc::Rc<dyn Fn(String)>,
+    wrong: bool,
+) {
+    let window = list.root().and_downcast::<gtk::Window>();
+    let asked = std::rc::Rc::new(passphrase::Asked::default());
+    let mount_op = passphrase::mount_operation(window.as_ref(), &label, wrong, asked.clone());
+    let list = list.clone();
+    let mounted = vol.clone();
+    vol.mount(
+        gio::MountMountFlags::NONE,
+        Some(&mount_op),
+        gio::Cancellable::NONE,
+        move |result| match result {
+            Ok(()) => {
+                MOUNTING.with(|m| m.borrow_mut().retain(|v| *v != vol_id));
+                // Open it — unless the user has chosen something else
+                // meanwhile.
+                let moved_on = ACTIVATIONS.with(|n| n.get()) != activation;
+                let path = mounted
+                    .get_mount()
+                    .and_then(|m| m.default_location().path());
+                match path {
+                    Some(path) if !moved_on => open(path.to_string_lossy().to_string()),
+                    _ => list.announce(
+                        &format!("{label} mounted"),
+                        gtk::AccessibleAnnouncementPriority::Medium,
+                    ),
+                }
+            }
+            Err(e) if passphrase::is_wrong_passphrase(&e, &asked) => {
+                log::info!("Wrong passphrase for {label}: {e}");
+                list.announce(
+                    &format!("Wrong passphrase for {label}"),
+                    gtk::AccessibleAnnouncementPriority::High,
+                );
+                mount_volume(&list, mounted, label, vol_id, activation, open, true);
+            }
+            Err(e) => {
+                MOUNTING.with(|m| m.borrow_mut().retain(|v| *v != vol_id));
+                if passphrase::is_cancelled(&e) {
+                    list.announce(
+                        &format!("{label} not mounted"),
+                        gtk::AccessibleAnnouncementPriority::Medium,
+                    );
+                } else {
+                    log::error!("Failed to mount volume: {e}");
+                    list.announce(
+                        &format!("Couldn't mount {label}: {e}"),
+                        gtk::AccessibleAnnouncementPriority::High,
+                    );
+                }
+            }
+        },
+    );
 }
 
 /// Focus the row named `name`, or, if it's gone, the nearest selectable
@@ -545,8 +642,14 @@ impl WayfinderSidebar {
         &self.imp().container
     }
 
+    /// The list of places itself (the portal lets Tab leave it, on GTK
+    /// versions that can).
+    pub fn places_list(&self) -> &gtk::ListBox {
+        &self.imp().places_list
+    }
+
     pub fn connect_place_activated<F: Fn(String) + 'static>(&self, callback: F) {
-        let callback = std::rc::Rc::new(callback);
+        let callback: std::rc::Rc<dyn Fn(String)> = std::rc::Rc::new(callback);
         self.imp()
             .places_list
             .connect_row_activated(move |list, row| {
@@ -576,54 +679,12 @@ impl WayfinderSidebar {
                                 }
                                 MOUNTING.with(|m| m.borrow_mut().push(vol_id.clone()));
                                 let activation = ACTIVATIONS.with(|n| n.get());
-                                // GTK's asks for a password, if needed, in a
-                                // dialog over this window.
-                                let window = list.root().and_downcast::<gtk::Window>();
-                                let mount_op = gtk::MountOperation::new(window.as_ref());
-                                let mounted = vol.clone();
-                                let callback = callback.clone();
-                                let list = list.clone();
                                 list.announce(
                                     &format!("Mounting {label}"),
                                     gtk::AccessibleAnnouncementPriority::Medium,
                                 );
-                                // Once mounted, open it — as activating a
-                                // mounted one does; if it fails, say why.
-                                vol.mount(
-                                    gio::MountMountFlags::NONE,
-                                    Some(&mount_op),
-                                    gio::Cancellable::NONE,
-                                    move |result| {
-                                        MOUNTING.with(|m| m.borrow_mut().retain(|v| *v != vol_id));
-                                        match result {
-                                            Ok(()) => {
-                                                // Open it — unless the user has
-                                                // chosen something else meanwhile.
-                                                let moved_on =
-                                                    ACTIVATIONS.with(|n| n.get()) != activation;
-                                                let path = mounted
-                                                    .get_mount()
-                                                    .and_then(|m| m.default_location().path());
-                                                match path {
-                                                    Some(path) if !moved_on => {
-                                                        callback(path.to_string_lossy().to_string())
-                                                    }
-                                                    _ => list.announce(
-                                                        &format!("{label} mounted"),
-                                                        gtk::AccessibleAnnouncementPriority::Medium,
-                                                    ),
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::error!("Failed to mount volume: {e}");
-                                                list.announce(
-                                                    &format!("Couldn't mount {label}: {e}"),
-                                                    gtk::AccessibleAnnouncementPriority::High,
-                                                );
-                                            }
-                                        }
-                                    },
-                                );
+                                let open: std::rc::Rc<dyn Fn(String)> = callback.clone();
+                                mount_volume(list, vol, label, vol_id, activation, open, false);
                                 break;
                             }
                         }
@@ -1733,7 +1794,18 @@ pub fn save_places(edit: &PlacesEdit) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bookmark_path, bookmarks_insert_pos, read_bookmarks_from, volumes_insert_pos};
+    use super::{
+        bookmark_path, bookmarks_insert_pos, is_crypt_uuid, read_bookmarks_from, volumes_insert_pos,
+    };
+
+    #[test]
+    fn crypt_uuids() {
+        assert!(is_crypt_uuid(
+            "CRYPT-LUKS2-b7a69eb580ba49d799c341699a35c7fa-ext\n"
+        ));
+        assert!(!is_crypt_uuid("LVM-abc"));
+        assert!(!is_crypt_uuid(""));
+    }
 
     #[test]
     fn bookmarks_without_a_name_are_saved_without_one() {

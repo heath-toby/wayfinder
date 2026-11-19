@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.8.0
+
+### New
+
+- **Encrypted drives** — choosing a locked (LUKS) drive in the sidebar asks for its passphrase in Wayfinder's own dialog: a labelled Passphrase field (Alt+P), Unlock, and Cancel or Escape. The passphrase is never saved. A wrong one is said and asked for again. Once unlocked, the drive's filesystem is mounted and opened; on btrfs that's the top level, so every subvolume is a folder in it, however many there are. Unmounting it (the eject button, or Eject in its menu) locks it again — "Backups unmounted and locked" — so the next mount asks for the passphrase once more. As in Nautilus, this is GVfs and UDisks's doing; a drive's own mount options (compression, say) go in `/etc/udisks2/mount_options.conf` (see the README).
+- **File chooser for other apps (portal)** — now actually reaches apps (every call was refused before, and start-up could hang for 25 seconds). Laid out for the keyboard: File name first (name part selected), Save as type / Files of type, the app's own choices, Location (Up and Down go through recent folders), then More options for places, Back/Forward/Up and the files. The app's file types filter the list, and when saving the extension follows the type. Several files can be chosen (Space each, Ctrl+A), Space again unchooses, letters jump to names, and Ctrl+1 / Ctrl+2 switch between grid and list as in Wayfinder. `install-portal.sh` installs it and makes it your desktop's file dialog (`--uninstall` puts things back).
+- **Desktop file, and opened on demand** — Wayfinder is listed in app menus and can be the default for folders; an app asking to show a folder (org.freedesktop.FileManager1) starts Wayfinder rather than Nautilus when it isn't running.
+
 ## 2.7.0
 
 ### New

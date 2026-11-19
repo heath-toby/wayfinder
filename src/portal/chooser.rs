@@ -13,32 +13,97 @@ use wayfinder::navigation::NavigationState;
 use wayfinder::sidebar::WayfinderSidebar;
 use wayfinder::views::{WayfinderGridView, WayfinderListView};
 
+use crate::options::{self, Choice, Filter, Memory};
+
 pub struct ChooserResult {
     pub uris: Vec<String>,
     pub cancelled: bool,
+    /// The app's extra choices, as `(id, value)`.
+    pub choices: Vec<(String, String)>,
+    /// The file type chosen, if the app offered some.
+    pub current_filter: Option<Filter>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn show_chooser(
-    title: &str,
-    accept_label: &str,
-    is_save: bool,
-    directory_mode: bool,
-    current_folder: Option<&str>,
-    current_name: Option<&str>,
-    result_tx: tokio::sync::oneshot::Sender<ChooserResult>,
-) {
+/// What the app asked for.
+pub struct ChooserSpec {
+    pub title: String,
+    pub accept_label: String,
+    pub is_save: bool,
+    pub directory_mode: bool,
+    pub multiple: bool,
+    pub current_folder: Option<String>,
+    pub current_name: Option<String>,
+    pub filters: Vec<Filter>,
+    pub current_filter: Option<Filter>,
+    pub choices: Vec<Choice>,
+}
+
+/// A control made for one of the app's choices.
+enum ChoiceControl {
+    Check(String, gtk::CheckButton),
+    List(String, gtk::DropDown, Vec<String>),
+}
+
+/// Tab order, top to bottom: File name, the type (Save as type / Files of
+/// type), the app's own choices, Location (Up/Down: recent folders), More
+/// options; then, with More options expanded, the places sidebar, Back,
+/// Forward, Up and the files; then Cancel and the app's Save/Open.
+pub fn show_chooser(spec: ChooserSpec, result_tx: tokio::sync::oneshot::Sender<ChooserResult>) {
+    let ChooserSpec {
+        title,
+        accept_label,
+        is_save,
+        directory_mode,
+        multiple,
+        current_folder,
+        current_name,
+        filters,
+        current_filter,
+        choices,
+    } = spec;
+    // Several files: only when opening files.
+    let multiple = multiple && !is_save && !directory_mode;
+    let memory = Memory::load();
+
+    // -- File types --
+    let (filters, first_filter) = if directory_mode {
+        (Vec::new(), 0)
+    } else {
+        options::filter_list(filters, current_filter)
+    };
+    let filters = Rc::new(filters);
+    let active_filter: Rc<Cell<Option<usize>>> =
+        Rc::new(Cell::new((!filters.is_empty()).then_some(first_filter)));
+
     let model = Rc::new(DirectoryModel::new());
-    let selection = gtk::SingleSelection::new(Some(model.filter_model.clone()));
+    let type_filter = {
+        let filters = filters.clone();
+        let active = active_filter.clone();
+        gtk::CustomFilter::new(move |item| {
+            let Some(file) = item.downcast_ref::<FileObject>() else {
+                return true;
+            };
+            if file.is_directory() {
+                return true;
+            }
+            match active.get().and_then(|i| filters.get(i)) {
+                Some(f) => options::filter_matches(f, &file.name(), &file.mime_type()),
+                None => true,
+            }
+        })
+    };
+    let shown =
+        gtk::FilterListModel::new(Some(model.filter_model.clone()), Some(type_filter.clone()));
+    let selection = gtk::SingleSelection::new(Some(shown));
     selection.set_autoselect(false); // Don't auto-select — user must deliberately choose
 
     let list_view = WayfinderListView::new();
-    list_view.set_model(&selection);
 
     let grid_view = WayfinderGridView::new();
 
     let nav = Rc::new(RefCell::new(NavigationState::new(
         current_folder
+            .as_deref()
             .map(PathBuf::from)
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| "/".into()),
@@ -48,32 +113,137 @@ pub fn show_chooser(
 
     // Build the dialog window
     let dlg = gtk::Window::builder()
-        .title(title)
+        .title(title.as_str())
         .default_width(800)
-        .default_height(500)
+        .default_height(if memory.expanded { 560 } else { -1 })
         .modal(true)
         .build();
+    dlg.set_titlebar(Some(&gtk::HeaderBar::new()));
 
-    // Header bar
-    let header = gtk::HeaderBar::new();
+    // -- The fields at the top --
+    let top = gtk::Grid::builder()
+        .row_spacing(6)
+        .column_spacing(8)
+        .margin_top(8)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    let mut row = 0;
+    let field = |grid: &gtk::Grid, row: &mut i32, label: &str, widget: &gtk::Widget, name: &str| {
+        let l = gtk::Label::builder()
+            .label(label)
+            .use_underline(true)
+            .xalign(1.0)
+            .build();
+        l.set_mnemonic_widget(Some(widget));
+        widget.update_property(&[gtk::accessible::Property::Label(name)]);
+        widget.set_hexpand(true);
+        grid.attach(&l, 0, *row, 1, 1);
+        grid.attach(widget, 1, *row, 1, 1);
+        *row += 1;
+    };
 
+    let suggested_name: Rc<str> = Rc::from(current_name.as_deref().unwrap_or(""));
+    let name_entry = gtk::Entry::builder().text(&*suggested_name).build();
+    let (name_label, name_name) = if directory_mode {
+        ("Folder _name:", "Folder name")
+    } else {
+        ("File _name:", "File name")
+    };
+    field(
+        &top,
+        &mut row,
+        name_label,
+        name_entry.upcast_ref(),
+        name_name,
+    );
+    // Back to the app's name: shown only once the name differs from it.
+    let reset_btn = gtk::Button::with_mnemonic("_Reset file name");
+    reset_btn.update_property(&[gtk::accessible::Property::Label("Reset file name")]);
+    reset_btn.set_visible(false);
+    top.attach(&reset_btn, 2, row - 1, 1, 1);
+
+    let type_dropdown = (!filters.is_empty()).then(|| {
+        let names: Vec<&str> = filters.iter().map(|f| f.name.as_str()).collect();
+        let dd = gtk::DropDown::from_strings(&names);
+        dd.set_selected(u32::try_from(first_filter).unwrap_or(0));
+        let (label, name) = if is_save {
+            ("Save as _type:", "Save as type")
+        } else {
+            ("Files of _type:", "Files of type")
+        };
+        field(&top, &mut row, label, dd.upcast_ref(), name);
+        dd
+    });
+
+    let choice_controls: Rc<Vec<ChoiceControl>> = Rc::new(
+        choices
+            .iter()
+            .map(|c| {
+                if c.options.is_empty() {
+                    let check = gtk::CheckButton::with_label(&c.label);
+                    check.set_active(c.initial == "true");
+                    top.attach(&check, 1, row, 1, 1);
+                    row += 1;
+                    ChoiceControl::Check(c.id.clone(), check)
+                } else {
+                    let labels: Vec<&str> = c.options.iter().map(|(_, l)| l.as_str()).collect();
+                    let dd = gtk::DropDown::from_strings(&labels);
+                    let ids: Vec<String> = c.options.iter().map(|(id, _)| id.clone()).collect();
+                    if let Some(i) = ids.iter().position(|id| *id == c.initial) {
+                        dd.set_selected(u32::try_from(i).unwrap_or(0));
+                    }
+                    // (The app's label, not a mnemonic: it may hold a _.)
+                    let l = gtk::Label::builder()
+                        .label(format!("{}:", c.label))
+                        .xalign(1.0)
+                        .build();
+                    dd.update_property(&[gtk::accessible::Property::Label(&c.label)]);
+                    dd.set_hexpand(true);
+                    top.attach(&l, 0, row, 1, 1);
+                    top.attach(&dd, 1, row, 1, 1);
+                    row += 1;
+                    ChoiceControl::List(c.id.clone(), dd, ids)
+                }
+            })
+            .collect(),
+    );
+
+    let location_entry = gtk::Entry::builder().placeholder_text("Path").build();
+    field(
+        &top,
+        &mut row,
+        "_Location:",
+        location_entry.upcast_ref(),
+        "Location",
+    );
+    location_entry.update_property(&[gtk::accessible::Property::Description(
+        "Up and Down go through recent folders",
+    )]);
+
+    let more_btn = gtk::ToggleButton::with_mnemonic("_More options");
+    more_btn.set_halign(gtk::Align::Start);
+    more_btn.update_property(&[gtk::accessible::Property::Label("More options")]);
+    top.attach(&more_btn, 1, row, 1, 1);
+
+    // -- More options: places, Back/Forward/Up and the files --
     let back_btn = gtk::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Go back")
+        .tooltip_text("Go back (Alt+Left)")
         .sensitive(false)
         .build();
     back_btn.update_property(&[gtk::accessible::Property::Label("Go back")]);
 
     let forward_btn = gtk::Button::builder()
         .icon_name("go-next-symbolic")
-        .tooltip_text("Go forward")
+        .tooltip_text("Go forward (Alt+Right)")
         .sensitive(false)
         .build();
     forward_btn.update_property(&[gtk::accessible::Property::Label("Go forward")]);
 
     let up_btn = gtk::Button::builder()
         .icon_name("go-up-symbolic")
-        .tooltip_text("Go to parent directory")
+        .tooltip_text("Go to parent directory (Alt+Up)")
         .build();
     up_btn.update_property(&[gtk::accessible::Property::Label("Go to parent directory")]);
 
@@ -81,10 +251,11 @@ pub fn show_chooser(
     nav_box.add_css_class("linked");
     nav_box.append(&back_btn);
     nav_box.append(&forward_btn);
-    header.pack_start(&nav_box);
-    header.pack_start(&up_btn);
+    nav_box.append(&up_btn);
+    nav_box.set_margin_bottom(4);
 
-    // Alt+Left / Alt+Right / Alt+Up, as in the main window.
+    // Alt+Left / Alt+Right / Alt+Up, as in the main window — from anywhere,
+    // More options open or not.
     {
         let nav_keys = gtk::ShortcutController::new();
         // Local: the controller sits on the dialog itself, which has no
@@ -109,75 +280,166 @@ pub fn show_chooser(
         dlg.add_controller(nav_keys);
     }
 
-    // Location combo with recent directories
-    let location_entry = gtk::Entry::builder()
-        .hexpand(true)
-        .placeholder_text("Path")
-        .build();
-    location_entry.update_property(&[gtk::accessible::Property::Label("Location")]);
-    header.set_title_widget(Some(&location_entry));
-
-    dlg.set_titlebar(Some(&header));
-
     // View stack
     let view_stack = gtk::Stack::new();
     view_stack.set_transition_type(gtk::StackTransitionType::None);
     view_stack.add_named(grid_view.widget(), Some("grid"));
     view_stack.add_named(list_view.widget(), Some("list"));
     view_stack.set_visible_child_name("list");
+    view_stack.set_vexpand(true);
 
-    // Sidebar
+    // Sidebar. Tab moves on from its list, on GTK versions that allow it
+    // (4.18+; this is built for 4.14, so it's set by name).
     let sidebar = WayfinderSidebar::new();
-    let sidebar_revealer = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::SlideRight)
-        .reveal_child(true)
-        .child(sidebar.widget())
+    if gtk::check_version(4, 18, 0).is_none() {
+        let leave = glib::Type::from_name("GtkListTabBehavior")
+            .and_then(glib::EnumClass::with_type)
+            .and_then(|class| class.to_value_by_nick("item"));
+        if let Some(leave) = leave {
+            sidebar
+                .places_list()
+                .set_property_from_value("tab-behavior", &leave);
+        }
+    }
+
+    // Status label
+    let status_label = gtk::Label::builder().xalign(0.0).margin_start(8).build();
+
+    let files_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    files_box.append(&nav_box);
+    files_box.append(&view_stack);
+    files_box.append(&status_label);
+
+    let paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(sidebar.widget())
+        .end_child(&files_box)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(180)
+        .vexpand(true)
+        .margin_top(8)
         .build();
 
-    // Bottom bar with filename entry (for Save) and accept/cancel buttons
+    // -- Cancel and Save/Open --
     let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bottom_bar.set_margin_top(8);
     bottom_bar.set_margin_bottom(8);
     bottom_bar.set_margin_start(8);
     bottom_bar.set_margin_end(8);
-
-    let (filename_entry, selected_label) = if is_save {
-        let entry = gtk::Entry::builder()
-            .hexpand(true)
-            .placeholder_text("Filename")
-            .text(current_name.unwrap_or(""))
-            .build();
-        entry.update_property(&[gtk::accessible::Property::Label("File name")]);
-        bottom_bar.append(&entry);
-        (Some(entry), None)
-    } else {
-        // For Open, show a read-only label that shows the selected file
-        let label = gtk::Label::builder()
-            .label("No file selected")
-            .hexpand(true)
-            .xalign(0.0)
-            .build();
-        label.update_property(&[gtk::accessible::Property::Label("Selected file")]);
-        bottom_bar.append(&label);
-        (None, Some(label))
-    };
+    bottom_bar.set_halign(gtk::Align::End);
 
     let cancel_btn = gtk::Button::with_label("Cancel");
     cancel_btn.update_property(&[gtk::accessible::Property::Label("Cancel")]);
 
     // (The app's label may mark a mnemonic, "_Save": used as one, and not
     // read out as "underscore".)
-    let accept_btn = gtk::Button::with_mnemonic(accept_label);
+    let accept_btn = gtk::Button::with_mnemonic(&accept_label);
     accept_btn.add_css_class("suggested-action");
     accept_btn.update_property(&[gtk::accessible::Property::Label(&without_mnemonic(
-        accept_label,
+        &accept_label,
     ))]);
 
     bottom_bar.append(&cancel_btn);
     bottom_bar.append(&accept_btn);
 
-    // Status label
-    let status_label = gtk::Label::builder().xalign(0.0).margin_start(8).build();
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&top);
+    root.append(&paned);
+    root.append(&bottom_bar);
+    dlg.set_child(Some(&root));
+
+    // -- List or grid: as Wayfinder was last left (the same setting) --
+    let grid_shown = Rc::new(Cell::new(false));
+    // To the files, list or grid, at the file selected if any.
+    let focus_files: Rc<dyn Fn()> = {
+        let (lv, gv, sel, grid) = (
+            list_view.clone(),
+            grid_view.clone(),
+            selection.clone(),
+            grid_shown.clone(),
+        );
+        Rc::new(move || {
+            let pos = sel.selected();
+            match (grid.get(), pos != gtk::INVALID_LIST_POSITION) {
+                // (Plain focus in the grid: scrolling it with FOCUS after a
+                // folder change upsets its focus tracking.)
+                (true, _) => gv.grab_focus(),
+                (false, true) => lv.grab_focus_at_selected(pos),
+                (false, false) => lv.grab_focus(),
+            }
+        })
+    };
+    // Only the view shown has the files: a hidden one holding them too
+    // confuses Orca.
+    let show_view: Rc<dyn Fn(bool)> = {
+        let (lv, gv, sel, stack, grid) = (
+            list_view.clone(),
+            grid_view.clone(),
+            selection.clone(),
+            view_stack.clone(),
+            grid_shown.clone(),
+        );
+        Rc::new(move |as_grid: bool| {
+            grid.set(as_grid);
+            if as_grid {
+                lv.column_view().set_model(gtk::SelectionModel::NONE);
+                gv.set_model(&sel);
+                stack.set_visible_child_name("grid");
+            } else {
+                gv.grid_view().set_model(gtk::SelectionModel::NONE);
+                lv.set_model(&sel);
+                stack.set_visible_child_name("list");
+            }
+        })
+    };
+    show_view(wayfinder::state::load_view_mode().as_deref() == Some("grid"));
+    // Ctrl+1 grid, Ctrl+2 list, as in Wayfinder — from anywhere.
+    {
+        let keys = gtk::ShortcutController::new();
+        keys.set_scope(gtk::ShortcutScope::Local);
+        for (accel, as_grid) in [("<Ctrl>1", true), ("<Ctrl>2", false)] {
+            let (show, focus, grid, d) = (
+                show_view.clone(),
+                focus_files.clone(),
+                grid_shown.clone(),
+                dlg.clone(),
+            );
+            let paned = paned.clone();
+            keys.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string(accel),
+                Some(gtk::CallbackAction::new(move |_, _| {
+                    if grid.get() != as_grid {
+                        show(as_grid);
+                        wayfinder::state::save_view_mode(if as_grid { "grid" } else { "list" });
+                    }
+                    d.announce(
+                        if as_grid { "Grid view" } else { "List view" },
+                        AccessibleAnnouncementPriority::Medium,
+                    );
+                    if paned.is_visible() {
+                        focus();
+                    }
+                    glib::Propagation::Stop
+                })),
+            ));
+        }
+        dlg.add_controller(keys);
+    }
+
+    // More options: open as it was left last time.
+    paned.set_visible(memory.expanded);
+    more_btn.set_active(memory.expanded);
+    more_btn.update_state(&[gtk::accessible::State::Expanded(Some(memory.expanded))]);
+    {
+        let paned = paned.clone();
+        more_btn.connect_toggled(move |b| {
+            let open = b.is_active();
+            paned.set_visible(open);
+            b.update_state(&[gtk::accessible::State::Expanded(Some(open))]);
+            Memory::update(|m| m.expanded = open);
+        });
+    }
 
     // A cached folder's background check changed it, or found it can no
     // longer be listed (the list has been emptied): say so, as the main
@@ -185,11 +447,11 @@ pub fn show_chooser(
     // Weak references: the model holds these callbacks, so strong ones
     // would keep the model and dialog alive after the dialog closes.
     {
-        let m = Rc::downgrade(&model);
+        let sel = selection.downgrade();
         let sl = status_label.downgrade();
         model.set_on_background_update(move || {
-            if let (Some(m), Some(sl)) = (m.upgrade(), sl.upgrade()) {
-                sl.set_text(&format!("{} items", m.item_count()));
+            if let (Some(sel), Some(sl)) = (sel.upgrade(), sl.upgrade()) {
+                sl.set_text(&format!("{} items", sel.n_items()));
             }
         });
         let sl = status_label.downgrade();
@@ -210,23 +472,6 @@ pub fn show_chooser(
         });
     }
 
-    // Layout
-    let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content_box.append(&view_stack);
-    content_box.append(&status_label);
-    content_box.append(&bottom_bar);
-
-    let paned = gtk::Paned::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .start_child(&sidebar_revealer)
-        .end_child(&content_box)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
-        .position(180)
-        .build();
-
-    dlg.set_child(Some(&paned));
-
     // Wire ColumnView sorter. Sorting here isn't Wayfinder's own sort:
     // don't save it over that.
     list_view.set_persist_sort(false);
@@ -240,73 +485,211 @@ pub fn show_chooser(
         model.set_sorter(Some(&cv_sorter));
     }
 
-    // Column navigation for list view (Left/Right to read columns, Tab to escape)
+    // Files chosen with Space (several only if the app allows), and what
+    // that put in the name field: a name typed over it is a name typed.
+    let chosen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let auto_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    // The name the user gave (to begin with, the app's): what the field
+    // goes back to when the files chosen are let go.
+    let typed_name: Rc<RefCell<String>> = Rc::new(RefCell::new(if is_save {
+        suggested_name.to_string()
+    } else {
+        String::new()
+    }));
+
+    // The app's name, with the extension of the type now chosen.
+    let reset_target: Rc<dyn Fn() -> String> = {
+        let (filters, active, suggested) = (
+            filters.clone(),
+            active_filter.clone(),
+            suggested_name.clone(),
+        );
+        Rc::new(move || {
+            let now = active.get();
+            if now.is_none() || now == Some(first_filter) {
+                return suggested.to_string();
+            }
+            now.and_then(|i| filters.get(i))
+                .and_then(|to| options::swap_extension(&suggested, filters.get(first_filter), to))
+                .unwrap_or_else(|| suggested.to_string())
+        })
+    };
+    let update_reset: Rc<dyn Fn()> = {
+        let (btn, entry, target) = (reset_btn.clone(), name_entry.clone(), reset_target.clone());
+        Rc::new(move || btn.set_visible(is_save && entry.text() != target()))
+    };
+    {
+        // A name not put there by choosing files is the user's.
+        let (auto_text, typed, update) =
+            (auto_text.clone(), typed_name.clone(), update_reset.clone());
+        name_entry.connect_changed(move |entry| {
+            let text = entry.text();
+            if text != *auto_text.borrow() {
+                *typed.borrow_mut() = text.to_string();
+            }
+            update();
+        });
+    }
+    {
+        let (chosen, auto_text, entry) = (chosen.clone(), auto_text.clone(), name_entry.clone());
+        let (target, d) = (reset_target.clone(), dlg.clone());
+        reset_btn.connect_clicked(move |_| {
+            chosen.borrow_mut().clear();
+            auto_text.borrow_mut().clear();
+            let name = target();
+            entry.set_text(&name);
+            // (The button has gone: back to the name.)
+            entry.grab_focus();
+            entry.select_region(0, options::stem_chars(&name));
+            d.announce(
+                &format!("File name reset to {name}"),
+                AccessibleAnnouncementPriority::Medium,
+            );
+        });
+    }
+
+    // -- Going places --
+    // Show a folder (history already updated)...
+    let show_folder: Rc<dyn Fn(&str)> = {
+        let model = model.clone();
+        let le = location_entry.clone();
+        let sl = status_label.clone();
+        let nav = nav.clone();
+        let bb = back_btn.clone();
+        let fb = forward_btn.clone();
+        let ub = up_btn.clone();
+        let sel = selection.clone();
+        let d = dlg.clone();
+        Rc::new(move |path: &str| load_dir(&model, path, &le, &sl, &nav, &bb, &fb, &ub, &sel, &d))
+    };
+    // ...or go to one.
+    let go_to: Rc<dyn Fn(&str)> = {
+        let nav = nav.clone();
+        let show = show_folder.clone();
+        Rc::new(move |path: &str| {
+            nav.borrow_mut().navigate_to(PathBuf::from(path));
+            show(path);
+        })
+    };
+
+    // Keys in the files, list or grid: Tab on and back, Ctrl+A, type-ahead;
+    // in the list, Left/Right read its columns (in the grid they move).
     let col_names: &[&str] = &["Name", "Size", "Date Modified", "Kind"];
     let current_column: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-    {
+    let view_keys = |grid: bool| {
         let col_controller = gtk::EventControllerKey::new();
         col_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         let cc = current_column.clone();
         let sel = selection.clone();
         let d = dlg.clone();
-        let le = location_entry.clone();
-        let name_entry = filename_entry.clone();
-        let accept = accept_btn.clone();
+        let cancel = cancel_btn.clone();
+        let (bb, fb, ub) = (back_btn.clone(), forward_btn.clone(), up_btn.clone());
+        let places = sidebar.places_list().clone();
+        let (chosen, auto_text, entry) = (chosen.clone(), auto_text.clone(), name_entry.clone());
+        let typed = typed_name.clone();
+        // Type-ahead: the letters so far, and when the last came.
+        let ahead: Rc<RefCell<(String, Option<std::time::Instant>)>> =
+            Rc::new(RefCell::new((String::new(), None)));
+        let cv = list_view.column_view().clone();
+        let gv = grid_view.grid_view().clone();
         col_controller.connect_key_pressed(move |_ctrl, key, _code, mods| {
             use gtk::gdk;
             let back = key == gdk::Key::ISO_Left_Tab
                 || (key == gdk::Key::Tab && mods.contains(gdk::ModifierType::SHIFT_MASK));
             if back {
-                // Back: the location.
-                le.grab_focus();
-                glib::Propagation::Stop
-            } else if key == gdk::Key::Tab {
-                // On: the file name to save as, or the button to open with —
-                // what comes next, rather than round to the top again.
-                match &name_entry {
-                    Some(entry) => entry.grab_focus(),
-                    None => accept.grab_focus(),
+                // Back: Up, Forward, Back (those that can be pressed), then
+                // the places.
+                match [&ub, &fb, &bb].into_iter().find(|b| b.is_sensitive()) {
+                    Some(b) => b.grab_focus(),
+                    None => places.grab_focus(),
                 };
                 glib::Propagation::Stop
-            } else if key == gdk::Key::Left && !mods.contains(gdk::ModifierType::ALT_MASK) {
-                let col = cc.get();
-                if col > 0 {
-                    cc.set(col - 1);
-                    if let Some(item) = sel.selected_item() {
-                        if let Some(file) = item.downcast_ref::<FileObject>() {
-                            let value = match cc.get() {
-                                0 => file.name(),
-                                1 => file.size_display(),
-                                2 => file.modified_display(),
-                                3 => file.file_type_name(),
-                                _ => String::new(),
-                            };
-                            d.announce(
-                                &format!("{}: {}", col_names[cc.get()], value),
-                                AccessibleAnnouncementPriority::Medium,
-                            );
+            } else if key == gdk::Key::Tab {
+                // On: Cancel, then Save/Open — rather than round the files.
+                cancel.grab_focus();
+                glib::Propagation::Stop
+            } else if multiple
+                && key == gdk::Key::a
+                && mods.contains(gdk::ModifierType::CONTROL_MASK)
+            {
+                // Every file shown, chosen.
+                let files: Vec<FileObject> = (0..sel.n_items())
+                    .filter_map(|i| sel.item(i).and_downcast::<FileObject>())
+                    .filter(|f| !f.is_directory())
+                    .collect();
+                *chosen.borrow_mut() = files.iter().map(|f| f.path()).collect();
+                let back_to = typed.borrow().clone();
+                show_chosen(&chosen.borrow(), &entry, &auto_text, &back_to);
+                d.announce(
+                    &format!("Selected {} files", files.len()),
+                    AccessibleAnnouncementPriority::Medium,
+                );
+                glib::Propagation::Stop
+            } else if let Some(c) = key
+                .to_unicode()
+                .filter(|c| !c.is_control() && *c != ' ')
+                .filter(|_| {
+                    !mods.intersects(
+                        gdk::ModifierType::CONTROL_MASK
+                            | gdk::ModifierType::ALT_MASK
+                            | gdk::ModifierType::SUPER_MASK,
+                    )
+                })
+            {
+                // Letters typed: to the name starting with them. A second's
+                // pause starts afresh.
+                let mut ahead = ahead.borrow_mut();
+                let now = std::time::Instant::now();
+                if ahead
+                    .1
+                    .is_none_or(|t| now.duration_since(t) > TYPE_AHEAD_PAUSE)
+                {
+                    ahead.0.clear();
+                }
+                ahead.0.push(c);
+                ahead.1 = Some(now);
+                let names: Vec<String> = (0..sel.n_items())
+                    .filter_map(|i| sel.item(i).and_downcast::<FileObject>())
+                    .map(|f| f.name())
+                    .collect();
+                let current = (sel.selected() != gtk::INVALID_LIST_POSITION)
+                    .then(|| usize::try_from(sel.selected()).ok())
+                    .flatten();
+                match options::type_ahead(&names, current, &ahead.0)
+                    .and_then(|i| u32::try_from(i).ok())
+                {
+                    Some(i) if Some(i as usize) == current => {}
+                    Some(i) => {
+                        let flags = gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT;
+                        if grid {
+                            gv.scroll_to(i, flags, None);
+                        } else {
+                            cv.scroll_to(i, None::<&gtk::ColumnViewColumn>, flags, None);
                         }
                     }
+                    None => d.announce(
+                        &format!("Nothing starting with {}", ahead.0),
+                        AccessibleAnnouncementPriority::Medium,
+                    ),
                 }
                 glib::Propagation::Stop
-            } else if key == gdk::Key::Right && !mods.contains(gdk::ModifierType::ALT_MASK) {
+            } else if !grid
+                && (key == gdk::Key::Left || key == gdk::Key::Right)
+                && !mods.contains(gdk::ModifierType::ALT_MASK)
+            {
                 let col = cc.get();
-                if col + 1 < col_names.len() {
-                    cc.set(col + 1);
-                    if let Some(item) = sel.selected_item() {
-                        if let Some(file) = item.downcast_ref::<FileObject>() {
-                            let value = match cc.get() {
-                                0 => file.name(),
-                                1 => file.size_display(),
-                                2 => file.modified_display(),
-                                3 => file.file_type_name(),
-                                _ => String::new(),
-                            };
-                            d.announce(
-                                &format!("{}: {}", col_names[cc.get()], value),
-                                AccessibleAnnouncementPriority::Medium,
-                            );
-                        }
+                let next = if key == gdk::Key::Left {
+                    col.checked_sub(1)
+                } else {
+                    (col + 1 < col_names.len()).then_some(col + 1)
+                };
+                if let Some(next) = next {
+                    cc.set(next);
+                    if let Some(file) = sel.selected_item().and_downcast::<FileObject>() {
+                        d.announce(
+                            &format!("{}: {}", col_names[next], column_value(&file, next)),
+                            AccessibleAnnouncementPriority::Medium,
+                        );
                     }
                 }
                 glib::Propagation::Stop
@@ -314,152 +697,77 @@ pub fn show_chooser(
                 glib::Propagation::Proceed
             }
         });
-        list_view.column_view().add_controller(col_controller);
-    }
+        col_controller
+    };
+    list_view.column_view().add_controller(view_keys(false));
+    grid_view.grid_view().add_controller(view_keys(true));
 
-    // Announce column value on selection change in list view
+    // Announce column value on selection change in list view — and whether
+    // it's one chosen.
     {
         let cc = current_column.clone();
         let d = dlg.clone();
+        let chosen = chosen.clone();
+        let grid = grid_shown.clone();
         selection.connect_selected_item_notify(move |sel| {
-            let col = cc.get();
-            if let Some(item) = sel.selected_item() {
-                if let Some(file) = item.downcast_ref::<FileObject>() {
-                    let value = match col {
-                        0 => file.name(),
-                        1 => file.size_display(),
-                        2 => file.modified_display(),
-                        3 => file.file_type_name(),
-                        _ => String::new(),
-                    };
-                    d.announce(
-                        &format!("{}: {}", col_names[col], value),
-                        AccessibleAnnouncementPriority::Medium,
-                    );
-                }
+            // (The grid has no columns: its name.)
+            let col = if grid.get() { 0 } else { cc.get() };
+            if let Some(file) = sel.selected_item().and_downcast::<FileObject>() {
+                let mark = if chosen.borrow().contains(&file.path()) {
+                    ", selected"
+                } else {
+                    ""
+                };
+                d.announce(
+                    &format!("{}: {}{mark}", col_names[col], column_value(&file, col)),
+                    AccessibleAnnouncementPriority::Medium,
+                );
             }
         });
     }
 
-    // Selected file tracking — Space selects, doesn't auto-select on navigation
-    let selected_file: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-
     // -- Load initial directory --
     let initial_path = nav.borrow().current().to_string_lossy().to_string();
-    load_dir(
-        &model,
-        &initial_path,
-        &location_entry,
-        &status_label,
-        &nav,
-        &back_btn,
-        &forward_btn,
-        &up_btn,
-        &selection,
-        &dlg,
-    );
-    list_view.grab_focus();
+    show_folder(&initial_path);
 
     // -- Navigation button handlers --
     {
         let nav = nav.clone();
-        let model = model.clone();
-        let le = location_entry.clone();
-        let sl = status_label.clone();
-        let bb = back_btn.clone();
-        let fb = forward_btn.clone();
-        let ub = up_btn.clone();
-        let sel = selection.clone();
-        let d = dlg.clone();
+        let show = show_folder.clone();
         back_btn.connect_clicked(move |_| {
             // Bound first, so the borrow ends before load_dir borrows again.
             let back = nav.borrow_mut().go_back().cloned();
             if let Some(path) = back {
-                load_dir(
-                    &model,
-                    &path.to_string_lossy(),
-                    &le,
-                    &sl,
-                    &nav,
-                    &bb,
-                    &fb,
-                    &ub,
-                    &sel,
-                    &d,
-                );
+                show(&path.to_string_lossy());
             }
         });
     }
     {
         let nav = nav.clone();
-        let model = model.clone();
-        let le = location_entry.clone();
-        let sl = status_label.clone();
-        let bb = back_btn.clone();
-        let fb = forward_btn.clone();
-        let ub = up_btn.clone();
-        let sel = selection.clone();
-        let d = dlg.clone();
+        let show = show_folder.clone();
         forward_btn.connect_clicked(move |_| {
             let forward = nav.borrow_mut().go_forward().cloned();
             if let Some(path) = forward {
-                load_dir(
-                    &model,
-                    &path.to_string_lossy(),
-                    &le,
-                    &sl,
-                    &nav,
-                    &bb,
-                    &fb,
-                    &ub,
-                    &sel,
-                    &d,
-                );
+                show(&path.to_string_lossy());
             }
         });
     }
     {
         let nav = nav.clone();
-        let model = model.clone();
-        let le = location_entry.clone();
-        let sl = status_label.clone();
-        let bb = back_btn.clone();
-        let fb = forward_btn.clone();
-        let ub = up_btn.clone();
-        let sel = selection.clone();
-        let d = dlg.clone();
+        let go = go_to.clone();
         up_btn.connect_clicked(move |_| {
             let up = nav.borrow().go_up();
             if let Some(parent) = up {
-                nav.borrow_mut().navigate_to(parent.clone());
-                load_dir(
-                    &model,
-                    &parent.to_string_lossy(),
-                    &le,
-                    &sl,
-                    &nav,
-                    &bb,
-                    &fb,
-                    &ub,
-                    &sel,
-                    &d,
-                );
+                go(&parent.to_string_lossy());
             }
         });
     }
 
     // -- Sidebar navigation --
     {
-        let nav = nav.clone();
-        let model = model.clone();
-        let le = location_entry.clone();
-        let sl = status_label.clone();
-        let bb = back_btn.clone();
-        let fb = forward_btn.clone();
-        let ub = up_btn.clone();
-        let sel = selection.clone();
+        let go = go_to.clone();
         let d = dlg.clone();
-        let lv = list_view.clone();
+        let focus = focus_files.clone();
         sidebar.connect_place_activated(move |path| {
             // The Bin and Recent Files aren't folders to choose from.
             if path.starts_with("trash:") || path.starts_with("recent:") {
@@ -472,40 +780,46 @@ pub fn show_chooser(
                 );
                 return;
             }
-            nav.borrow_mut().navigate_to(PathBuf::from(&path));
-            load_dir(&model, &path, &le, &sl, &nav, &bb, &fb, &ub, &sel, &d);
-            // To its files, as in the main window: Tab can't leave the
-            // sidebar's list.
-            lv.grab_focus();
+            go(&path);
+            // To its files, as in the main window.
+            focus();
         });
     }
 
-    // A selection belongs to the folder it was made in: moving elsewhere
-    // (every move shows the new location in the entry) clears it.
-    if let Some(label) = selected_label.clone() {
-        let sf = selected_file.clone();
+    // A choice belongs to the folder it was made in: moving elsewhere
+    // (every move shows the new location in the entry) clears it — and
+    // the names it put in the name field, unless that's a name to save as.
+    {
+        let (chosen, auto_text, entry) = (chosen.clone(), auto_text.clone(), name_entry.clone());
+        let typed = typed_name.clone();
         location_entry.connect_changed(move |_| {
-            if sf.borrow_mut().take().is_some() {
-                label.set_text("No file selected");
+            if chosen.borrow_mut().drain(..).next().is_some() && !is_save {
+                let was_chosen = entry.text() == *auto_text.borrow();
+                auto_text.borrow_mut().clear();
+                if was_chosen {
+                    let back_to = typed.borrow().clone();
+                    entry.set_text(&back_to);
+                }
             }
         });
     }
 
     // -- Enter in the location: go there --
+    // (Up/Down set `stay`: going through recent folders keeps the focus in
+    // the location.)
+    let stay = Rc::new(Cell::new(false));
     {
-        let nav = nav.clone();
         let model = model.clone();
-        let sl = status_label.clone();
-        let bb = back_btn.clone();
-        let fb = forward_btn.clone();
-        let ub = up_btn.clone();
-        let sel = selection.clone();
         let d = dlg.clone();
-        let lv = list_view.clone();
+        let focus = focus_files.clone();
+        let go = go_to.clone();
+        let paned = paned.clone();
+        let stay = stay.clone();
         // Enters, counted: only the latest one's check goes anywhere (one
         // for a corrected path mustn't lose to the one before it).
-        let enters = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let enters = Rc::new(Cell::new(0u64));
         location_entry.connect_activate(move |entry| {
+            let stay = stay.replace(false);
             let enter = enters.get() + 1;
             enters.set(enter);
             let enters = enters.clone();
@@ -523,17 +837,12 @@ pub fn show_chooser(
             // touch a slow mount, so not on the main thread.
             let check = path.clone();
             let generation = model.generation();
-            let (nav, model, entry, sl, bb, fb, ub, sel, d, lv) = (
-                nav.clone(),
+            let (model, d, focus, go, paned) = (
                 model.clone(),
-                entry.clone(),
-                sl.clone(),
-                bb.clone(),
-                fb.clone(),
-                ub.clone(),
-                sel.clone(),
                 d.clone(),
-                lv.clone(),
+                focus.clone(),
+                go.clone(),
+                paned.clone(),
             );
             let waiting = wayfinder::background::waiting_message(&check);
             let d_slow = d.clone();
@@ -552,9 +861,11 @@ pub fn show_chooser(
                         );
                         return;
                     }
-                    nav.borrow_mut().navigate_to(PathBuf::from(&path));
-                    load_dir(&model, &path, &entry, &sl, &nav, &bb, &fb, &ub, &sel, &d);
-                    lv.grab_focus();
+                    go(&path);
+                    // To its files, if they're shown.
+                    if !stay && paned.is_visible() {
+                        focus();
+                    }
                 },
                 move || {
                     if let Some(msg) = waiting {
@@ -565,133 +876,168 @@ pub fn show_chooser(
         });
     }
 
-    // -- Space to select file (deliberate selection) --
-    let space_controller = gtk::EventControllerKey::new();
-    space_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let sel_for_space = selection.clone();
-    let sf = selected_file.clone();
-    let fn_entry = filename_entry.clone();
-    let sel_label = selected_label.clone();
-    let d = dlg.clone();
-    space_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
-        if key == gtk::gdk::Key::space {
-            if let Some(item) = sel_for_space.selected_item() {
-                if let Some(file) = item.downcast_ref::<FileObject>() {
-                    // Choosing folders: only a folder; files: only a file.
-                    if file.is_directory() != directory_mode {
-                        let hint = if directory_mode {
-                            "Not a folder: choose a folder"
-                        } else {
-                            "That's a folder: press Enter to open it, Space on a file to choose it"
-                        };
-                        d.announce(hint, AccessibleAnnouncementPriority::Medium);
-                    }
-                    if file.is_directory() == directory_mode {
-                        *sf.borrow_mut() = Some(file.path());
-                        if let Some(ref entry) = fn_entry {
-                            entry.set_text(&file.name());
-                        }
-                        if let Some(ref label) = sel_label {
-                            label.set_text(&file.name());
-                        }
-                        d.announce(
-                            &format!("Selected {}", file.name()),
-                            AccessibleAnnouncementPriority::Medium,
-                        );
-                    }
+    // -- Up/Down in the location: recent folders, gone to at once --
+    {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let entry = location_entry.clone();
+        let d = dlg.clone();
+        let stay = stay.clone();
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            use gtk::gdk;
+            let down = match key {
+                gdk::Key::Down | gdk::Key::KP_Down => true,
+                gdk::Key::Up | gdk::Key::KP_Up => false,
+                _ => return glib::Propagation::Proceed,
+            };
+            if mods.intersects(
+                gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::SHIFT_MASK,
+            ) {
+                return glib::Propagation::Proceed;
+            }
+            let recent = Memory::load().recent;
+            if recent.is_empty() {
+                d.announce(
+                    "No recent folders yet",
+                    AccessibleAnnouncementPriority::Medium,
+                );
+                return glib::Propagation::Stop;
+            }
+            match options::recent_step(&recent, &entry.text(), down) {
+                Some(i) => {
+                    entry.set_text(&recent[i]);
+                    entry.set_position(-1);
+                    stay.set(true);
+                    entry.emit_activate();
                 }
+                None => d.announce(
+                    if down {
+                        "Last recent folder"
+                    } else {
+                        "First recent folder"
+                    },
+                    AccessibleAnnouncementPriority::Medium,
+                ),
             }
             glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    list_view.column_view().add_controller(space_controller);
+        });
+        location_entry.add_controller(keys);
+    }
 
-    // Same for grid view
-    let space_controller2 = gtk::EventControllerKey::new();
-    space_controller2.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let sel_for_space2 = selection.clone();
-    let sf2 = selected_file.clone();
-    let fn_entry2 = filename_entry.clone();
-    let sel_label2 = selected_label.clone();
-    let d2 = dlg.clone();
-    space_controller2.connect_key_pressed(move |_ctrl, key, _code, _mods| {
-        if key == gtk::gdk::Key::space {
-            if let Some(item) = sel_for_space2.selected_item() {
-                if let Some(file) = item.downcast_ref::<FileObject>() {
-                    // Choosing folders: only a folder; files: only a file.
-                    if file.is_directory() != directory_mode {
-                        let hint = if directory_mode {
-                            "Not a folder: choose a folder"
-                        } else {
-                            "That's a folder: press Enter to open it, Space on a file to choose it"
-                        };
-                        d2.announce(hint, AccessibleAnnouncementPriority::Medium);
-                    }
-                    if file.is_directory() == directory_mode {
-                        *sf2.borrow_mut() = Some(file.path());
-                        if let Some(ref entry) = fn_entry2 {
-                            entry.set_text(&file.name());
-                        }
-                        if let Some(ref label) = sel_label2 {
-                            label.set_text(&file.name());
-                        }
-                        d2.announce(
-                            &format!("Selected {}", file.name()),
-                            AccessibleAnnouncementPriority::Medium,
-                        );
-                    }
-                }
+    // -- Space to choose a file (deliberate selection); again to unchoose --
+    let space_on = |view: &gtk::Widget| {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let sel = selection.clone();
+        let chosen = chosen.clone();
+        let entry = name_entry.clone();
+        let auto_text = auto_text.clone();
+        let typed = typed_name.clone();
+        let d = dlg.clone();
+        keys.connect_key_pressed(move |_ctrl, key, _code, _mods| {
+            if key != gtk::gdk::Key::space {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(file) = sel.selected_item().and_downcast::<FileObject>() {
+                space_choose(
+                    &file,
+                    directory_mode,
+                    multiple,
+                    &chosen,
+                    &entry,
+                    &auto_text,
+                    &typed.borrow().clone(),
+                    &d,
+                );
             }
             glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    grid_view.grid_view().add_controller(space_controller2);
+        });
+        view.add_controller(keys);
+    };
+    space_on(list_view.column_view().upcast_ref());
+    space_on(grid_view.grid_view().upcast_ref());
 
     // -- Enter opens folders, doesn't select files --
-    let enter_controller = gtk::EventControllerKey::new();
-    enter_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let sel_for_enter = selection.clone();
-    let nav_for_enter = nav.clone();
-    let model_for_enter = model.clone();
-    let le2 = location_entry.clone();
-    let sl2 = status_label.clone();
-    let bb2 = back_btn.clone();
-    let fb2 = forward_btn.clone();
-    let ub2 = up_btn.clone();
-    let d3 = dlg.clone();
-    enter_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
-        if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
-            if let Some(item) = sel_for_enter.selected_item() {
-                if let Some(file) = item.downcast_ref::<FileObject>() {
+    for view in [
+        list_view.column_view().upcast_ref::<gtk::Widget>(),
+        grid_view.grid_view().upcast_ref(),
+    ] {
+        let enter_controller = gtk::EventControllerKey::new();
+        enter_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let sel = selection.clone();
+        let go = go_to.clone();
+        enter_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
+            if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+                if let Some(file) = sel.selected_item().and_downcast::<FileObject>() {
                     if file.is_directory() {
-                        let path = file.path();
-                        nav_for_enter.borrow_mut().navigate_to(PathBuf::from(&path));
-                        load_dir(
-                            &model_for_enter,
-                            &path,
-                            &le2,
-                            &sl2,
-                            &nav_for_enter,
-                            &bb2,
-                            &fb2,
-                            &ub2,
-                            &sel_for_enter,
-                            &d3,
-                        );
+                        go(&file.path());
                         return glib::Propagation::Stop;
                     }
                 }
             }
             glib::Propagation::Proceed
-        } else {
-            glib::Propagation::Proceed
+        });
+        view.add_controller(enter_controller);
+    }
+
+    // -- The file type: filters the list; when saving, the name follows --
+    if let Some(dd) = type_dropdown.as_ref() {
+        let active = active_filter.clone();
+        let filters = filters.clone();
+        let type_filter = type_filter.clone();
+        let sel = selection.clone();
+        let sl = status_label.clone();
+        let entry = name_entry.clone();
+        let d = dlg.clone();
+        let update = update_reset.clone();
+        dd.connect_selected_notify(move |dd| {
+            let Ok(i) = usize::try_from(dd.selected()) else {
+                return;
+            };
+            if i >= filters.len() {
+                return;
+            }
+            let before = active.replace(Some(i));
+            type_filter.changed(gtk::FilterChange::Different);
+            sl.set_text(&format!("{} items", sel.n_items()));
+            if is_save {
+                let old = before.and_then(|b| filters.get(b));
+                if let Some(name) = options::swap_extension(&entry.text(), old, &filters[i]) {
+                    entry.set_text(&name);
+                    d.announce(
+                        &format!("File name {name}"),
+                        AccessibleAnnouncementPriority::Low,
+                    );
+                }
+            }
+            update();
+        });
+    }
+
+    // What goes back with the files: the app's choices and the type.
+    let extras = {
+        let controls = choice_controls.clone();
+        let active = active_filter.clone();
+        let filters = filters.clone();
+        move || -> (Vec<(String, String)>, Option<Filter>) {
+            let values = controls
+                .iter()
+                .map(|c| match c {
+                    ChoiceControl::Check(id, b) => (id.clone(), b.is_active().to_string()),
+                    ChoiceControl::List(id, dd, ids) => (
+                        id.clone(),
+                        usize::try_from(dd.selected())
+                            .ok()
+                            .and_then(|i| ids.get(i).cloned())
+                            .unwrap_or_default(),
+                    ),
+                })
+                .collect();
+            (values, active.get().and_then(|i| filters.get(i).cloned()))
         }
-    });
-    list_view.column_view().add_controller(enter_controller);
+    };
 
     // -- Cancel --
     let tx_cancel = result_tx.clone();
@@ -701,6 +1047,8 @@ pub fn show_chooser(
             let _ = tx.send(ChooserResult {
                 uris: vec![],
                 cancelled: true,
+                choices: vec![],
+                current_filter: None,
             });
         }
         d_cancel.close();
@@ -708,16 +1056,21 @@ pub fn show_chooser(
 
     // -- Accept --
     let tx_accept = result_tx.clone();
-    let sf_accept = selected_file.clone();
-    let fn_accept = filename_entry.clone();
+    let chosen_accept = chosen.clone();
+    let auto_accept = auto_text.clone();
+    let typed_accept = typed_name.clone();
+    let fn_accept = name_entry.clone();
     let model_accept = model.clone();
     let d_accept = dlg.clone();
     let le_accept = location_entry.clone();
+    let go_accept = go_to.clone();
+    let paned_accept = paned.clone();
+    let focus_accept = focus_files.clone();
     // Save presses, counted: a Replace check under way acts only if it's
     // the latest press's, the dialog is still open, and it still shows the
     // folder and name it checked (otherwise a corrected name, another
     // folder or a cancel would lose to it).
-    let checking_accept = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let checking_accept = Rc::new(Cell::new(0u64));
     accept_btn.connect_clicked(move |_| {
         let press = checking_accept.get() + 1;
         checking_accept.set(press);
@@ -740,12 +1093,21 @@ pub fn show_chooser(
         let send = {
             let tx = tx_accept.clone();
             let d = d_accept.clone();
-            move |path: &str| {
+            let extras = extras.clone();
+            let folder = current_dir.clone();
+            move |paths: &[String]| {
                 if let Some(tx) = tx.borrow_mut().take() {
+                    let (choices, current_filter) = extras();
                     let _ = tx.send(ChooserResult {
-                        uris: vec![gio::File::for_path(path).uri().to_string()],
+                        uris: paths
+                            .iter()
+                            .map(|p| gio::File::for_path(p).uri().to_string())
+                            .collect(),
                         cancelled: false,
+                        choices,
+                        current_filter,
                     });
+                    Memory::update(|m| m.used(&folder));
                 }
                 d.close();
             }
@@ -753,10 +1115,7 @@ pub fn show_chooser(
 
         if is_save {
             // For Save: the filename entry text in the current directory.
-            let name = fn_accept
-                .as_ref()
-                .map(|e| e.text().to_string())
-                .unwrap_or_default();
+            let name = fn_accept.text().to_string();
             if name.is_empty() {
                 d_accept.announce("No file name", AccessibleAnnouncementPriority::High);
                 return;
@@ -785,7 +1144,7 @@ pub fn show_chooser(
             // newer press or the dialog gone (quietly: the newer press
             // speaks), or what changed since (the folder and name shown,
             // as written, or another location typed).
-            let stale = std::rc::Rc::new({
+            let stale = Rc::new({
                 let model = model_accept.clone();
                 let name_entry = fn_accept.clone();
                 let location = le_accept.clone();
@@ -800,11 +1159,7 @@ pub fn show_chooser(
                     if location_not_open(&location.text(), &folder) {
                         return Some("Not saved: another location was typed. Press Enter in it to go there, then Save.");
                     }
-                    let name = name_entry
-                        .as_ref()
-                        .map(|e| e.text().to_string())
-                        .unwrap_or_default();
-                    if folder != checked_folder || name != checked_name {
+                    if folder != checked_folder || name_entry.text() != checked_name {
                         return Some("Not saved: the folder or name changed. Press Save again.");
                     }
                     None
@@ -857,7 +1212,7 @@ pub fn show_chooser(
                         }
                     };
                     let Some(refused) = found else {
-                        send(&full_path);
+                        send(std::slice::from_ref(&full_path));
                         return;
                     };
                     // Not a file to save over: the app couldn't write to a
@@ -884,7 +1239,7 @@ pub fn show_chooser(
                         // Changed while the question was open: said, not
                         // saved somewhere else.
                         match stale_choice() {
-                            None => send(&full_path),
+                            None => send(std::slice::from_ref(&full_path)),
                             Some("") => {}
                             Some(why) => say_stale_choice(&d_choice, why),
                         }
@@ -908,26 +1263,112 @@ pub fn show_chooser(
             return;
         }
 
-        // For Open: the space-selected file — if it's in this folder (it
-        // may have been chosen before moving elsewhere). Choosing a folder,
-        // with none selected, means the one being shown.
-        let chosen = sf_accept
-            .borrow()
-            .clone()
-            .filter(|p| {
-                std::path::Path::new(p).parent() == Some(std::path::Path::new(&current_dir))
-            })
-            .or_else(|| directory_mode.then(|| current_dir.clone()));
-        match chosen {
-            Some(path) => send(&path),
-            None => d_accept.announce("No file selected", AccessibleAnnouncementPriority::High),
+        // For Open: the files chosen with Space, if the name field still
+        // shows them and they're in this folder (they may have been chosen
+        // before moving elsewhere). Choosing a folder, with none chosen,
+        // means the one being shown.
+        let text = fn_accept.text().to_string();
+        if text.trim().is_empty() || text == *auto_accept.borrow() {
+            let here: Vec<String> = chosen_accept
+                .borrow()
+                .iter()
+                .filter(|p| {
+                    std::path::Path::new(p).parent() == Some(std::path::Path::new(&current_dir))
+                })
+                .cloned()
+                .collect();
+            if !here.is_empty() {
+                send(&here);
+            } else if directory_mode {
+                send(std::slice::from_ref(&current_dir));
+            } else {
+                d_accept.announce("No file selected", AccessibleAnnouncementPriority::High);
+            }
+            return;
         }
+
+        // Names typed: in this folder, or a full path. A folder typed is
+        // gone to (unless folders are what's being chosen).
+        let names = options::typed_names(&text);
+        if names.len() > 1 && !multiple {
+            d_accept.announce(
+                "Only one can be chosen here",
+                AccessibleAnnouncementPriority::High,
+            );
+            return;
+        }
+        let paths: Vec<String> = names.iter().map(|n| resolve_typed(n, &current_dir)).collect();
+        let check = paths.clone();
+        let generation = model_accept.generation();
+        let (model, d, entry, go, paned, focus, checking) = (
+            model_accept.clone(),
+            d_accept.clone(),
+            fn_accept.clone(),
+            go_accept.clone(),
+            paned_accept.clone(),
+            focus_accept.clone(),
+            checking_accept.clone(),
+        );
+        let typed = typed_accept.clone();
+        let waiting = paths
+            .first()
+            .and_then(|p| wayfinder::background::waiting_message(p));
+        let d_slow = d_accept.clone();
+        wayfinder::background::run(
+            // Each: Some(is a folder), or None if it isn't there.
+            move || {
+                check
+                    .iter()
+                    .map(|p| std::fs::metadata(p).ok().map(|m| m.is_dir()))
+                    .collect::<Vec<_>>()
+            },
+            move |kinds| {
+                // Pressed again, gone elsewhere or retyped since: leave it.
+                if checking.get() != press
+                    || !d.is_visible()
+                    || model.generation() != generation
+                    || entry.text() != text
+                {
+                    return;
+                }
+                for (name, kind) in names.iter().zip(&kinds) {
+                    let problem = match kind {
+                        None => Some(format!("{name} doesn't exist")),
+                        Some(false) if directory_mode => Some(format!("{name} isn't a folder")),
+                        Some(true) if !directory_mode && names.len() > 1 => {
+                            Some(format!("{name} is a folder"))
+                        }
+                        _ => None,
+                    };
+                    if let Some(problem) = problem {
+                        d.announce(&problem, AccessibleAnnouncementPriority::High);
+                        return;
+                    }
+                }
+                if !directory_mode && kinds == [Some(true)] {
+                    // (Cleared: a folder gone to isn't a name to keep.)
+                    entry.set_text("");
+                    typed.borrow_mut().clear();
+                    go(&paths[0]);
+                    if paned.is_visible() {
+                        focus();
+                    }
+                    return;
+                }
+                send(&paths);
+            },
+            move || {
+                if let Some(msg) = waiting {
+                    d_slow.announce(&msg, AccessibleAnnouncementPriority::Medium);
+                }
+            },
+        );
     });
 
-    // Enter in the file name field saves; Escape cancels.
-    if let Some(entry) = filename_entry.as_ref() {
+    // Enter in the file name field accepts; Escape cancels.
+    {
         let accept = accept_btn.clone();
-        entry.connect_activate(move |_| accept.emit_clicked());
+        name_entry.connect_activate(move |_| accept.emit_clicked());
     }
     {
         let cancel = cancel_btn.clone();
@@ -952,12 +1393,70 @@ pub fn show_chooser(
             let _ = tx.send(ChooserResult {
                 uris: vec![],
                 cancelled: true,
+                choices: vec![],
+                current_filter: None,
             });
         }
         glib::Propagation::Proceed
     });
 
     dlg.present();
+    // The cursor starts in the file name, its name part selected: typing
+    // replaces the name and keeps the type.
+    name_entry.grab_focus();
+    let stem = options::stem_chars(&name_entry.text());
+    name_entry.select_region(0, stem);
+}
+
+/// Letters typed in the file list further apart than this start a new
+/// search.
+const TYPE_AHEAD_PAUSE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// What column `col` of the list says for `file`.
+fn column_value(file: &FileObject, col: usize) -> String {
+    match col {
+        0 => file.name(),
+        1 => file.size_display(),
+        2 => file.modified_display(),
+        3 => file.file_type_name(),
+        _ => String::new(),
+    }
+}
+
+/// A name typed in the name field, as a full path: one starting with / or
+/// ~ as it is; anything else in the folder shown.
+fn resolve_typed(name: &str, current_dir: &str) -> String {
+    use wayfinder::path_complete::{clean, expand_tilde};
+    let expanded = expand_tilde(name);
+    if expanded.starts_with('/') {
+        clean(&expanded)
+    } else {
+        clean(
+            &std::path::Path::new(current_dir)
+                .join(name)
+                .to_string_lossy(),
+        )
+    }
+}
+
+/// The name field showing the files chosen, noted as what the chooser put
+/// there; or, with none, `empty` (the user's own name).
+fn show_chosen(chosen: &[String], entry: &gtk::Entry, auto_text: &RefCell<String>, empty: &str) {
+    let names: Vec<String> = chosen
+        .iter()
+        .filter_map(|p| std::path::Path::new(p).file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .collect();
+    if names.is_empty() {
+        // Back to the user's own name: theirs, not the chooser's.
+        auto_text.borrow_mut().clear();
+        entry.set_text(empty);
+    } else {
+        // (Noted first: setting the text tells whoever's watching.)
+        let text = options::names_text(&names);
+        *auto_text.borrow_mut() = text.clone();
+        entry.set_text(&text);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -982,13 +1481,12 @@ fn load_dir(
 
     let dir_name = wayfinder::file_model::display_name(path);
     {
-        let m = model.clone();
         let status_label = status_label.clone();
         let selection = selection.clone();
         let window = window.clone();
         model.load_directory(path, false, move |result| match result {
             Ok(_) => {
-                let count = m.item_count();
+                let count = selection.n_items();
                 status_label.set_text(&format!("{count} items"));
                 selection.set_selected(gtk::INVALID_LIST_POSITION); // Clear selection
                 window.announce(
@@ -1072,8 +1570,86 @@ fn location_not_open(typed: &str, current: &str) -> bool {
     clean(&expand_tilde(typed)) != current && clean(&expand_tilde(typed.trim())) != current
 }
 
+/// Space on the focused item: choose it, or, if it is already chosen,
+/// unchoose it (so a file picked to replace can be let go again). Several
+/// may be chosen if `multiple`; otherwise choosing one replaces the last.
+#[allow(clippy::too_many_arguments)]
+fn space_choose(
+    file: &FileObject,
+    directory_mode: bool,
+    multiple: bool,
+    chosen: &RefCell<Vec<String>>,
+    name_entry: &gtk::Entry,
+    auto_text: &RefCell<String>,
+    back_to: &str,
+    dlg: &gtk::Window,
+) {
+    // Choosing folders: only a folder; files: only a file.
+    if file.is_directory() != directory_mode {
+        let hint = if directory_mode {
+            "Not a folder: choose a folder"
+        } else {
+            "That's a folder: press Enter to open it, Space on a file to choose it"
+        };
+        dlg.announce(hint, AccessibleAnnouncementPriority::Medium);
+        return;
+    }
+    let name = file.name();
+    let added = toggle_chosen(&mut chosen.borrow_mut(), &file.path(), multiple);
+    show_chosen(&chosen.borrow(), name_entry, auto_text, back_to);
+    let count = chosen.borrow().len();
+    let more = if multiple && count > 1 {
+        format!(", {count} selected")
+    } else {
+        String::new()
+    };
+    let what = if added { "Selected" } else { "Deselected" };
+    dlg.announce(
+        &format!("{what} {name}{more}"),
+        AccessibleAnnouncementPriority::Medium,
+    );
+}
+
+/// Space on `path`: out if it's chosen, else in (alongside the others only
+/// if `multiple`). Whether it went in.
+fn toggle_chosen(chosen: &mut Vec<String>, path: &str, multiple: bool) -> bool {
+    if let Some(i) = chosen.iter().position(|p| p == path) {
+        chosen.remove(i);
+        return false;
+    }
+    if !multiple {
+        chosen.clear();
+    }
+    chosen.push(path.to_string());
+    true
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn space_on_the_chosen_file_unchooses_it() {
+        use super::toggle_chosen;
+        let mut c = Vec::new();
+        assert!(toggle_chosen(&mut c, "/a/b", false));
+        assert!(toggle_chosen(&mut c, "/a/c", false));
+        assert_eq!(c, vec!["/a/c"]);
+        assert!(!toggle_chosen(&mut c, "/a/c", false));
+        assert!(c.is_empty());
+        // Several: each in and out on its own.
+        toggle_chosen(&mut c, "/a/b", true);
+        toggle_chosen(&mut c, "/a/c", true);
+        assert!(!toggle_chosen(&mut c, "/a/b", true));
+        assert_eq!(c, vec!["/a/c"]);
+    }
+
+    #[test]
+    fn typed_names_resolve_in_the_folder_shown() {
+        use super::resolve_typed;
+        assert_eq!(resolve_typed("a.txt", "/home/u"), "/home/u/a.txt");
+        assert_eq!(resolve_typed("../b", "/home/u"), "/home/b");
+        assert_eq!(resolve_typed("/etc/x", "/home/u"), "/etc/x");
+    }
+
     use super::{location_not_open, save_target, without_mnemonic};
 
     #[test]
