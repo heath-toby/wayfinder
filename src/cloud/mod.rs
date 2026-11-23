@@ -531,9 +531,131 @@ pub fn describe(item_name: &str, drive_name: &str, outcome: &Outcome) -> Option<
     Some(format!("Sync updated: {item_name}, {}.", parts.join(", ")))
 }
 
+// --- Separate logins ----------------------------------------------------
+//
+// rclone keeps a Proton Drive login (its session) in rclone.conf, and every
+// rclone process using the remote reads it from there. Proton's refresh
+// token is single-use: whichever process renews an expired session first
+// gets a new pair, and every other process's copy dies. Short-lived
+// processes read the file afresh and recover; a mount reads it once, so
+// after a long sleep (the access token expired) it was usually the loser,
+// and showed nothing until killed. So the mount, and the service's syncs,
+// each get a session of their own: a copy of the remote's section without
+// the session, in a config file only they use.
+
+/// The keys of the session (not the account) in a Proton Drive section.
+const SESSION_KEYS: &[&str] = &[
+    "client_uid",
+    "client_access_token",
+    "client_refresh_token",
+    "client_salted_key_pass",
+];
+
+/// The lines of section `[name]` in an rclone config, header included.
+pub fn config_section(conf: &str, name: &str) -> Option<String> {
+    let header = format!("[{name}]");
+    let mut out = String::new();
+    let mut inside = false;
+    for line in conf.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            if inside {
+                break;
+            }
+            inside = t == header;
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn config_value<'a>(section: &'a str, key: &str) -> Option<&'a str> {
+    section.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        (k.trim() == key).then(|| v.trim())
+    })
+}
+
+/// `section` without its session: what a process with a login of its own
+/// starts from. None if the remote can't log in by itself — not Proton
+/// Drive (other remotes have no such trouble, and an OAuth one can't sign
+/// in again without a browser), or no password kept.
+pub fn own_login_section(section: &str) -> Option<String> {
+    if config_value(section, "type") != Some("protondrive")
+        || config_value(section, "password").is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    let mut out = String::new();
+    for line in section.lines() {
+        let key = line.split_once('=').map(|(k, _)| k.trim());
+        if key.is_some_and(|k| SESSION_KEYS.contains(&k)) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Whether two sections are the same account (equal apart from sessions):
+/// if not, the copy must be made again (a changed password, say).
+pub fn same_account(a: &str, b: &str) -> bool {
+    own_login_section(a).is_some() && own_login_section(a) == own_login_section(b)
+}
+
+/// Whether a line of a mount's output says it has lost its login for good
+/// (rclone doesn't sign in again by itself; started afresh, it does).
+pub fn lost_login(line: &str) -> bool {
+    line.contains("failed to refresh auth") || line.contains("de-auth")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PROTON: &str = "[Proton]\ntype = protondrive\nusername = me@proton.me\npassword = obscured\notp_secret_key = abc\nclient_uid = u1\nclient_access_token = a1\nclient_refresh_token = r1\nclient_salted_key_pass = k1\n";
+
+    #[test]
+    fn config_sections() {
+        let conf = format!("[Other]\ntype = drive\n\n{PROTON}\n[Last]\ntype = local\n");
+        let s = config_section(&conf, "Proton").unwrap();
+        assert!(s.starts_with("[Proton]\n"));
+        assert!(s.contains("client_uid = u1"));
+        assert!(!s.contains("[Last]"));
+        assert!(config_section(&conf, "Missing").is_none());
+    }
+
+    #[test]
+    fn own_login_drops_only_the_session() {
+        let own = own_login_section(PROTON).unwrap();
+        assert!(own.contains("password = obscured"));
+        assert!(own.contains("otp_secret_key = abc"));
+        assert!(!own.contains("client_"));
+        // Not Proton, or no password: left sharing the main config.
+        assert!(own_login_section("[G]\ntype = drive\ntoken = {}\n").is_none());
+        assert!(own_login_section("[P]\ntype = protondrive\nusername = x\n").is_none());
+    }
+
+    #[test]
+    fn same_account_ignores_sessions() {
+        let renewed = PROTON.replace("r1", "r2").replace("a1", "a2");
+        assert!(same_account(PROTON, &renewed));
+        assert!(!same_account(
+            PROTON,
+            &PROTON.replace("obscured", "changed")
+        ));
+    }
+
+    #[test]
+    fn lost_logins() {
+        assert!(lost_login("ERROR : IO error: failed to refresh auth: failed to refresh auth, de-auth: 400 POST https://drive-api.proton.me/auth/v4/refresh: Invalid refresh token"));
+        // A first 401 is renewed as usual: not lost.
+        assert!(!lost_login("INFO+2: 401 GET https://drive-api.proton.me/...: Invalid access token (Code=401, Status=401), Attempt 1"));
+    }
 
     fn proton() -> Drive {
         Drive {

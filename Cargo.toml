@@ -24,6 +24,6 @@ log = "0.4"
 env_logger = "0.11"
 chrono = "0.4"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "macros", "time", "process", "signal", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "process", "signal", "sync", "io-util"] }
 futures-util = { version = "0.3", default-features = false }
 notify = "8"

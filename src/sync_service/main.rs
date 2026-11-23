@@ -37,6 +37,8 @@ enum Event {
     SyncNow(String, bool),
     /// A managed drive was mounted (again).
     Mounted(String),
+    /// The managed mount at this mountpoint has lost its login.
+    LoginLost(String),
 }
 
 /// Per-item scheduling.
@@ -158,7 +160,17 @@ async fn main() {
         tokio::select! {
             _ = sigterm.recv() => break,
             _ = mount_check.tick() => {
-                for mounted in mounts.tend(&cloud::load_drives()) {
+                let drives = cloud::load_drives();
+                for mounted in mounts.tend(&drives, &tx) {
+                    if mounts.reconnecting.remove(&mounted) {
+                        let name = drives
+                            .iter()
+                            .find(|d| d.mountpoint == mounted)
+                            .map_or("the drive", |d| d.name());
+                        let message = format!("Reconnected to {name}.");
+                        log::info!("{message}");
+                        report(&conn, &mounted, &message, 2).await;
+                    }
                     let _ = tx.send(Event::Mounted(mounted));
                 }
                 continue;
@@ -178,6 +190,14 @@ async fn main() {
                             let s = state.entry(i.original.clone()).or_default();
                             s.asked |= tell;
                             s.due = Some(Instant::now());
+                        }
+                    }
+                    Event::LoginLost(mountpoint) => {
+                        if mounts.restart(&mountpoint).await {
+                            let drives = cloud::load_drives();
+                            for mounted in mounts.tend(&drives, &tx) {
+                                let _ = tx.send(Event::Mounted(mounted));
+                            }
                         }
                     }
                     Event::Mounted(mountpoint) => {
@@ -293,6 +313,11 @@ async fn run_item(item: &SyncItem) -> cloud::Outcome {
     log::debug!("bisync {}:\n{out}", item.original);
     let mut outcome = cloud::parse_bisync(&out);
     outcome.ok &= ok;
+    if !outcome.ok && !outcome.needs_first_run {
+        // (Its output isn't logged otherwise: say why, for next time.)
+        let why = outcome.error.clone().unwrap_or_else(|| reason(&out));
+        log::warn!("bisync of {} failed: {why}", item.original);
+    }
     if !outcome.needs_first_run {
         return outcome;
     }
@@ -372,6 +397,54 @@ fn state_dir() -> PathBuf {
     dirs::state_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// rclone's own config file.
+fn rclone_config() -> PathBuf {
+    std::env::var_os("RCLONE_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("rclone/rclone.conf")
+        })
+}
+
+/// A config file holding remote `name` with a login of its own, for
+/// `purpose` (the mount, the syncs): made from rclone.conf's section, and
+/// made again if the account there changes; the session rclone keeps in it
+/// is its own. None to use rclone.conf as it is.
+fn session_config(name: &str, purpose: &str) -> Option<PathBuf> {
+    let conf = std::fs::read_to_string(rclone_config()).ok()?;
+    // (An encrypted config can't be copied from.)
+    if conf.contains("RCLONE_ENCRYPT_V0:") {
+        return None;
+    }
+    let section = cloud::config_section(&conf, name)?;
+    let fresh = cloud::own_login_section(&section)?;
+    let dir = state_dir().join("wayfinder/sessions");
+    let path = dir.join(format!("{name}-{purpose}.conf"));
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let ours = cloud::config_section(&current, name).unwrap_or_default();
+    if !cloud::same_account(&ours, &section) {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .ok()?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .ok()?;
+        use std::io::Write;
+        f.write_all(fresh.as_bytes()).ok()?;
+        log::info!("{name}: a login of its own for the {purpose}");
+    }
+    Some(path)
+}
+
 /// Delete the bisync state and links of items no longer kept offline, so
 /// kept again they start afresh.
 fn forget_old_items(items: &[SyncItem]) {
@@ -410,7 +483,16 @@ fn short_link(item: &SyncItem) -> std::io::Result<PathBuf> {
 /// Run rclone: whether it succeeded (its exit status: its messages can't
 /// be relied on to say), and its stdout and stderr together.
 async fn rclone(args: &[String]) -> (bool, String) {
-    match tokio::process::Command::new("rclone")
+    let mut cmd = tokio::process::Command::new("rclone");
+    // The syncs' own login (see `cloud::own_login_section`), for the drive
+    // they work on.
+    let drive = cloud::load_drives()
+        .into_iter()
+        .find(|d| args.iter().any(|a| a.starts_with(&d.remote)));
+    if let Some(conf) = drive.and_then(|d| session_config(d.name(), "sync")) {
+        cmd.arg("--config").arg(conf);
+    }
+    match cmd
         .args(args)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -665,12 +747,16 @@ struct Mounts {
     retry_at: HashMap<String, (Instant, u32)>,
     /// Mountpoints seen mounted at the last look.
     mounted: Vec<String>,
+    /// When each running mount was started.
+    started: HashMap<String, Instant>,
+    /// Mounts restarted for a lost login, to say so once they're back.
+    pub reconnecting: std::collections::HashSet<String>,
 }
 
 impl Mounts {
     /// Start managed mounts that aren't running, notice ones that stopped,
     /// and return the mountpoints newly mounted since the last look.
-    fn tend(&mut self, drives: &[Drive]) -> Vec<String> {
+    fn tend(&mut self, drives: &[Drive], tx: &UnboundedSender<Event>) -> Vec<String> {
         let fuse = fuse_mountpoints();
         for d in drives.iter().filter(|d| d.manage_mount) {
             if let Some(child) = self.running.get_mut(&d.mountpoint) {
@@ -702,7 +788,12 @@ impl Mounts {
                 .stderr(std::process::Stdio::null())
                 .status();
             let _ = std::fs::create_dir_all(&d.mountpoint);
-            match tokio::process::Command::new("rclone")
+            let mut cmd = tokio::process::Command::new("rclone");
+            // A login of its own: nothing else can renew it under it.
+            if let Some(conf) = session_config(d.name(), "mount") {
+                cmd.arg("--config").arg(conf);
+            }
+            match cmd
                 .args([
                     "mount",
                     &d.remote,
@@ -719,11 +810,17 @@ impl Mounts {
                 .env("RCLONE_RC_USER", "wayfinder")
                 .env("RCLONE_RC_PASS", rc_password())
                 .stdin(std::process::Stdio::null())
+                // Read for a lost login (and passed on to the journal).
+                .stderr(std::process::Stdio::piped())
                 .kill_on_drop(false)
                 .spawn()
             {
-                Ok(child) => {
+                Ok(mut child) => {
                     log::info!("mounting {} at {}", d.remote, d.mountpoint);
+                    if let Some(err) = child.stderr.take() {
+                        watch_mount_output(err, d.mountpoint.clone(), tx.clone());
+                    }
+                    self.started.insert(d.mountpoint.clone(), Instant::now());
                     self.running.insert(d.mountpoint.clone(), child);
                 }
                 Err(e) => log::error!("can't start the mount of {}: {e}", d.remote),
@@ -742,26 +839,74 @@ impl Mounts {
         newly
     }
 
+    /// Stop the mount at `mountpoint` (it's lost its login), to be started
+    /// again at once by `tend`. False if it isn't ours, or was only just
+    /// started (its last lines may still be coming in).
+    async fn restart(&mut self, mountpoint: &str) -> bool {
+        if self
+            .started
+            .get(mountpoint)
+            .is_none_or(|t| t.elapsed() < Duration::from_secs(30))
+        {
+            return false;
+        }
+        let Some(child) = self.running.remove(mountpoint) else {
+            return false;
+        };
+        log::warn!("the mount at {mountpoint} lost its login: starting it again");
+        stop_mount(mountpoint, child).await;
+        self.started.remove(mountpoint);
+        self.retry_at.remove(mountpoint);
+        self.reconnecting.insert(mountpoint.to_string());
+        true
+    }
+
     /// Unmount everything the service mounted (rclone unmounts cleanly on
     /// SIGTERM; a kill would leave the mountpoint broken).
     async fn stop_all(&mut self) {
-        for (mountpoint, mut child) in self.running.drain() {
-            if let Some(pid) = child.id() {
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
-            }
-            if tokio::time::timeout(Duration::from_secs(10), child.wait())
-                .await
-                .is_err()
-            {
-                let _ = child.kill().await;
-                let _ = std::process::Command::new("fusermount3")
-                    .args(["-uz", &mountpoint])
-                    .status();
-            }
+        for (mountpoint, child) in self.running.drain() {
+            stop_mount(&mountpoint, child).await;
         }
     }
+}
+
+/// Stop a mount (rclone unmounts cleanly on SIGTERM; a kill would leave
+/// the mountpoint broken, so then it's unmounted by force).
+async fn stop_mount(mountpoint: &str, mut child: tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+    if tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    // (Busy, it may still be mounted: lazily, then.)
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-uz", mountpoint])
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Pass a mount's output on to the journal, and say if it loses its login.
+fn watch_mount_output(
+    err: tokio::process::ChildStderr,
+    mountpoint: String,
+    tx: UnboundedSender<Event>,
+) {
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(err).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("rclone: {line}");
+            if cloud::lost_login(&line) {
+                let _ = tx.send(Event::LoginLost(mountpoint.clone()));
+            }
+        }
+    });
 }
 
 /// A random password for this run's remote-control logins.
