@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.8.1
+
+### Fixed
+
+- **Proton Drive showed nothing after a long sleep** until rclone was killed. Proton's login renewal works only once, and every rclone process shared one login: after the laptop had slept for hours, whichever renewed it first left the mount with a dead one, and the mount never signed in again. Wayfinder Sync now gives the mount and its syncs logins of their own (kept in `~/.local/state/wayfinder/sessions`, readable only by you), so nothing renews the mount's login under it; and should the mount still lose its login, the service restarts it and Wayfinder says "Reconnected to Proton." A failed sync now logs rclone's reason.
+- **Menus didn't keep focus when they opened**: F10 read the selected file instead of the menu bar, arrow keys moved in the file list, and context menus on sidebar items put focus in the file list. Opening a popup makes the window inactive and active again on some compositors (niri), and Wayfinder took that for coming back to the window and put focus back on the selected file.
+
 ## 2.8.0
 
 ### New
