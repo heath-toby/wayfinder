@@ -491,9 +491,19 @@ impl ObjectImpl for WayfinderWindowInner {
                 glib::idle_add_local_once(move || {
                     // Not out of a text field the user was typing in (the
                     // search or location): only back to the files.
-                    let typing = gtk::prelude::GtkWindowExt::focus(&win2)
+                    let focus = gtk::prelude::GtkWindowExt::focus(&win2);
+                    let typing = focus
+                        .as_ref()
                         .is_some_and(|f| f.is::<gtk::Text>() || f.is::<gtk::Entry>());
-                    if !typing {
+                    // Nor out of a menu just opened: niri deactivates and
+                    // reactivates the window as a popup appears, and taking
+                    // focus back to the files then left the menu open but
+                    // unreachable (F10, the context menus).
+                    let in_menu = focus.as_ref().is_some_and(|f| {
+                        f.ancestor(gtk::Popover::static_type()).is_some()
+                            || f.ancestor(gtk::PopoverMenuBar::static_type()).is_some()
+                    });
+                    if !typing && !in_menu {
                         win2.restore_focus_to_selected();
                     }
                 });

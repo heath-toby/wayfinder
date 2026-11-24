@@ -97,7 +97,7 @@ Tab from the file list focuses navigation buttons (back/forward/up) then the loc
 
 **GTK4 ListBox Tab gotcha**: GTK4's ListBox internally consumes Tab to cycle between rows. External `EventControllerKey` (even at Capture phase) cannot intercept Tab before ListBox handles it. Do NOT attempt to add Tab navigation out of the sidebar's `places_list` — it will silently fail. The `set_tab_behavior(ListTabBehavior::Leave)` API only exists in GTK 4.18+, and this project targets `v4_14`.
 
-**Window re-focus**: `connect_is_active_notify` in `imp.rs` restores focus to the selected file item when the window regains focus (e.g. after Alt-Tab from another app).
+**Window re-focus**: `connect_is_active_notify` in `imp.rs` restores focus to the selected file item when the window regains focus (e.g. after Alt-Tab from another app). Not when focus is in a text field or already inside a menu (`Popover` / `PopoverMenuBar` ancestor): niri deactivates and reactivates the window as a popup opens, and restoring then pulled focus out of every menu just opened (F10, context menus) so Orca read the file list instead.
 
 ### Toggle Buttons
 
