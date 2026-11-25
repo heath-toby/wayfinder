@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.9.0
+
+### New
+
+- **Remember the passphrase until restart** — a tickbox in the encrypted-drive passphrase dialog (Alt+R). Ticked, the passphrase is kept in the kernel's keyring (in memory only, never on disk) once it has unlocked the drive, and the drive is unlocked without asking from then on, until the computer restarts or shuts down. (Not GVfs's own remembering: with KeePassXC as the keyring that would save the passphrase for good.) A remembered passphrase that stops working is forgotten and asked for again; "Forget Remembered Passphrase" in a locked drive's sidebar menu forgets it yourself.
+- **Encrypted drives come back after sleep** — suspend switches USB and Thunderbolt drives off, and they come back on wake as if plugged in again, locked. Wayfinder Sync's service now unlocks and mounts again a drive that went away while mounted, if its passphrase is remembered, and says so ("Backups is back: unlocked and mounted again."); anything waiting for its mount, such as a backup started by a .path unit, carries on. A drive you unmounted yourself stays as you left it.
+
 ## 2.8.1
 
 ### Fixed

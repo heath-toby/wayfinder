@@ -1650,6 +1650,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "gtk4",
+ "libc",
  "log",
  "notify",
  "tokio",

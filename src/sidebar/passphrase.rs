@@ -6,7 +6,7 @@
 //! prompt is replaced by a plain Wayfinder dialog, so it reads well with
 //! Orca, Escape cancels, and a wrong passphrase can be asked for again.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::gio;
@@ -16,17 +16,24 @@ use gtk::prelude::*;
 /// What one mount attempt's passphrase prompt saw.
 #[derive(Default)]
 pub(super) struct Asked {
-    /// The user gave a passphrase (so a failed unlock means a wrong one).
+    /// A passphrase was given (so a failed unlock means a wrong one).
     pub given: Cell<bool>,
+    /// It was the remembered one, not typed.
+    pub used_remembered: Cell<bool>,
+    /// Typed, with "Remember the passphrase until restart" ticked: kept
+    /// once it has unlocked the drive (a wrong one never is).
+    pub to_remember: RefCell<Option<String>>,
 }
 
 /// A mount operation for mounting `label`, over `window`: GTK's for
 /// anything else it asks (which processes keep a drive busy, say), ours for
-/// a passphrase. `wrong` says the last passphrase didn't work.
+/// a passphrase. `wrong` says the last passphrase didn't work; `remembered`
+/// is given without asking.
 pub(super) fn mount_operation(
     window: Option<&gtk::Window>,
     label: &str,
     wrong: bool,
+    remembered: Option<String>,
     asked: Rc<Asked>,
 ) -> gtk::MountOperation {
     let op = gtk::MountOperation::new(window);
@@ -40,6 +47,16 @@ pub(super) fn mount_operation(
             return;
         }
         glib::signal::signal_stop_emission_by_name(op, "ask-password");
+        // Remembered: given at once, the first time it's asked for.
+        if let Some(pass) = remembered.as_deref() {
+            if !asked.used_remembered.replace(true) {
+                asked.given.set(true);
+                op.set_password(Some(pass));
+                op.set_password_save(gio::PasswordSave::Never);
+                op.reply(gio::MountOperationResult::Handled);
+                return;
+            }
+        }
         ask(window.as_ref(), op, &label, wrong, asked.clone());
     });
     op
@@ -110,6 +127,10 @@ fn ask(
     vbox.append(&entry_label);
     vbox.append(&entry);
 
+    // Kept in the kernel's memory (see `keyring`), so gone after a restart.
+    let remember = gtk::CheckButton::with_mnemonic("_Remember the passphrase until restart");
+    vbox.append(&remember);
+
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     buttons.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
@@ -155,6 +176,9 @@ fn ask(
             }
             answered.set(true);
             asked.given.set(true);
+            if remember.is_active() {
+                asked.to_remember.replace(Some(pass.to_string()));
+            }
             op.set_password(Some(&pass));
             // Asked for every time: never kept in the keyring.
             op.set_password_save(gio::PasswordSave::Never);

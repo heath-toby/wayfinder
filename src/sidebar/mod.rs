@@ -1,6 +1,8 @@
 mod imp;
 mod passphrase;
 
+use crate::keyring;
+
 use std::path::PathBuf;
 
 use gtk::gio;
@@ -304,28 +306,13 @@ fn eject_mount_at(widget: &gtk::Widget, mount_path: &str, label: &str) {
     }
 }
 
-/// Whether `mount` is of an unlocked encrypted (LUKS) device: its
-/// device-mapper device was set up by cryptsetup.
+/// Whether `mount` is of an unlocked encrypted (LUKS) device.
 fn is_encrypted(mount: &gio::Mount) -> bool {
-    let Some(device) = mount
+    mount
         .volume()
         .and_then(|v| v.identifier(gio::VOLUME_IDENTIFIER_KIND_UNIX_DEVICE))
-    else {
-        return false;
-    };
-    let Ok(real) = std::fs::canonicalize(device.as_str()) else {
-        return false;
-    };
-    let Some(dm) = real.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    std::fs::read_to_string(format!("/sys/block/{dm}/dm/uuid"))
-        .is_ok_and(|uuid| is_crypt_uuid(&uuid))
-}
-
-/// A device-mapper UUID cryptsetup gave its device ("CRYPT-LUKS2-…").
-fn is_crypt_uuid(uuid: &str) -> bool {
-    uuid.starts_with("CRYPT-")
+        .and_then(|d| crate::drives::luks_of_device(&d))
+        .is_some()
 }
 
 /// Mount `vol` (named `label`, `vol_id` in MOUNTING), asking for a
@@ -343,7 +330,10 @@ fn mount_volume(
 ) {
     let window = list.root().and_downcast::<gtk::Window>();
     let asked = std::rc::Rc::new(passphrase::Asked::default());
-    let mount_op = passphrase::mount_operation(window.as_ref(), &label, wrong, asked.clone());
+    // (Not after it failed: then it's asked for.)
+    let remembered = (!wrong).then(|| keyring::recall(&vol_id)).flatten();
+    let mount_op =
+        passphrase::mount_operation(window.as_ref(), &label, wrong, remembered, asked.clone());
     let list = list.clone();
     let mounted = vol.clone();
     vol.mount(
@@ -353,6 +343,14 @@ fn mount_volume(
         move |result| match result {
             Ok(()) => {
                 MOUNTING.with(|m| m.borrow_mut().retain(|v| *v != vol_id));
+                if let Some(pass) = asked.to_remember.take() {
+                    if !keyring::remember(&vol_id, &pass) {
+                        list.announce(
+                            "Couldn't remember the passphrase",
+                            gtk::AccessibleAnnouncementPriority::Medium,
+                        );
+                    }
+                }
                 // Open it — unless the user has chosen something else
                 // meanwhile.
                 let moved_on = ACTIVATIONS.with(|n| n.get()) != activation;
@@ -369,6 +367,11 @@ fn mount_volume(
             }
             Err(e) if passphrase::is_wrong_passphrase(&e, &asked) => {
                 log::info!("Wrong passphrase for {label}: {e}");
+                // A remembered one that no longer works (changed since):
+                // forgotten, and asked for.
+                if asked.used_remembered.get() {
+                    keyring::forget(&vol_id);
+                }
                 list.announce(
                     &format!("Wrong passphrase for {label}"),
                     gtk::AccessibleAnnouncementPriority::High,
@@ -439,6 +442,29 @@ fn eject_item(row: &gtk::ListBoxRow, popover: &gtk::Popover) -> Option<gtk::Butt
     btn.connect_clicked(move |_| {
         pop.popdown();
         eject_mount_at(row.upcast_ref(), &mount_path, &label);
+    });
+    Some(btn)
+}
+
+/// A "Forget Remembered Passphrase" item for `row`'s menu, if it's a locked
+/// drive whose passphrase is remembered (see `keyring`).
+fn forget_passphrase_item(row: &gtk::ListBoxRow, popover: &gtk::Popover) -> Option<gtk::Button> {
+    let name = row.widget_name();
+    let uuid = name.strip_prefix("volume-unmounted:")?.to_string();
+    if !keyring::is_remembered(&uuid) {
+        return None;
+    }
+    let btn = gtk::Button::with_label("Forget Remembered Passphrase");
+    btn.add_css_class("flat");
+    let pop = popover.clone();
+    let row = row.clone();
+    btn.connect_clicked(move |_| {
+        pop.popdown();
+        keyring::forget(&uuid);
+        row.announce(
+            "Passphrase forgotten: it will be asked for next time",
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
     });
     Some(btn)
 }
@@ -1143,6 +1169,9 @@ impl WayfinderSidebar {
             let eject = list
                 .row_at_y(y as i32)
                 .and_then(|row| eject_item(&row, &popover));
+            let forget = list
+                .row_at_y(y as i32)
+                .and_then(|row| forget_passphrase_item(&row, &popover));
 
             let btn = gtk::Button::with_label("Edit Sidebar");
             btn.add_css_class("flat");
@@ -1157,6 +1186,9 @@ impl WayfinderSidebar {
             });
 
             let menu = with_settings(btn.upcast_ref());
+            if let Some(forget) = forget {
+                menu.prepend(&forget);
+            }
             if let Some(eject) = eject {
                 menu.prepend(&eject);
             }
@@ -1206,6 +1238,9 @@ impl WayfinderSidebar {
             let eject = list2
                 .selected_row()
                 .and_then(|row| eject_item(&row, &popover));
+            let forget = list2
+                .selected_row()
+                .and_then(|row| forget_passphrase_item(&row, &popover));
 
             let btn = gtk::Button::with_label("Edit Sidebar");
             btn.add_css_class("flat");
@@ -1220,6 +1255,9 @@ impl WayfinderSidebar {
             });
 
             let menu = with_settings(btn.upcast_ref());
+            if let Some(forget) = forget {
+                menu.prepend(&forget);
+            }
             if let Some(eject) = eject {
                 menu.prepend(&eject);
             }
@@ -1794,18 +1832,7 @@ pub fn save_places(edit: &PlacesEdit) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        bookmark_path, bookmarks_insert_pos, is_crypt_uuid, read_bookmarks_from, volumes_insert_pos,
-    };
-
-    #[test]
-    fn crypt_uuids() {
-        assert!(is_crypt_uuid(
-            "CRYPT-LUKS2-b7a69eb580ba49d799c341699a35c7fa-ext\n"
-        ));
-        assert!(!is_crypt_uuid("LVM-abc"));
-        assert!(!is_crypt_uuid(""));
-    }
+    use super::{bookmark_path, bookmarks_insert_pos, read_bookmarks_from, volumes_insert_pos};
 
     #[test]
     fn bookmarks_without_a_name_are_saved_without_one() {

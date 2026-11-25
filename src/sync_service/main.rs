@@ -14,6 +14,8 @@
 //! reported as the `Synced` signal on `org.wayfinder.Sync`, which Wayfinder
 //! announces; if Wayfinder isn't running, as a desktop notification.
 
+mod drive_watch;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -39,6 +41,9 @@ enum Event {
     Mounted(String),
     /// The managed mount at this mountpoint has lost its login.
     LoginLost(String),
+    /// An encrypted drive came back after vanishing while mounted: where
+    /// it's mounted now (empty if it couldn't be), and what to say.
+    DriveBack(String, String),
 }
 
 /// Per-item scheduling.
@@ -132,6 +137,8 @@ async fn main() {
         log::warn!("can't watch the offline copies: {e}");
     }
 
+    drive_watch::start(tx.clone());
+
     let mut mounts = Mounts::default();
     let mut items = current_items();
     let mut state: HashMap<String, ItemState> = HashMap::new();
@@ -191,6 +198,11 @@ async fn main() {
                             s.asked |= tell;
                             s.due = Some(Instant::now());
                         }
+                    }
+                    Event::DriveBack(path, message) => {
+                        // (Not mounted: no folder to refresh.)
+                        let item = if path.is_empty() { "-" } else { path.as_str() };
+                        report(&conn, item, &message, 0).await;
                     }
                     Event::LoginLost(mountpoint) => {
                         if mounts.restart(&mountpoint).await {

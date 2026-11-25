@@ -18,6 +18,7 @@ name = "wayfinder-sync"
 path = "src/sync_service/main.rs"
 
 [dependencies]
+libc = "0.2"
 gtk = { package = "gtk4", version = "0.10", features = ["v4_14"] }
 dirs = "7"
 log = "0.4"
