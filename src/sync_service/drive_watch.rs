@@ -32,12 +32,18 @@ struct State {
     tx: UnboundedSender<Event>,
 }
 
-/// Watch for encrypted drives, on a thread of its own (GIO's volume
-/// monitor needs a GLib main loop).
+/// Watch for encrypted drives, on a thread of its own running GLib's
+/// default main context: GIO's volume monitor delivers its signals there,
+/// not to a thread-default context pushed for it (a private context heard
+/// nothing). Nothing else in the service uses the default context.
 pub fn start(tx: UnboundedSender<Event>) {
     std::thread::spawn(move || {
-        let ctx = glib::MainContext::new();
-        let result = ctx.with_thread_default(|| {
+        let ctx = glib::MainContext::default();
+        let Ok(_owner) = ctx.acquire() else {
+            log::warn!("can't watch encrypted drives: GLib's main context is in use");
+            return;
+        };
+        {
             let monitor = gio::VolumeMonitor::get();
             let state = Rc::new(RefCell::new(State {
                 watch: Watch::default(),
@@ -70,10 +76,7 @@ pub fn start(tx: UnboundedSender<Event>) {
             }
             // (Kept alive by the loop below.)
             let _monitor = monitor;
-            glib::MainLoop::new(Some(&glib::MainContext::ref_thread_default()), false).run();
-        });
-        if let Err(e) = result {
-            log::warn!("can't watch encrypted drives: {e}");
+            glib::MainLoop::new(Some(&ctx), false).run();
         }
     });
 }
